@@ -6,10 +6,13 @@
 *.p12
 *.key
 
+!package.json
+!package-lock.json
+!tsconfig.json
+
 # Docker
 docker-compose.dev.yml
 docker-compose.stage.yml
-.Dockerignore
 .docker/
 volumes/
 
