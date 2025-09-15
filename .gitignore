@@ -1,0 +1,38 @@
+# Env / Secrets
+.env
+.env.*
+*.json
+*.pem
+*.p12
+*.key
+
+# Docker
+docker-compose.dev.yml
+docker-compose.stage.yml
+.Dockerignore
+.docker/
+volumes/
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+.next/
+out/
+.turbo/
+.vercel/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+*.log
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

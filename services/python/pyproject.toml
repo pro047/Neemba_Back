@@ -1,0 +1,39 @@
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+extend-exclude = ["dist", "build", ".venv", ".mypy_cache", ".ruff_cache", "__pycache__", "migrations"]
+
+[tool.ruff.format]
+quote-style = "double"            # 문자열은 "
+indent-style = "space"
+docstring-code-format = true      # docstring 안 코드도 포맷
+line-ending = "lf"
+
+[tool.ruff.lint]
+# 실무에서 많이 쓰는 규칙 묶음 (과한 건 뺐음)
+select = [
+  "E",   # pycodestyle (공백/스타일)
+  "W",   # pycodestyle warnings
+  "F",   # pyflakes (버그성)
+  "I",   # isort (import 정렬)
+  "B",   # bugbear (잠재 버그/안티패턴)
+  "UP",  # pyupgrade (3.x 스타일로 업그레이드)
+  "C4",  # comprehensions (리스트/딕컴프 개선)
+  "SIM", # simplify (불필요한 분기 단순화)
+  "RET", # return (리턴 스타일)
+  "RSE", # raise (예외 스타일)
+  "TRY", # tryceratops (예외 처리 안티패턴)
+  "PTH", # pathlib 권장
+  "NPY", # numpy 규약(쓰면 도움)
+  "PD",  # pandas 권장(쓰면 도움)
+  "PERF" # perflint (미세 성능)
+]
+# 타입 힌트 강제는 안 함(ANN 계열 제외), 과한 규칙은 필요 시 점진 적용
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]  # 프로젝트 루트 패키지명으로 바꿔
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # 패키지 노출 목적으로 남겨둔 unused import 허용
