@@ -35,15 +35,27 @@ def require_env_int(key: str) -> int:
 load_env_or_fail()
 
 
-nats_url: Final[str] = require_env("NATS_URL")
-nats_subject: Final[str] = require_env("NATS_SUBJECT")
-nats_stream_name: Final[str] = require_env("NATS_STREAM_NAME")
-nats_consumer_name: Final[str] = require_env("NATS_CONSUMER_NAME")
+def get_nats_config() -> dict[str, str]:
+    return {
+        "nats_url": require_env("NATS_URL"),
+        "nats_subject": require_env("NATS_SUBJECT"),
+        "nats_stream_name": require_env("NATS_STREAM_NAME"),
+        "nats_consumer_name": require_env("NATS_CONSUMER_NAME")
+    }
 
-deepl_api_key: Final[str] = require_env("DEEPL_API_KEY")
 
-# postgres_host: Final[str] = require_env("POSTGRES_HOST")
-# postgres_port: Final[str] = require_env("POSTGRES_PORT")
-# postgres_user: Final[str] = require_env("POSTGRES_USER")
-# postgres_password: Final[str] = require_env("POSTGRES_PASSWORD")
-# postgres_database: Final[str] = require_env("POSTGRES_DATABASE")
+def get_deepl_config() -> dict[str, str]:
+    return {
+
+        "deepl_api_key": require_env("DEEPL_API_KEY")
+    }
+
+
+def get_postgres_config() -> dict[str, str]:
+    return {
+        "postgres_host": require_env("POSTGRES_HOST"),
+        "postgres_port": require_env("POSTGRES_PORT"),
+        "postgres_user": require_env("POSTGRES_USER"),
+        "postgres_password": require_env("POSTGRES_PASSWORD"),
+        "postgres_database": require_env("POSTGRES_DATABASE"),
+    }

@@ -9,7 +9,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 
 from src.compose import build
-from src.config import deepl_api_key
+from src.config import get_nats_config, get_deepl_config
 from src.deepL.deepL import DeeplTranslationService
 from src.pushClient.pusher import Pusher
 from src.separator.kss_separator import SentenceSeparator
@@ -30,8 +30,13 @@ async def lifespan(app: FastAPI):
     separator_task = None
 
     try:
+        app.state.nats_config = get_nats_config()
+        app.state.deepl_config = get_deepl_config()
+
+        deepl_api = app.state.deepl_config['deepl_api_key']
+
         hub = WebSocketHub()
-        translator = DeeplTranslationService(deepl_api_key)
+        translator = DeeplTranslationService(deepl_api)
         pusher = Pusher(hub)
 
         separator = SentenceSeparator(
@@ -56,7 +61,8 @@ async def lifespan(app: FastAPI):
         app.state.consumer_task = asyncio.create_task(
             build(
                 app.state.hub,
-                app.state.separator)
+                app.state.separator,
+                app.state.nats_config)
         )
         app.state.consumer_task.add_done_callback(_log_task_result)
 
