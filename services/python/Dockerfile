@@ -58,4 +58,4 @@ CMD [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--lifespan"
 FROM runtime AS prod
 ENV GUNICORN_WORKERS=2 \
     GUNICORN_TIMEOUT=60
-CMD [ "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-W", "2", "-b", "0.0.0.0:8000", "--timeout", "60", "main:app"]
+CMD [ "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000", "--timeout", "60", "main:app"]
