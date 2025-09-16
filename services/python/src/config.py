@@ -42,8 +42,8 @@ nats_consumer_name: Final[str] = require_env("NATS_CONSUMER_NAME")
 
 deepl_api_key: Final[str] = require_env("DEEPL_API_KEY")
 
-postgres_host: Final[str] = require_env("POSTGRES_HOST")
-postgres_port: Final[str] = require_env("POSTGRES_PORT")
-postgres_user: Final[str] = require_env("POSTGRES_USER")
-postgres_password: Final[str] = require_env("POSTGRES_PASSWORD")
-postgres_database: Final[str] = require_env("POSTGRES_DATABASE")
+# postgres_host: Final[str] = require_env("POSTGRES_HOST")
+# postgres_port: Final[str] = require_env("POSTGRES_PORT")
+# postgres_user: Final[str] = require_env("POSTGRES_USER")
+# postgres_password: Final[str] = require_env("POSTGRES_PASSWORD")
+# postgres_database: Final[str] = require_env("POSTGRES_DATABASE")
