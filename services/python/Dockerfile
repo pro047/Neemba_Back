@@ -14,6 +14,8 @@ RUN set -eux; \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
+RUN useradd -m appuser
+
 ARG NATS_VERSION=0.2.4
 ARG TARGETARCH
 RUN set -eux; \
@@ -28,16 +30,16 @@ RUN set -eux; \
     rm -rf /tmp/*; \
     nats --version
 
-RUN useradd -m appuser
-USER appuser
 
 FROM base AS deps
-COPY --chown=appuser:appuser pyproject.toml uv.lock* /app/
+COPY pyproject.toml uv.lock* /app/
 
-RUN uv sync --frozen --no-dev --system
+RUN uv --version \ 
+    && uv sync --frozen --no-dev
 
 FROM deps AS runtime
-COPY --chown=appuser:appuser . /app
+COPY . /app
+USER appuser
 
 ENV PYTHONPATH=/app:/app/services/python
 
