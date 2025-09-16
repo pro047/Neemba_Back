@@ -14,7 +14,7 @@ RUN set -eux; \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
-ARG NATS_VERSION=0.1.7
+ARG NATS_VERSION=0.2.4
 ARG TARGETARCH
 RUN set -eux; \
     case "$TARGETARCH" in \
