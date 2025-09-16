@@ -34,14 +34,18 @@ RUN set -eux; \
 FROM base AS deps
 COPY pyproject.toml uv.lock* /app/
 
+ENV PATH="/usr/local/bin:${PATH}"
+ENV PYTHONPATH=/app:/app/services/python
+
 RUN uv --version \ 
-    && uv sync --frozen --no-dev --system
+    && uv export --frozen --no-dev --format requirements-txt > /tmp/req.lock.txt \
+    && uv pip install --system -r /tmp/req.lock.txt \
+    && rm -f /tmp/req.lock.txt
 
 FROM deps AS runtime
 COPY . /app
 USER appuser
 
-ENV PYTHONPATH=/app:/app/services/python
 
 EXPOSE 8000
 
