@@ -1,3 +1,29 @@
+[project]
+name = "neemba-python"
+version = "0.1.0"
+description = "Neemba FastAPI service"
+requires-python = ">=3.12"
+readme = "README.md"
+
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "gunicorn",
+  "httpx",
+  "nats-py",
+  "kss",
+  "mecab-python3",
+  "pydantic",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "mypy",
+  "ruff",
+]
+
 [tool.ruff]
 line-length = 150
 target-version = "py312"
