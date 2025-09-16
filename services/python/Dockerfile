@@ -35,7 +35,7 @@ FROM base AS deps
 COPY pyproject.toml uv.lock* /app/
 
 RUN uv --version \ 
-    && uv sync --frozen --no-dev
+    && uv sync --frozen --no-dev --system
 
 FROM deps AS runtime
 COPY . /app

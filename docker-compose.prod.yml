@@ -42,6 +42,7 @@ services:
     build:
       context: ./services/python
       dockerfile: Dockerfile
+      target: prod
     env_file:
       - .env.prod
     expose:
