@@ -1,9 +1,17 @@
 neemba.app, www.neemba.app {
   encode zstd gzip
 
+  @health path /health
+  respond @health 200
+
   @ws path /ws*
-  reverse_proxy @ws node:3000
-  reverse_proxy /api/* node:3000
-  reverse_proxy /py/*  python:8000
-  reverse_proxy /      node:3000
+  reverse_proxy @ws python:8000
+
+  handle_path /api/* {
+    reverse_proxy node:3000
+  }
+
+  handle_path /py/* {
+    reverse_proxy python:8000
+  }
 }
