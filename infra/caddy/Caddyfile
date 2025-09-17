@@ -1,0 +1,9 @@
+neemba.app, www.neemba.app {
+  encode zstd gzip
+
+  @ws path /ws*
+  reverse_proxy @ws node:3000
+  reverse_proxy /api/* node:3000
+  reverse_proxy /py/*  python:8000
+  reverse_proxy /      node:3000
+}
