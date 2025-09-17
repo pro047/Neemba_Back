@@ -70,3 +70,8 @@ services:
     networks:
       - appnet
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/varz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
