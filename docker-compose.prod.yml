@@ -66,7 +66,7 @@ services:
       - "8222"
     volumes:
       - nats-data:/data
-      - ./infra/nats/nats.conf:/etc/nats/nats.conf:ro
+      - /srv/neemba/infra/nats/nats.conf:/etc/nats/nats.conf:ro
     networks:
       - appnet
     restart: unless-stopped
