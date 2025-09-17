@@ -11,9 +11,10 @@ services:
     image: caddy:2.8
     ports:
       - "80:80"
-      # - "443:443"
+      - "443:443"
     volumes:
       - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./infra/certs:/data
     depends_on:
       - node
       - python
