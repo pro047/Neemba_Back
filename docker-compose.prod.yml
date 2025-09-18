@@ -16,7 +16,6 @@ services:
     volumes:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./infra/letsencrypt:/etc/letsencrypt
-      - ./infra/hls:/var/www/html/hls
       - ./infra/nginx/html:/var/www/html
     restart: unless-stopped
     networks:
@@ -28,8 +27,7 @@ services:
     ports:
       - "1935:1935"
     volumes:
-      - ./infra/rtmp/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./infra/hls:/var/www/html/hls
+      - ./infra/rtmp/nginx.conf:/etc/nginx/nginx.conf.template:ro
     networks:
       - appnet
     restart: unless-stopped
