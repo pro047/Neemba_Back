@@ -26,10 +26,10 @@ services:
     image: alpine:3.20
     container_name: nginx-reloader
     command: >
-      sh -c "apk add --no-cache curl docker-cli &&
+      sh -c "apk add --no-cache curl docker-cli netcat-openbsd &&
             while true; do
-              nc 0l -p 8888 -e sh -c 'docker kill -s HUP nginx';
-            done;
+              nc -l -p 8888 -e sh -c 'docker kill -s HUP nginx';
+            done"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
