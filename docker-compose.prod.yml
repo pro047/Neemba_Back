@@ -18,6 +18,7 @@ services:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf.template:ro
       - ./infra/letsencrypt:/etc/letsencrypt
       - ./infra/nginx/html:/var/www/html
+    command: ["nginx", "-g", "daemon off;"]
     networks:
       - appnet
     restart: unless-stopped
