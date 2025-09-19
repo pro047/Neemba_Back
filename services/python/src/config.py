@@ -1,16 +1,16 @@
 import os
 from typing import Final
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 
 def load_env_or_fail() -> None:
-    path = "/app"
-    if os.path.exists(path):
-        load_dotenv(dotenv_path=path, override=False)
-        print(f'env loaded: {path}')
-        return
-    raise RuntimeError(
-        f'no env file found (cwd={os.getcwd()} / path = {path}) / exists = {os.path.exists(path)}')
+    env_path = find_dotenv()
+    if not env_path:
+        raise RuntimeError(f'no .env file found (cwd={os.getcwd()})')
+    loaded = load_dotenv(env_path, override=False)
+    if not loaded:
+        raise RuntimeError(f'failed to load .env: {env_path}')
+    print(f'env loaded: {env_path}')
 
 
 def require_env(key: str, *, mask: bool = True) -> str:
@@ -42,6 +42,10 @@ def get_nats_config() -> dict[str, str]:
         "nats_stream_name": require_env("NATS_STREAM_NAME"),
         "nats_consumer_name": require_env("NATS_CONSUMER_NAME")
     }
+
+
+def get_ws_url() -> str:
+    return require_env('WS_URL')
 
 
 def get_deepl_config() -> dict[str, str]:

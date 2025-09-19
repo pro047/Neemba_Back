@@ -9,7 +9,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 
 from src.compose import build
-from src.config import get_nats_config, get_deepl_config
+from src.config import get_nats_config, get_deepl_config, get_ws_url
 from src.deepL.deepL import DeeplTranslationService
 from src.pushClient.pusher import Pusher
 from src.separator.kss_separator import SentenceSeparator
@@ -134,8 +134,8 @@ def get_metrics():
 
 @app.post('/internal/sessions/start', response_model=StartResponse)
 async def start_session(req: StartRequest):
-    webSocket_url = f'ws://localhost:8080/ws?sessionId={req.session_id}'
-
+    base_ws_url = get_ws_url()
+    webSocket_url = f"{base_ws_url}?sessionId={req.session_id}"
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
 

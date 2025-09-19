@@ -2,7 +2,7 @@ import express from "express";
 import { pythonHost } from "../config";
 import { v4 as uuidv4 } from "uuid";
 import { runPipelines } from "../runPipeLines";
-import { removeSessionId, setSessionId } from "./sessionStore";
+import { removeSessionId, setSessionId } from "../sessions/sessionStore";
 
 const router = express.Router();
 
@@ -65,7 +65,7 @@ router.post("/sessions/stop", async (req, res) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: sessionId }),
     });
-    return res.json({ ok: true });
+    return res.status(200).json({ ok: true });
   } catch (err) {
     return res.status(500).json({ error: err });
   }

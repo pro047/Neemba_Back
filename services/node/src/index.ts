@@ -1,6 +1,7 @@
 import express from "express";
 import { collectDefaultMetrics, Counter, Registry } from "prom-client";
-import sessions from "./sessions/sessions";
+import rtmp from "./router/rtmp";
+import mic from "./router/mic";
 
 const app = express();
 
@@ -27,7 +28,8 @@ const requestCounter = new Counter({
 });
 registry.registerMetric(requestCounter);
 
-app.use("/api", sessions);
+app.use("/api", rtmp);
+app.use("/api", mic);
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
