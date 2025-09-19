@@ -12,7 +12,7 @@ let stopPipeline: (() => Promise<void>) | null = null;
 
 router.post("/sessions/start", async (req, res) => {
   const sessionId = uuidv4();
-  const youtubeUrl = req.body?.youtubeUrl;
+  const rtmpUrl = req.body?.rtmpUrl;
   const sourceLang = req.body?.sourceLang ?? "ko-KR";
   const targetLang = req.body?.targetLang ?? "en-US";
 
@@ -20,7 +20,6 @@ router.post("/sessions/start", async (req, res) => {
 
   console.log("python host", PY_HOST);
   console.log(sessionId);
-  console.log(youtubeUrl);
   console.log(sourceLang);
   console.log(targetLang);
 
@@ -28,7 +27,7 @@ router.post("/sessions/start", async (req, res) => {
     const r = await fetch(`${PY_HOST}/internal/sessions/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, youtubeUrl, sourceLang, targetLang }),
+      body: JSON.stringify({ sessionId, rtmpUrl, sourceLang, targetLang }),
     });
     const t = (await r.json()) as {
       sessionId: string;
@@ -37,12 +36,13 @@ router.post("/sessions/start", async (req, res) => {
     if (!r.ok) console.error("python err:", r.status, t);
     else console.log("python ok:", t);
 
-    const { stop } = await runPipelines(youtubeUrl);
+    const { stop } = await runPipelines(rtmpUrl);
     stopPipeline = stop;
 
     return res.status(202).json({ sessionId, webSocketUrl: t.webSocketUrl });
   } catch (err) {
     console.error("python fetch fail", err);
+    return res.status(500).json({ error: err });
   }
 });
 
@@ -52,19 +52,23 @@ router.post("/sessions/stop", async (req, res) => {
 
   if (!sessionId) return res.status(400).json({ error: "sessionId required" });
 
-  removeSessionId();
+  try {
+    removeSessionId();
 
-  if (stopPipeline) await stopPipeline();
+    if (stopPipeline) await stopPipeline();
 
-  console.log("session stopped");
-  console.log(stopPipeline);
+    console.log("session stopped");
+    console.log(stopPipeline);
 
-  await fetch(`${PY_HOST}/internal/sessions/stop`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId: sessionId }),
-  });
-  return res.json({ ok: true });
+    await fetch(`${PY_HOST}/internal/sessions/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: sessionId }),
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err });
+  }
 });
 
 export default router;

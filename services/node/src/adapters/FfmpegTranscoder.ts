@@ -6,7 +6,7 @@ import type { Readable, Writable } from "node:stream";
 export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
 
-  startTranscoder(): {
+  startTranscoder(rtmpUrl: string): {
     inputWritable: Writable;
     pcmReadable: Readable;
     stop: () => void;
@@ -20,7 +20,7 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "-flags",
       "low_delay",
       "-i",
-      "pipe:0",
+      rtmpUrl,
       "-vn",
       "-ac",
       "1",
