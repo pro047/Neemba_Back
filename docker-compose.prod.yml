@@ -66,6 +66,8 @@ services:
       context: ./services/node
       dockerfile: Dockerfile
     container_name: node
+    volumes:
+      - /var/lib/neemba/secrets:/var/lib/neemba/secrets:ro
     env_file:
       - .env.prod
     expose:
