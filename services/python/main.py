@@ -136,6 +136,7 @@ def get_metrics():
 async def start_session(req: StartRequest):
     base_ws_url = get_ws_url()
     webSocket_url = f"{base_ws_url}?sessionId={req.session_id}"
+    print(webSocket_url)
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
 
