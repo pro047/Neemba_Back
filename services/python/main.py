@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
     try:
         app.state.nats_config = get_nats_config()
         app.state.deepl_config = get_deepl_config()
+        app.state.get_ws_config = get_ws_url()
 
         deepl_api = app.state.deepl_config['deepl_api_key']
 
@@ -72,6 +73,7 @@ async def lifespan(app: FastAPI):
         app.state.separator_task.add_done_callback(_log_task_result)
 
         logger.info(">>> lifespan : init done")
+        logger.info(f"--------ws : {app.state.get_ws_config} -------")
         print(">>> hub at lifespan:", id(app.state.hub))
         yield
 
@@ -135,7 +137,8 @@ def get_metrics():
 @app.post('/internal/sessions/start', response_model=StartResponse)
 async def start_session(req: StartRequest):
     base_ws_url = get_ws_url()
-    webSocket_url = f"{base_ws_url}?sessionId={req.session_id}"
+    print(base_ws_url)
+    webSocket_url = f"wss://neemba.app/ws?sessionId={req.session_id}"
     print(webSocket_url)
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 

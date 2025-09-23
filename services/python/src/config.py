@@ -12,8 +12,9 @@ def load_env_or_fail() -> None:
     print(f'env loaded: {env_path}')
 
 
-def require_env(key: str, *, mask: bool = True) -> str:
+def require_env(key: str, *, mask: bool = False) -> str:
     value = os.getenv(key)
+    print(value)
     if value is None or value == "":
         raise RuntimeError(f'env {key} is not configured')
     if mask:
@@ -43,13 +44,15 @@ def get_nats_config() -> dict[str, str]:
     }
 
 
-def get_ws_url() -> str:
-    return require_env('WS_URL')
+def get_ws_url() -> dict[str, str]:
+    print('ws_url', os.getenv('WS_URL'))
+    return {
+        "ws_url": require_env("WS_URL")
+    }
 
 
 def get_deepl_config() -> dict[str, str]:
     return {
-
         "deepl_api_key": require_env("DEEPL_API_KEY")
     }
 
