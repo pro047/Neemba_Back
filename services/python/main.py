@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
         app.state.separator_task.add_done_callback(_log_task_result)
 
         logger.info(">>> lifespan : init done")
-        logger.info(f"--------ws : {app.state.get_ws_config} -------")
+        print(f"--------ws : {app.state.get_ws_config} -------")
         print(">>> hub at lifespan:", id(app.state.hub))
         yield
 
@@ -137,9 +137,9 @@ def get_metrics():
 @app.post('/internal/sessions/start', response_model=StartResponse)
 async def start_session(req: StartRequest):
     base_ws_url = get_ws_url()
-    print(base_ws_url)
+    print('base url', base_ws_url)
     webSocket_url = f"wss://neemba.app/ws?sessionId={req.session_id}"
-    print(webSocket_url)
+    print('ws url', webSocket_url)
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
 

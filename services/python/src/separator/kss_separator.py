@@ -109,7 +109,6 @@ class SentenceSeparator:
             pass
 
     async def _flush(self) -> None:
-        print('call _flush')
         for key, state in list(self.state_by_key.items()):
             text = state.carryover_text.strip()
             if not text:
