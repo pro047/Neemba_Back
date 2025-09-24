@@ -20,7 +20,7 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "-flags",
       "low_delay",
       "-i",
-      "rtmp://neemba.app/live/translation",
+      "rtmp://neemba.app:1935/live/translation",
       "-vn",
       "-ac",
       "1",
