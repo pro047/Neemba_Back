@@ -3,7 +3,6 @@ import type { AudioConsumerPort } from "../ports/audioConsumerPort";
 
 export class StreamlinkToConsumerService {
   constructor(
-    private readonly rtmpUrl: string,
     private readonly audioTranscoder: AudioTranscoder,
     private readonly audioConsumer: AudioConsumerPort
   ) {}
@@ -15,7 +14,7 @@ export class StreamlinkToConsumerService {
       inputWritable,
       pcmReadable,
       stop: stopTranscoder,
-    } = this.audioTranscoder.startTranscoder(this.rtmpUrl);
+    } = this.audioTranscoder.startTranscoder();
 
     const streamStop = await this.audioConsumer.start(pcmReadable);
 

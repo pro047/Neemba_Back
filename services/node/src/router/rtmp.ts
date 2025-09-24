@@ -12,7 +12,6 @@ let stopPipeline: (() => Promise<void>) | null = null;
 
 router.post("/sessions/start", async (req, res) => {
   const sessionId = uuidv4();
-  const rtmpUrl = req.body?.rtmpUrl;
   const sourceLang = req.body?.sourceLang ?? "ko-KR";
   const targetLang = req.body?.targetLang ?? "en-US";
 
@@ -27,7 +26,7 @@ router.post("/sessions/start", async (req, res) => {
     const r = await fetch(`${PY_HOST}/internal/sessions/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId, rtmpUrl, sourceLang, targetLang }),
+      body: JSON.stringify({ sessionId, sourceLang, targetLang }),
     });
     const t = (await r.json()) as {
       sessionId: string;
@@ -36,7 +35,7 @@ router.post("/sessions/start", async (req, res) => {
     if (!r.ok) console.error("python err:", r.status, t);
     else console.log("python ok:", t);
 
-    const { stop } = await runPipelines(rtmpUrl);
+    const { stop } = await runPipelines();
     stopPipeline = stop;
 
     return res.status(202).json({ sessionId, webSocketUrl: t.webSocketUrl });

@@ -17,7 +17,7 @@ export interface LiveMediaReader {
 
 // 오디오 트랜스코더 인터페이스(to google speech-to-text)
 export interface AudioTranscoder {
-  startTranscoder(rtmpUrl: string): {
+  startTranscoder(): {
     inputWritable: Writable;
     pcmReadable: Readable;
     stop: () => void;

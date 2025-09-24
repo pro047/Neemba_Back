@@ -6,7 +6,7 @@ import type { Readable, Writable } from "node:stream";
 export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
 
-  startTranscoder(rtmpUrl: string): {
+  startTranscoder(): {
     inputWritable: Writable;
     pcmReadable: Readable;
     stop: () => void;
@@ -20,7 +20,7 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "-flags",
       "low_delay",
       "-i",
-      rtmpUrl,
+      "rtmp://neemba.app/live/translation",
       "-vn",
       "-ac",
       "1",

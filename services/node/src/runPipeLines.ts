@@ -14,9 +14,7 @@ import { StreamSwitcher } from "./stream/StreamSwitcher";
 const url = natsUrl || "nats://neemba:nats1234@localhost:4222";
 console.log(url);
 
-export async function runPipelines(
-  rtmpUrl: string
-): Promise<{ stop: () => Promise<void> }> {
+export async function runPipelines(): Promise<{ stop: () => Promise<void> }> {
   const audioTranscoder = new FfmpegTranscoder();
 
   const auth = new GoogleAuth({
@@ -64,7 +62,6 @@ export async function runPipelines(
 
   // 유즈 케이스 실행
   const service = new StreamlinkToConsumerService(
-    rtmpUrl,
     audioTranscoder,
     orchestrator
   );
