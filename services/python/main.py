@@ -99,7 +99,6 @@ async def lifespan(app: FastAPI):
 
 class StartRequest(BaseModel):
     session_id: str = Field(alias="sessionId")
-    rtmp_url: str = Field(alias="rtmpUrl")
     source_lang: str = Field(alias="sourceLang")
     target_lang: str = Field(alias="targetLang")
 
