@@ -46,6 +46,8 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
         const alternative = result.alternatives?.[0];
         const transcript = alternative?.transcript ?? "";
 
+        console.log("V2 : ", transcript);
+
         if (!alternative) continue;
         options.onTranscript({
           isFinal: result.isFinal ?? false,
@@ -111,6 +113,7 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
       for (let i = 0; i < audioChunkBuffer.length; i += CHUNK) {
         const slice = audioChunkBuffer.subarray(i, i + CHUNK);
         const payload = { audio: slice };
+
         assertAudioOnlyAfterConfig(payload);
         stream.write(payload);
       }

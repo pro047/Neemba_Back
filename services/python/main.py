@@ -4,7 +4,7 @@ import logging
 import traceback
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, Field
 
@@ -134,17 +134,17 @@ def get_metrics():
 
 
 @app.post('/internal/sessions/start', response_model=StartResponse)
-async def start_session(req: StartRequest):
-    base_ws_url = get_ws_url()
+async def start_session(req: StartRequest, request: Request):
+    base_ws_url = request.app.state.get_ws_config['ws_url']
     print('base url', base_ws_url)
-    webSocket_url = f"wss://neemba.app/ws?sessionId={req.session_id}"
+    webSocket_url = f"{base_ws_url}?sessionId={req.session_id}"
     print('ws url', webSocket_url)
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
 
 @app.post('/internal/sessions/stop')
 async def stop_sessoin(req: StopRequest):
-    print(f'sessionId: {req.session_id}')
+    print(f'sessionId: {req.session_id} stopped')
 
     hub: WebSocketHub = app.state.hub
 

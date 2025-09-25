@@ -3,9 +3,10 @@ from dotenv import load_dotenv, find_dotenv
 
 
 def load_env_or_fail() -> None:
-    env_path = find_dotenv()
+    env_path = find_dotenv(filename='.env')
     if not env_path:
-        raise RuntimeError(f'no .env file found (cwd={os.getcwd()})')
+        raise RuntimeError(
+            f'no .env file found (cwd={os.getcwd()}) / env path : {env_path}')
     loaded = load_dotenv(env_path, override=False)
     if not loaded:
         raise RuntimeError(f'failed to load .env: {env_path}')
