@@ -41,8 +41,6 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   }) {
     this.prevText = this.text;
     this.text = this.normalize(result.transcript);
-    console.log("interim : ", result.transcript);
-
     if (!this.prevText || !this.text) return;
 
     const segmentId = result.segmentId;

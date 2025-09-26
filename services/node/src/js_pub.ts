@@ -90,6 +90,7 @@ export class JetStreamTranscriptPublisher implements TranscriptPublisherPort {
 
     try {
       await this.jetStream.publish(subject, payload, { headers: msgHeaders });
+      console.log("published :", message.transcriptText);
     } catch (err) {
       const code = (err as NatsError)?.code;
       if (code === "CONNECTION_CLOSED") {

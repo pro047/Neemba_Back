@@ -34,8 +34,6 @@ export class StreamOrchestrator implements AudioConsumerPort {
   ) {}
 
   async start(pcmReadable: Readable): Promise<StopStreaming> {
-    console.log("orchestar :", pcmReadable);
-
     const sessionId = getSessionId();
 
     const sessionSegmentId = this.segmentManager.next(sessionId);
