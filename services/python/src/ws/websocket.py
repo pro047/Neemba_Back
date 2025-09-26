@@ -15,6 +15,7 @@ class WebSocketHub:
                 await self._safe_close(self.client)
         await ws.accept()
         self.client = ws
+        print('curr ws :', self.client)
 
     async def detach(self) -> None:
         async with self._lock:
