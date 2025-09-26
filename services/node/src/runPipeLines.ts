@@ -15,7 +15,7 @@ const url = natsUrl || "nats://neemba:nats1234@localhost:4222";
 console.log(url);
 
 export async function runPipelines(): Promise<{ stop: () => Promise<void> }> {
-  const audioTranscoder = new FfmpegTranscoder();
+  const ffmpeg = new FfmpegTranscoder();
 
   const auth = new GoogleAuth({
     scopes: "https://www.googleapis.com/auth/cloud-platform",
@@ -61,10 +61,7 @@ export async function runPipelines(): Promise<{ stop: () => Promise<void> }> {
   );
 
   // 유즈 케이스 실행
-  const service = new StreamlinkToConsumerService(
-    audioTranscoder,
-    orchestrator
-  );
+  const service = new StreamlinkToConsumerService(ffmpeg, orchestrator);
 
   const serviceStop = await service.run();
 

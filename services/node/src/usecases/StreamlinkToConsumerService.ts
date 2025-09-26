@@ -1,10 +1,10 @@
-import type { AudioTranscoder, LiveMediaReader } from "../ports/ports";
+import type { AudioTranscoder } from "../ports/ports";
 import type { AudioConsumerPort } from "../ports/audioConsumerPort";
 
 export class StreamlinkToConsumerService {
   constructor(
-    private readonly audioTranscoder: AudioTranscoder,
-    private readonly audioConsumer: AudioConsumerPort
+    private readonly ffmpeg: AudioTranscoder,
+    private readonly orchestra: AudioConsumerPort
   ) {}
 
   async run(): Promise<() => Promise<void>> {
@@ -14,9 +14,9 @@ export class StreamlinkToConsumerService {
       inputWritable,
       pcmReadable,
       stop: stopTranscoder,
-    } = this.audioTranscoder.startTranscoder();
+    } = this.ffmpeg.startTranscoder();
 
-    const streamStop = await this.audioConsumer.start(pcmReadable);
+    const streamStop = await this.orchestra.start(pcmReadable);
 
     let alreadyStopped = false;
     const stop = async () => {
