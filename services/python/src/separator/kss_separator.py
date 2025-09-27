@@ -1,6 +1,6 @@
 import asyncio
 import re
-from collections.abc import Callable
+import heapq
 from dataclasses import dataclass
 from typing import List, Protocol
 
@@ -33,16 +33,19 @@ class SentenceSeparator:
     def __init__(self,
                  translator: Translator,
                  pusher: Pusher,
+                 curr_seq=0
                  ) -> None:
         self.queue: asyncio.Queue[TranslationRequestDto] = asyncio.Queue(
             maxsize=1000)
         self.sentence_queue: asyncio.Queue[str] = asyncio.Queue(
         )
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
+        self.heap: list[tuple[int, TranslationRequestDto]] = []
 
         self.sep_sentenc = ""
         self._stop = False
         self.lastSentAt = 0.0
+        self.curr_seq = curr_seq
 
         self._push_task: asyncio.Task[None] | None = None
         self._ticker_task: asyncio.Task[None] | None = None

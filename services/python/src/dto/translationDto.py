@@ -9,7 +9,7 @@ class TranslationRequestDto:
     sequence: int
     source_text: str
     target_lang: str
-    source_lang: Optional[str] = None
+    source_lang: str
     confidence: float = 0.0
 
 

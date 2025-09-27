@@ -16,9 +16,12 @@ export class StreamlinkToConsumerService {
       stop: stopTranscoder,
     } = this.ffmpeg.startTranscoder();
 
+    console.log("service :", pcmReadable);
+
     const streamStop = await this.orchestra.start(pcmReadable);
 
     let alreadyStopped = false;
+
     const stop = async () => {
       if (alreadyStopped) return;
       alreadyStopped = true;
