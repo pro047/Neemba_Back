@@ -3,8 +3,6 @@ import type {
   PublishEvent,
   TranscriptPublisherPort,
 } from "../ports/transcriptPublisher";
-import { LcpStabilizer } from "../stream/lcp";
-import type { StableSuffixGate } from "../stream/StableSuffixGate";
 
 function prefixSum(preText: string, currText: string): string {
   console.log("prefixSum - preText :", preText);
