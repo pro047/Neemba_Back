@@ -1,10 +1,5 @@
 import type { Readable, Writable } from "node:stream";
 
-//쿠키 헤더 제공 인터페이스
-export interface CookieHeaderProvider {
-  getCookieHeader(): Promise<string>;
-}
-
 export interface LiveMediaExtracter {
   getStreamUrl(youtubeUrl: string): Promise<string>;
 }

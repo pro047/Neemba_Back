@@ -4,7 +4,7 @@ import type {
   AudioConsumerPort,
   StopStreaming,
 } from "../ports/audioConsumerPort";
-import { getSessionId } from "../sessions/sessionStore";
+import { getSessionId } from "../ports/sessionStore";
 import type { ISegmentManager } from "../ports/segment";
 import type { IInterfaceOrchestra } from "../ports/interimOrchestra";
 import type { StreamSwitcher } from "../stream/StreamSwitcher";
