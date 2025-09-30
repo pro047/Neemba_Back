@@ -65,7 +65,7 @@ export async function runPipelines(): Promise<{ stop: () => Promise<void> }> {
 
   const serviceStop = await service.run();
 
-  console.log("Starting Streamlink to Consumer Service...");
+  console.log("translate Starting");
 
   return { stop: serviceStop };
 }

@@ -22,7 +22,7 @@ class TranscriptConsumer:
         self.stream_name = stream_name
         self.consumer_name = consumer_name
         self.worker_concurrency = worker_concurrency
-        self.worker_semaphore = asyncio.Semaphore(worker_concurrency)
+        self.worker_semaphore = asyncio.Semaphore(1)
         self.client = None
         self.subscription = None
         self.separator = separator
@@ -69,17 +69,16 @@ class TranscriptConsumer:
         )
 
     async def _handle_message(self, message: Msg) -> None:
-        logging.basicConfig(level=logging.ERROR)
-
-        async with self.worker_semaphore:
-            try:
-                req = self._parse_request(message.data)
-                print(f"req: {req}")
+        try:
+            req = self._parse_request(message.data)
+            async with self.worker_semaphore:
+                # print(
+                #     f"req: {req} / seg : {req.segment_id} - req_text : {req.source_text}")
                 await self.separator.offer(req)
-                await message.ack()
-            except Exception:
-                logging.exception("handle message error")
-                await message.nak()
+            await message.ack()
+        except Exception:
+            logging.exception("handle message error")
+            await message.nak()
 
     async def run(self):
         print("consumer run")
@@ -89,9 +88,10 @@ class TranscriptConsumer:
 
         while True:
             try:
-                msgs = await self.subscription.fetch(batch=self.worker_concurrency, timeout=5)
+                msgs = await self.subscription.fetch()
             except TimeoutError:
                 continue
+
             tasks = [asyncio.create_task(self._handle_message(msg))
                      for msg in msgs]
             if tasks:

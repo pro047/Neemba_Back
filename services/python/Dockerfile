@@ -32,6 +32,7 @@ RUN set -eux; \
 
 
 FROM base AS deps
+
 COPY pyproject.toml uv.lock* /app/
 
 ENV PATH="/usr/local/bin:${PATH}"
@@ -43,19 +44,20 @@ RUN uv --version \
     && rm -f /tmp/req.lock.txt
 
 FROM deps AS runtime
-COPY . /app
-USER appuser
 
+COPY . /app
+
+USER appuser
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \ 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 FROM runtime AS dev
-CMD [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--lifespan", "on", "--log-level", "info", "--reload", "--reload-dir", "/app/services/python", "--reload-include", "*.py", "--reload-exclude", "__pycache__/*", "--reload-exclude", "*.pyc" ]
+CMD [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--lifespan", "on", "--log-level", "info"]
 
 FROM runtime AS prod
-ENV GUNICORN_WORKERS=2 \
+ENV GUNICORN_WORKERS=1 \
     GUNICORN_TIMEOUT=60
-CMD [ "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000", "--timeout", "60", "main:app"]
+CMD [ "gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "-b", "0.0.0.0:8000", "--timeout", "60", "main:app"]

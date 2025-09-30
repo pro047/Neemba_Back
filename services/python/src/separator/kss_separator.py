@@ -1,6 +1,9 @@
 import asyncio
+import os
 import re
-import heapq
+import threading
+
+
 from dataclasses import dataclass
 from typing import List, Protocol
 
@@ -12,7 +15,7 @@ from src.dto.translationDto import TranslationRequestDto
 
 @dataclass
 class SegmentState:
-    carryover_text: str = ''
+    buffer: str = ''
 
 
 class Pusher(Protocol):
@@ -33,38 +36,44 @@ class SentenceSeparator:
     def __init__(self,
                  translator: Translator,
                  pusher: Pusher,
-                 curr_seq=0
                  ) -> None:
+        self._lock = asyncio.Lock()
+        self._tasks: list[asyncio.Task[None]] = []
         self.queue: asyncio.Queue[TranslationRequestDto] = asyncio.Queue(
             maxsize=1000)
         self.sentence_queue: asyncio.Queue[str] = asyncio.Queue(
         )
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
-        self.heap: list[tuple[int, TranslationRequestDto]] = []
 
-        self.sep_sentenc = ""
+        self._start = False
         self._stop = False
         self.lastSentAt = 0.0
-        self.curr_seq = curr_seq
-
-        self._push_task: asyncio.Task[None] | None = None
-        self._ticker_task: asyncio.Task[None] | None = None
-        self._store_text_task: asyncio.Task[None] | None = None
 
         self.pusher = pusher
         self.translator = translator
         self.splitter = Kss("split_sentences")
 
     async def start(self) -> None:
-        self._ticker_task = asyncio.create_task(self._ticker_loop())
-        self._store_text_task = asyncio.create_task(self._store_text_loop())
-        self._push_task = asyncio.create_task(self._push_loop())
+        async with self._lock:
+            if self._start:
+                print(f'sep - start ignored {os.getpid()} {id(self)}')
+                return
+            self._start = True
+            print(f'sep - start : {os.getpid} {id(self)}')
+        self._tasks = [
+            asyncio.create_task(self._ticker_loop()),
+            asyncio.create_task(self._store_text_loop()),
+            asyncio.create_task(self._push_loop()),
+        ]
 
     async def stop(self) -> None:
         self._stop = True
-        for t in (self._ticker_task, self._push_task, self._store_text_task):
+        for t in self._tasks:
             if t:
                 t.cancel()
+
+        await asyncio.gather(*self._tasks)
+        self._tasks.clear()
 
     async def offer(self, event: TranslationRequestDto):
         await self.queue.put(event)
@@ -78,13 +87,9 @@ class SentenceSeparator:
                 key = (event.session_id, event.segment_id)
                 state = self.state_by_key.setdefault(key, SegmentState())
 
-                state.carryover_text += event.source_text
-                try:
-                    pass
-                finally:
-                    self.queue.task_done()
-        except asyncio.CancelledError:
-            pass
+                state.buffer = (state.buffer + " " + event.source_text).strip()
+        finally:
+            self.queue.task_done()
 
     async def _push_loop(self) -> None:
         print('regist _push_loop')
@@ -106,29 +111,43 @@ class SentenceSeparator:
 
         try:
             while not self._stop:
-                await asyncio.sleep(3.0)
+                try:
+                    await asyncio.sleep(3.0)
+                except asyncio.CancelledError:
+                    break
                 await self._flush()
+
         except asyncio.CancelledError:
             pass
 
     async def _flush(self) -> None:
+        thread = threading.enumerate()
+        print(f"현재 실행 중인 쓰레드 : {len(thread)}")
+        for th in thread:
+            print(f'- {th.name}')
+
         for key, state in list(self.state_by_key.items()):
-            text = state.carryover_text.strip()
+            text = state.buffer.strip()
+            print(f'text : {text}')
             if not text:
                 continue
 
             sentences: List[str] = await asyncio.to_thread(self.splitter, text)
+            print('separator - sentences : ', sentences)
             if not sentences:
                 continue
 
             last = sentences[-1]
+            print(f'sep - last : {last}')
             closed = _is_sentence_closed(last)
+            print(f'sep - closed : {closed}')
             end = len(sentences) if closed else max(
                 0, len(sentences) - 1)
+            print(f'sep - end : {end}')
 
             for s in sentences[:end]:
                 s_clean = s.strip()
                 if s_clean:
                     print(f's_clean : {s_clean}')
                     await self.sentence_queue.put(s_clean)
-            state.carryover_text = " " if closed else last
+            state.buffer = " " if closed else last

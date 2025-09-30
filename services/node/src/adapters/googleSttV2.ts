@@ -39,7 +39,10 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
 
     stream.on("data", (response: any) => {
       for (const result of response.results ?? []) {
-        if (result.stability < 0.85 && result.stability > 0) {
+        if (
+          (result.stability < 0.85 && result.stability > 0) ||
+          result.isFinal
+        ) {
           return;
         }
 
@@ -48,7 +51,7 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
 
         if (!alternative) continue;
         options.onTranscript({
-          isFinal: result.isFinal ?? false,
+          isFinal: false,
           transcriptText: transcript ?? "",
           confidence: alternative.confidence,
           resultEndTimeMs: toMillis(result.resultEndTimeMs),
