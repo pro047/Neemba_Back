@@ -87,7 +87,7 @@ class SentenceSeparator:
                 key = (event.session_id, event.segment_id)
                 state = self.state_by_key.setdefault(key, SegmentState())
 
-                state.buffer = (state.buffer + " " + event.source_text).strip()
+                state.buffer = (state.buffer + event.source_text).strip()
         finally:
             self.queue.task_done()
 
