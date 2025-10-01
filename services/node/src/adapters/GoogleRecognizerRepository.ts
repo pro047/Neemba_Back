@@ -4,7 +4,7 @@ import type {
   RecognizerLocation,
   RecognizerRepository,
   RecognizerSummary,
-} from "../repositories/RecongnizerRepository";
+} from "../ports/RecongnizerRepository";
 
 export class GoogleRecognizerRepository implements RecognizerRepository {
   createSpeechClientByParent(parent: string): speech.SpeechClient {
@@ -98,8 +98,6 @@ export class GoogleRecognizerRepository implements RecognizerRepository {
     );
     if (found) return found.name;
     try {
-      console.log("ensure create", this.create(input));
-
       return await this.create(input);
     } catch (err: any) {
       if (err.code === 6) {

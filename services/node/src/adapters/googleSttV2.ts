@@ -23,10 +23,9 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
   ) {}
 
   getRecognizer = async () => {
-    const recognizer = await this.speechClient.getRecognizer({
+    await this.speechClient.getRecognizer({
       name: this.recognizerName,
     });
-    console.log("recognizer", recognizer);
   };
 
   startStreaming(options: {

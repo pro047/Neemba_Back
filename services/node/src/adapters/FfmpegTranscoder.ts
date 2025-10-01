@@ -37,11 +37,16 @@ export class FfmpegTranscoder implements AudioTranscoder {
       stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
 
+    if (child) {
+      console.log("ffmpeg spawned");
+      console.log(child.stdout);
+    }
+
     this.childProcess = child;
 
-    child.stderr.on("data", (d) => process.stdout.write(String(d)));
-    child.on("error", (e) => console.error("spawn error:", e));
-    child.on("close", (c) => console.log("ffmpeg exit code :", c));
+    this.childProcess.stderr.on("data", (d) => console.log(d));
+    this.childProcess.on("error", (e) => console.error("spawn error:", e));
+    this.childProcess.on("close", (c) => console.log("ffmpeg exit code :", c));
 
     return {
       inputWritable: child.stdin,

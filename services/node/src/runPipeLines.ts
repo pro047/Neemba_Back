@@ -20,6 +20,7 @@ export async function runPipelines(): Promise<{ stop: () => Promise<void> }> {
   const auth = new GoogleAuth({
     scopes: "https://www.googleapis.com/auth/cloud-platform",
   });
+
   const projectId = await auth.getProjectId();
 
   const recognizer = new GoogleRecognizerRepository();
