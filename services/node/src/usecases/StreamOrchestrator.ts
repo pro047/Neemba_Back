@@ -66,6 +66,8 @@ export class StreamOrchestrator implements AudioConsumerPort {
 
     (async () => {
       for await (const chunk of pcmReadable as unknown as AsyncIterable<Buffer>) {
+        console.log("orchestra : ", chunk.length);
+
         if (this.stopFlag) return;
         await this.switcher.write(chunk);
       }
