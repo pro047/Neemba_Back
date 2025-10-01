@@ -55,7 +55,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 FROM runtime AS dev
-CMD [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--lifespan", "on", "--log-level", "info"]
+CMD [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--lifespan", "on", "--log-level", "info", "--reload"]
 
 FROM runtime AS prod
 ENV GUNICORN_WORKERS=1 \
