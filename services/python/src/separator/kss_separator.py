@@ -61,10 +61,11 @@ class SentenceSeparator:
             self._start = True
             print(f'sep - start : {os.getpid} {id(self)}')
         self._tasks = [
-            asyncio.create_task(self._ticker_loop()),
+            asyncio.create_task(self._flush()),
             asyncio.create_task(self._store_text_loop()),
             asyncio.create_task(self._push_loop()),
         ]
+        print(self._tasks)
 
     async def stop(self) -> None:
         self._stop = True
@@ -72,7 +73,7 @@ class SentenceSeparator:
             if t:
                 t.cancel()
 
-        await asyncio.gather(*self._tasks)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
     async def offer(self, event: TranslationRequestDto):
@@ -97,6 +98,7 @@ class SentenceSeparator:
         try:
             while not self._stop:
                 sentence = await self.sentence_queue.get()
+                print(f'push loop : {sentence}')
                 try:
                     translated = self.translator.translate(
                         sentence, target_language='en-US')
@@ -106,48 +108,56 @@ class SentenceSeparator:
         except asyncio.CancelledError:
             pass
 
-    async def _ticker_loop(self) -> None:
-        print('regist _ticker_loop')
+    # async def _ticker_loop(self) -> None:
+    #     print('regist _ticker_loop')
+
+    #     try:
+    #         while not self._stop:
+    #             try:
+    #                 await asyncio.sleep(3.0)
+    #             except asyncio.CancelledError:
+    #                 break
+    #             await self._flush()
+
+    #     except asyncio.CancelledError:
+    #         pass
+
+    async def _get_state_item(self) -> str:
+        print('get state item')
+        text = ''
+        for key, state in list(self.state_by_key.items()):
+            text = state.buffer.strip()
+        return text
+
+    async def _flush(self) -> None:
+        print('regist flush')
 
         try:
             while not self._stop:
-                try:
-                    await asyncio.sleep(3.0)
-                except asyncio.CancelledError:
-                    break
-                await self._flush()
+                text = await self._get_state_item()
+                print(f'text : {text}')
+                if not text:
+                    print('flush : not found text')
+                    return
 
+                sentences: List[str] = await asyncio.to_thread(self.splitter, text)
+                print('separator - sentences : ', sentences)
+                if not sentences:
+                    return
+
+                last = sentences[-1]
+                print(f'sep - last : {last}')
+                closed = _is_sentence_closed(last)
+                print(f'sep - closed : {closed}')
+                end = len(sentences) if closed else max(
+                    0, len(sentences) - 1)
+                print(f'sep - end : {end}')
+
+                for s in sentences[:end]:
+                    s_clean = s.strip()
+                    if s_clean:
+                        await self.sentence_queue.put(s_clean)
+                        print(f's_clean : {s_clean}')
+                # state.buffer = " " if closed else last
         except asyncio.CancelledError:
-            pass
-
-    async def _flush(self) -> None:
-        thread = threading.enumerate()
-        print(f"현재 실행 중인 쓰레드 : {len(thread)}")
-        for th in thread:
-            print(f'- {th.name}')
-
-        for key, state in list(self.state_by_key.items()):
-            text = state.buffer.strip()
-            print(f'text : {text}')
-            if not text:
-                continue
-
-            sentences: List[str] = await asyncio.to_thread(self.splitter, text)
-            print('separator - sentences : ', sentences)
-            if not sentences:
-                continue
-
-            last = sentences[-1]
-            print(f'sep - last : {last}')
-            closed = _is_sentence_closed(last)
-            print(f'sep - closed : {closed}')
-            end = len(sentences) if closed else max(
-                0, len(sentences) - 1)
-            print(f'sep - end : {end}')
-
-            for s in sentences[:end]:
-                s_clean = s.strip()
-                if s_clean:
-                    print(f's_clean : {s_clean}')
-                    await self.sentence_queue.put(s_clean)
-            state.buffer = " " if closed else last
+            print('flush finished')

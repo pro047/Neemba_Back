@@ -39,7 +39,6 @@ export class FfmpegTranscoder implements AudioTranscoder {
 
     if (child) {
       console.log("ffmpeg spawned");
-      console.log(child.stdout);
     }
 
     this.childProcess = child;
