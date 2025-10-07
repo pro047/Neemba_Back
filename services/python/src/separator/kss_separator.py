@@ -43,6 +43,7 @@ class SentenceSeparator:
             maxsize=1000)
         self.sentence_queue: asyncio.Queue[str] = asyncio.Queue(
         )
+        self.state_queue: asyncio.Queue[SegmentState] = asyncio.Queue()
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
 
         self._start = False
@@ -65,7 +66,6 @@ class SentenceSeparator:
             asyncio.create_task(self._store_text_loop()),
             asyncio.create_task(self._push_loop()),
         ]
-        print(self._tasks)
 
     async def stop(self) -> None:
         self._stop = True
@@ -89,6 +89,7 @@ class SentenceSeparator:
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
+                await self.state_queue.put(state)
         finally:
             self.queue.task_done()
 
@@ -108,56 +109,36 @@ class SentenceSeparator:
         except asyncio.CancelledError:
             pass
 
-    # async def _ticker_loop(self) -> None:
-    #     print('regist _ticker_loop')
-
-    #     try:
-    #         while not self._stop:
-    #             try:
-    #                 await asyncio.sleep(3.0)
-    #             except asyncio.CancelledError:
-    #                 break
-    #             await self._flush()
-
-    #     except asyncio.CancelledError:
-    #         pass
-
-    async def _get_state_item(self) -> str:
-        print('get state item')
-        text = ''
-        for key, state in list(self.state_by_key.items()):
-            text = state.buffer.strip()
-        return text
-
     async def _flush(self) -> None:
         print('regist flush')
-
         try:
             while not self._stop:
-                text = await self._get_state_item()
-                print(f'text : {text}')
-                if not text:
-                    print('flush : not found text')
-                    return
+                if self._stop:
+                    break
+                text = await self.state_queue.get()
+                print(f'text : {text.buffer}')
 
-                sentences: List[str] = await asyncio.to_thread(self.splitter, text)
+                sentences: List[str] = await asyncio.to_thread(self.splitter, text.buffer)
                 print('separator - sentences : ', sentences)
                 if not sentences:
-                    return
+                    print('empty sentences so continue')
+                    continue
 
                 last = sentences[-1]
-                print(f'sep - last : {last}')
+
                 closed = _is_sentence_closed(last)
-                print(f'sep - closed : {closed}')
+
                 end = len(sentences) if closed else max(
                     0, len(sentences) - 1)
-                print(f'sep - end : {end}')
 
                 for s in sentences[:end]:
                     s_clean = s.strip()
                     if s_clean:
                         await self.sentence_queue.put(s_clean)
                         print(f's_clean : {s_clean}')
-                # state.buffer = " " if closed else last
+                text.buffer = " " if closed else last
         except asyncio.CancelledError:
             print('flush finished')
+            raise
+        except Exception as e:
+            print('flush error:', e)

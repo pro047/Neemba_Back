@@ -5,7 +5,7 @@ import type { Readable, Writable } from "node:stream";
 
 export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
-
+  private healthCheckTimer: NodeJS.Timeout | null = null;
   startTranscoder(): {
     inputWritable: Writable;
     pcmReadable: Readable;
@@ -14,11 +14,13 @@ export class FfmpegTranscoder implements AudioTranscoder {
     const ffmpegArguments = [
       "-hide_banner",
       "-loglevel",
-      "warning",
+      "info",
+      "-analyzeduration",
+      "0",
+      "-probesize",
+      "32k",
       "-fflags",
       "nobuffer",
-      "-flags",
-      "low_delay",
       "-i",
       "rtmp://neemba.app:1935/live/translation",
       "-vn",
@@ -31,19 +33,31 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "-f",
       "s16le",
       "pipe:1",
+      "-progress",
+      "pipe:2",
     ];
 
     const child = spawn("ffmpeg", ffmpegArguments, {
       stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
 
-    if (child) {
-      console.log("ffmpeg spawned");
-    }
+    let lastProcessAt = Date.now();
 
     this.childProcess = child;
 
-    this.childProcess.stderr.on("data", (d) => console.log(d));
+    this.childProcess.stderr.on("data", (d) => {
+      const str = d.toString();
+      if (str.includes("out_time_ms")) {
+        lastProcessAt = Date.now();
+      }
+    });
+
+    this.healthCheckTimer = setInterval(() => {
+      if (Date.now() - lastProcessAt > 3000) {
+        console.warn("ffmpeg process not updated for 3s");
+      }
+    }, 3000);
+
     this.childProcess.on("error", (e) => console.error("spawn error:", e));
     this.childProcess.on("close", (c) => console.log("ffmpeg exit code :", c));
 
@@ -54,6 +68,10 @@ export class FfmpegTranscoder implements AudioTranscoder {
         if (child) {
           child.kill("SIGKILL");
           this.childProcess = undefined;
+        }
+        if (this.healthCheckTimer) {
+          clearInterval(this.healthCheckTimer);
+          this.healthCheckTimer = null;
         }
       },
     };
