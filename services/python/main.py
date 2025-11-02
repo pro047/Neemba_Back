@@ -169,8 +169,15 @@ async def websocket_endpoint(ws: WebSocket):
         })
 
         while True:
-            await ws.receive_text()
+            message = await ws.receive_json()
+            
+            # pong 핸들링
+            if message.get("type") == "pong":
+                await hub.on_pong()
 
     except WebSocketDisconnect:
         print('main : websocket disconnected')
         pass
+    except Exception as e:
+        print(f'main : websocket error: {e}')
+        await hub.detach()
