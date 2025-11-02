@@ -1,6 +1,9 @@
 import type { AudioTranscoder } from "../ports/ports";
 import type { AudioConsumerPort } from "../ports/audioConsumerPort";
 
+// 전역 변수로 리스너가 등록되었는지 추적
+let signalListenersRegistered = false;
+
 export class StreamlinkToConsumerService {
   constructor(
     private readonly ffmpeg: AudioTranscoder,
@@ -33,12 +36,16 @@ export class StreamlinkToConsumerService {
       await Promise.resolve(stopTranscoder());
     };
 
-    process.once("SIGINT", () => {
-      stop().finally(() => process.exit(0));
-    });
-    process.once("SIGTERM", () => {
-      stop().finally(() => process.exit(0));
-    });
+    // 리스너가 이미 등록되었으면 건너뛰기
+    if (!signalListenersRegistered) {
+      signalListenersRegistered = true;
+      process.once("SIGINT", () => {
+        stop().finally(() => process.exit(0));
+      });
+      process.once("SIGTERM", () => {
+        stop().finally(() => process.exit(0));
+      });
+    }
 
     return stop;
   }
