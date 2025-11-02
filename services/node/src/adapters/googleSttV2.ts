@@ -42,6 +42,8 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
           (result.stability < 0.85 && result.stability > 0) ||
           result.isFinal
         ) {
+          if (result.isFinal)
+            console.dir(result, { depth: null, colors: true });
           return;
         }
 

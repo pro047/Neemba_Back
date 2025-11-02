@@ -29,7 +29,49 @@ class Translator(Protocol):
 
 
 def _is_sentence_closed(text: str) -> bool:
-    return bool(re.search(r'([\.!\?…]|\s*[다요죠네])\s*$', text.strip()))
+    """
+    문장이 종결되었는지 확인하는 함수
+    - 마침표, 느낌표, 물음표, 줄임표로 끝나는지 확인
+    - 한국어 종결어미로 끝나는지 확인 (공백 유무와 관계없이)
+    """
+    text = text.strip()
+    if not text:
+        return False
+    
+    # 구두점으로 끝나는지 확인
+    if re.search(r'[\.!\?…]\s*$', text):
+        return True
+    
+    # 한국어 종결어미로 끝나는지 확인
+    # 단순 종결어미: 다, 요, 죠, 네, 어요, 아요
+    # 복합 종결어미: ~는데요, ~습니다, ~습니까, ~지요, ~게요, ~을게요, ~을까요, 
+    #                ~으니까요, ~네요, ~인데요, ~래요, ~거예요 등
+    # 공백이 있을 수도 있고 없을 수도 있음
+    endings = [
+        r'[다요죠네]\s*$',  # 단순 종결어미
+        r'어요\s*$',
+        r'아요\s*$',
+        r'는데요\s*$',
+        r'은데요\s*$',
+        r'습니다\s*$',
+        r'습니까\s*$',
+        r'지요\s*$',
+        r'게요\s*$',
+        r'을게요\s*$',
+        r'을까요\s*$',
+        r'으니까요\s*$',
+        r'네요\s*$',
+        r'인데요\s*$',
+        r'래요\s*$',
+        r'거예요\s*$',
+        r'니다\s*$',
+    ]
+    
+    for ending in endings:
+        if re.search(ending, text):
+            return True
+    
+    return False
 
 
 class SentenceSeparator:
