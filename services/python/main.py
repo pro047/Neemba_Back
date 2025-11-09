@@ -86,11 +86,11 @@ async def lifespan(app: FastAPI):
             with contextlib.suppress(Exception):
                 await app.state.separator.stop()
 
-        for task in (getattr(app.state, "consumer_task", None), getattr(app.state, "separator_tast", None)):
+        for task in (getattr(app.state, "consumer_task", None), getattr(app.state, "separator_task", None)):
             if task and not task.done():
                 task.cancel()
 
-        for task in (getattr(app.state, "consumer_task", None), getattr(app.state, "separator_tast", None)):
+        for task in (getattr(app.state, "consumer_task", None), getattr(app.state, "separator_task", None)):
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
@@ -143,7 +143,7 @@ async def start_session(req: StartRequest, request: Request):
 
 
 @app.post('/internal/sessions/stop')
-async def stop_sessoin(req: StopRequest):
+async def stop_session(req: StopRequest):
     print(f'sessionId: {req.session_id} stopped')
 
     hub: WebSocketHub = app.state.hub
@@ -171,9 +171,15 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             message = await ws.receive_json()
             
-            # pong 핸들링
-            if message.get("type") == "pong":
+            message_type = message.get("type")
+            
+            # pong 타입: 클라이언트가 주기적으로 보내는 pong (keepalive)
+            if message_type == "pong":
                 await hub.on_pong()
+                continue
+            
+            # 다른 메시지 타입은 여기서 처리 (현재는 없음)
+            # 실제 데이터 메시지는 여기서 처리됨
 
     except WebSocketDisconnect:
         print('main : websocket disconnected')

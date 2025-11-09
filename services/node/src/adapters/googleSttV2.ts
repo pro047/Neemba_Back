@@ -38,22 +38,30 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
 
     stream.on("data", (response: any) => {
       for (const result of response.results ?? []) {
-        if (
-          (result.stability < 0.85 && result.stability > 0) ||
-          result.isFinal
-        ) {
-          if (result.isFinal)
-            console.dir(result, { depth: null, colors: true });
+        const alternative = result.alternatives?.[0];
+        if (!alternative) continue;
+
+        // Final 결과는 항상 처리
+        if (result.isFinal) {
+          console.dir(result, { depth: null, colors: true });
+          options.onTranscript({
+            isFinal: true,
+            transcriptText: alternative.transcript ?? "",
+            confidence: alternative.confidence,
+            resultEndTimeMs: toMillis(result.resultEndTimeMs),
+          });
+          continue;
+        }
+
+        // Interim 결과는 stability가 충분할 때만 처리
+        if (result.stability < 0.85 && result.stability > 0) {
           return;
         }
 
-        const alternative = result.alternatives?.[0];
-        const transcript = alternative?.transcript ?? "";
-
-        if (!alternative) continue;
+        const transcript = alternative.transcript ?? "";
         options.onTranscript({
           isFinal: false,
-          transcriptText: transcript ?? "",
+          transcriptText: transcript,
           confidence: alternative.confidence,
           resultEndTimeMs: toMillis(result.resultEndTimeMs),
         });

@@ -4,15 +4,6 @@ import type {
   TranscriptPublisherPort,
 } from "../ports/transcriptPublisher";
 
-function prefixSum(preText: string, currText: string): string {
-  console.log("prefixSum - preText :", preText);
-  console.log("prefixSum - currText :", currText);
-  console.log("-----------------------------------");
-  preText = currText;
-  const result = preText + currText;
-  return result;
-}
-
 export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   private text: string | null = "";
   private prevText: string | null = "";
@@ -44,10 +35,7 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
     const segmentId = result.segmentId;
     const sessionId = result.sessionId;
 
-    const slice =
-      this.prevText.length > this.text.length
-        ? this.text
-        : this.text.slice(this.prevText.length);
+    const slice = this.computeDelta(this.prevText, this.text);
 
     if (slice === "") return;
 
@@ -74,6 +62,34 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
       .trim()
       .replace(/[\s]+/g, " ")
       .replace(/[.,!?]/g, "");
+  }
+
+  private computeDelta(prevText: string | null, currText: string | null) {
+    if (!currText) return "";
+    if (!prevText) return currText;
+    if (prevText === currText) return "";
+
+    let prefixIdx = 0;
+    const minLength = Math.min(prevText.length, currText.length);
+    while (
+      prefixIdx < minLength &&
+      prevText.charCodeAt(prefixIdx) === currText.charCodeAt(prefixIdx)
+    ) {
+      prefixIdx++;
+    }
+
+    let prevSuffix = prevText.length - 1;
+    let currSuffix = currText.length - 1;
+    while (
+      prevSuffix >= prefixIdx &&
+      currSuffix >= prefixIdx &&
+      prevText.charCodeAt(prevSuffix) === currText.charCodeAt(currSuffix)
+    ) {
+      prevSuffix--;
+      currSuffix--;
+    }
+
+    return currText.slice(prefixIdx, currSuffix + 1);
   }
 
   private async ensurePublisher() {
