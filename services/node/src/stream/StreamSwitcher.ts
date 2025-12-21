@@ -50,8 +50,17 @@ export class StreamSwitcher implements IStreamSwitcher {
     while (this.buffer.length >= frameBytes) {
       const frame = this.buffer.subarray(0, frameBytes);
       this.buffer = this.buffer.subarray(frameBytes);
-
-      await handle.write(frame);
+      if (generation !== this.generation || !handle.isOpen()) {
+        this.buffer = Buffer.concat([frame, this.buffer]);
+        return;
+      }
+      try {
+        await handle.write(frame);
+      } catch (err) {
+        console.error("stream switcher write failed", err);
+        this.buffer = Buffer.concat([frame, this.buffer]);
+        return;
+      }
     }
   }
 

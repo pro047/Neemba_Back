@@ -11,26 +11,30 @@ import type { StreamSwitcher } from "../stream/StreamSwitcher";
 import type { StreamHandle } from "../ports/streamSwitcher";
 import { createSentenceSession } from "../sessions/createSentenceSession";
 
+type RotationReason = "scheduled" | "error";
+
 function makeGoogleHandle(
   google: ReturnType<SpeechToTextPort["startStreaming"]>
 ): StreamHandle {
   return {
     write: (data: Buffer) => google.writeAudioChunk(data),
     close: () => google.stop(),
-    isOpen: () => true,
+    isOpen: () => google.isOpen(),
   };
 }
 
 export class StreamOrchestrator implements AudioConsumerPort {
   private stopFlag = false;
-  private restartTimer?: NodeJS.Timeout;
+  private restartTimer: NodeJS.Timeout | undefined;
+  private rotationInFlight: Promise<void> | null = null;
 
   constructor(
     private readonly sttPort: SpeechToTextPort,
     private readonly switcher: StreamSwitcher,
     private readonly interimOrchestra: IInterfaceOrchestra,
     private readonly segmentManager: ISegmentManager,
-    private readonly restartIntervalMs = 285_000
+    private readonly restartIntervalMs = 285_000,
+    private readonly restartRetryIntervalMs = 5_000
   ) {}
 
   async start(pcmReadable: Readable): Promise<StopStreaming> {
@@ -63,6 +67,7 @@ export class StreamOrchestrator implements AudioConsumerPort {
     const firstHandle = this._createSttHandle(session, sessionId);
 
     await this.switcher.handoff(firstHandle, sessionSegmentId);
+    this._scheduleNextRestart(sessionId, session);
 
     (async () => {
       for await (const chunk of pcmReadable as unknown as AsyncIterable<Buffer>) {
@@ -71,14 +76,13 @@ export class StreamOrchestrator implements AudioConsumerPort {
       }
     })().catch((e) => console.error("pcm pump error", e));
 
-    this._scheduleOverlap(sessionId, session);
-
     return async () => {
       this.stopFlag = true;
-      clearTimeout(this.restartTimer);
-      session.stop();
+      this._clearRestartTimer();
+      await this.rotationInFlight?.catch(() => undefined);
+      session.stop(sessionId);
       this.interimOrchestra.dispose();
-      this.switcher.shutdown();
+      await this.switcher.shutdown();
       console.log("stream stopped");
     };
   }
@@ -98,7 +102,12 @@ export class StreamOrchestrator implements AudioConsumerPort {
           sessionId: sessionId,
         });
       },
-      onError: (e) => console.log("Stt error :", e),
+      onError: (e) => {
+        console.log("Stt error :", e);
+        this._rotateStream(sessionId, session, "error").catch(
+          () => undefined
+        );
+      },
     });
     try {
       stt.configureOnce();
@@ -109,19 +118,55 @@ export class StreamOrchestrator implements AudioConsumerPort {
     return makeGoogleHandle(stt);
   }
 
-  private _scheduleOverlap(
+  private _scheduleNextRestart(
     sessionId: string,
-    session: ReturnType<typeof createSentenceSession>
+    session: ReturnType<typeof createSentenceSession>,
+    delayMs = this.restartIntervalMs,
+    reason: RotationReason = "scheduled"
   ) {
-    const tick = async () => {
+    if (this.stopFlag) return;
+    this._clearRestartTimer();
+    this.restartTimer = setTimeout(() => {
+      this._rotateStream(sessionId, session, reason).catch(() => undefined);
+    }, delayMs);
+  }
+
+  private _clearRestartTimer() {
+    if (!this.restartTimer) return;
+    clearTimeout(this.restartTimer);
+    this.restartTimer = undefined;
+  }
+
+  private _rotateStream(
+    sessionId: string,
+    session: ReturnType<typeof createSentenceSession>,
+    reason: RotationReason
+  ): Promise<void> {
+    if (this.rotationInFlight) return this.rotationInFlight;
+
+    const work = (async () => {
       if (this.stopFlag) return;
-      const nextSegmentId = this.segmentManager.next(sessionId);
-      const nextHandle = this._createSttHandle(session, sessionId);
+      this._clearRestartTimer();
+      try {
+        const nextSegmentId = this.segmentManager.next(sessionId);
+        const nextHandle = this._createSttHandle(session, sessionId);
+        await this.switcher.handoff(nextHandle, nextSegmentId);
+        this._scheduleNextRestart(sessionId, session);
+      } catch (err) {
+        console.error(`stream rotation failed (${reason})`, err);
+        this._scheduleNextRestart(
+          sessionId,
+          session,
+          this.restartRetryIntervalMs,
+          "error"
+        );
+      }
+    })();
 
-      await this.switcher.handoff(nextHandle, nextSegmentId);
+    this.rotationInFlight = work.finally(() => {
+      this.rotationInFlight = null;
+    });
 
-      this.restartTimer = setTimeout(tick, this.restartIntervalMs);
-    };
-    this.restartTimer = setTimeout(tick, this.restartIntervalMs);
+    return this.rotationInFlight;
   }
 }

@@ -1,16 +1,15 @@
 import { spawn } from "child_process";
 import type { ChildProcessWithoutNullStreams } from "child_process";
 import type { AudioTranscoder } from "../ports/ports";
+import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 
 export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
   private healthCheckTimer: NodeJS.Timeout | null = null;
-  startTranscoder(): {
-    inputWritable: Writable;
-    pcmReadable: Readable;
-    stop: () => void;
-  } {
+  private restarting = false;
+
+  private spawnFfmpeg() {
     const ffmpegArguments = [
       "-hide_banner",
       "-loglevel",
@@ -41,39 +40,100 @@ export class FfmpegTranscoder implements AudioTranscoder {
       stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
 
+    this.childProcess = child;
+    return child;
+  }
+
+  startTranscoder(): {
+    inputWritable: Writable;
+    pcmReadable: Readable;
+    stop: () => void;
+  } {
+    const outputMultiplexer = new PassThrough();
+    const inputProxy = new PassThrough();
+    let stopped = false;
     let lastProcessAt = Date.now();
 
-    this.childProcess = child;
+    const attachTranscoder = () => {
+      const child = this.spawnFfmpeg();
 
-    this.childProcess.stderr.on("data", (d) => {
-      const str = d.toString();
-      if (str.includes("out_time_ms")) {
-        lastProcessAt = Date.now();
-      }
+      lastProcessAt = Date.now();
+
+      child.stdout.on("data", (chunk) => {
+        outputMultiplexer.write(chunk);
+      });
+
+      child.stderr.on("data", (d) => {
+        const str = d.toString();
+        if (str.includes("out_time_ms")) {
+          lastProcessAt = Date.now();
+        }
+      });
+
+      child.on("error", (e) => console.error("spawn error:", e));
+      child.on("close", (code) => {
+        console.log("ffmpeg exit code :", code);
+        if (!stopped) {
+          this.requestRestart(attachTranscoder);
+        }
+      });
+    };
+
+    inputProxy.on("data", (chunk) => {
+      const child = this.childProcess;
+      if (!child || child.stdin.destroyed) return;
+      child.stdin.write(chunk);
     });
+
+    inputProxy.on("end", () => {
+      const child = this.childProcess;
+      if (!child || child.stdin.destroyed) return;
+      child.stdin.end();
+    });
+
+    attachTranscoder();
 
     this.healthCheckTimer = setInterval(() => {
       if (Date.now() - lastProcessAt > 3000) {
         console.warn("ffmpeg process not updated for 3s");
+        this.requestRestart(attachTranscoder);
       }
     }, 3000);
 
-    this.childProcess.on("error", (e) => console.error("spawn error:", e));
-    this.childProcess.on("close", (c) => console.log("ffmpeg exit code :", c));
-
     return {
-      inputWritable: child.stdin,
-      pcmReadable: child.stdout,
+      inputWritable: inputProxy,
+      pcmReadable: outputMultiplexer,
       stop: () => {
-        if (child) {
-          child.kill("SIGKILL");
-          this.childProcess = undefined;
-        }
+        stopped = true;
+        this.disposeChild();
         if (this.healthCheckTimer) {
           clearInterval(this.healthCheckTimer);
           this.healthCheckTimer = null;
         }
+        inputProxy.end();
+        outputMultiplexer.end();
       },
     };
+  }
+
+  private requestRestart(attachTranscoder: () => void): void {
+    if (this.restarting) return;
+    this.restarting = true;
+    queueMicrotask(() => {
+      try {
+        this.disposeChild();
+        attachTranscoder();
+      } finally {
+        this.restarting = false;
+      }
+    });
+  }
+
+  private disposeChild() {
+    if (!this.childProcess) return;
+    try {
+      this.childProcess.kill("SIGKILL");
+    } catch {}
+    this.childProcess = undefined;
   }
 }

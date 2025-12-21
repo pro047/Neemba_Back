@@ -20,6 +20,11 @@ services:
     restart: unless-stopped
     networks:
       - appnet
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   rtmp:
     image: alfg/nginx-rtmp
@@ -34,6 +39,11 @@ services:
     networks:
       - appnet
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   reloader:
     image: alpine:3.20
@@ -48,6 +58,11 @@ services:
     networks:
       - appnet
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   certbot:
     image: certbot/certbot
@@ -60,6 +75,11 @@ services:
     networks:
       - appnet
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   node:
     build:
@@ -80,6 +100,11 @@ services:
       interval: 15s
       timeout: 3s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   python:
     build:
@@ -99,6 +124,11 @@ services:
       interval: 15s
       timeout: 3s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   nats:
     image: nats:2.10.17-alpine
@@ -120,3 +150,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

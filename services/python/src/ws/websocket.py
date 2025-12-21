@@ -66,7 +66,8 @@ class WebSocketHub:
 
     async def _send_text(self, ws: WebSocket, text: str) -> None:
         try:
-            await ws.send_text(text)
+            async with self._send_gate:
+                await ws.send_text(text)
             print('hub: broadcast:', text)
 
         except Exception as e:
@@ -84,13 +85,30 @@ class WebSocketHub:
         except Exception:
             pass
 
-    async def _send_ping(self, ws: WebSocket) -> None:
+    async def _mark_waiting_for_reconnect(self) -> None:
+        async with self._lock:
+            self.client = None
+            self._reconnect_waiting = True
+            self._reconnect_waiting_since = time.time()
+            self._first_pong_received = False
+            self._last_pong_time = 0
+
+    async def _send_ping(self, ws: WebSocket) -> bool:
         """ping 전송 (클라이언트는 자동으로 pong 응답해야 함)"""
         try:
             # ping 메시지를 JSON으로 전송
             # 클라이언트는 이를 받으면 자동으로 {"type": "pong"}을 보내야 함
-            await ws.send_json({"type": "ping"})
+            async with self._send_gate:
+                if ws.application_state != WebSocketState.CONNECTED:
+                    return False
+                await ws.send_json({"type": "ping"})
+            return True
         except Exception as e:
+            msg = str(e)
+            # 연결이 이미 종료된 뒤 ping을 보내려 하면 Starlette가 RuntimeError를 발생시킴
+            if isinstance(e, RuntimeError) and ("websocket.send" in msg or "close" in msg.lower()):
+                print('ping skipped: websocket already closed')
+                return False
             print(f'ping send error: {e}')
             raise
 
@@ -137,12 +155,7 @@ class WebSocketHub:
                             print(
                                 f'keepalive: no pong for {time_since_last_pong:.1f}s, closing and preparing for reconnect')
                             await self._safe_close(ws)
-                            async with self._lock:
-                                self.client = None
-                                self._reconnect_waiting = True
-                                self._reconnect_waiting_since = time.time()
-                                self._first_pong_received = False
-                                self._last_pong_time = 0
+                            await self._mark_waiting_for_reconnect()
                             print(
                                 'keepalive: connection closed, waiting for client to reconnect...')
                             # 재연결 대기 루프로 전환
@@ -153,19 +166,24 @@ class WebSocketHub:
                         print('keepalive: waiting for first pong...')
 
                     # ping 전송
+                    # ping 직전에 현재 클라이언트인지와 상태를 다시 확인
+                    async with self._lock:
+                        current = self.client
+
+                    if current is not ws:
+                        print('keepalive: client replaced before ping, skipping this round')
+                        continue
+
                     # 클라이언트는 이를 받으면 자동으로 {"type": "pong"}을 보내야 함
                     # 클라이언트 코드에서 ping을 받으면 pong만 보내고 무시하도록 처리 필요
-                    await self._send_ping(ws)
+                    sent = await self._send_ping(ws)
+                    if not sent:
+                        raise ConnectionError('ping not sent; websocket closed')
                     print('keepalive: sent ping')
                 except Exception as e:
                     print(f'keepalive: error {e}, preparing for reconnect')
                     await self._safe_close(ws)
-                    async with self._lock:
-                        self.client = None
-                        self._reconnect_waiting = True
-                        self._reconnect_waiting_since = time.time()
-                        self._first_pong_received = False
-                        self._last_pong_time = 0
+                    await self._mark_waiting_for_reconnect()
                     print(
                         'keepalive: connection error, waiting for client to reconnect...')
                     # 재연결 대기 루프로 전환

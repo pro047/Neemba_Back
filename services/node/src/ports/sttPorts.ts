@@ -12,5 +12,6 @@ export interface SpeechToTextPort {
     configureOnce: () => void;
     writeAudioChunk: (audioChunkBuffer: Buffer) => Promise<void>;
     stop: () => Promise<void>;
+    isOpen: () => boolean;
   };
 }

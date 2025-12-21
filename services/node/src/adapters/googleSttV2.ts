@@ -35,6 +35,11 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
     onError: (e: unknown) => void;
   }) {
     const stream = this.speechClient._streamingRecognize();
+    let closed = false;
+
+    const markClosed = () => {
+      closed = true;
+    };
 
     stream.on("data", (response: any) => {
       for (const result of response.results ?? []) {
@@ -67,11 +72,16 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
         });
       }
     });
-    stream.on("error", (err: any) => options.onError?.(err));
+    stream.on("error", (err: any) => {
+      markClosed();
+      options.onError?.(err);
+    });
     stream.on("end", () => {
+      markClosed();
       console.log("stream end");
     });
     stream.on("close", () => {
+      markClosed();
       console.log("stream close");
     });
 
@@ -117,7 +127,11 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
     };
 
     const writeAudioChunk = async (audioChunkBuffer: Buffer) => {
-      if (!Buffer.isBuffer(audioChunkBuffer) || audioChunkBuffer.length === 0)
+      if (
+        closed ||
+        !Buffer.isBuffer(audioChunkBuffer) ||
+        audioChunkBuffer.length === 0
+      )
         return;
       const CHUNK = 8192;
       for (let i = 0; i < audioChunkBuffer.length; i += CHUNK) {
@@ -130,6 +144,8 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
     };
 
     const stop = async () => {
+      if (closed) return;
+      markClosed();
       try {
         stream.end();
       } finally {
@@ -137,6 +153,8 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
       }
     };
 
-    return { configureOnce, writeAudioChunk, stop };
+    const isOpen = () => !closed;
+
+    return { configureOnce, writeAudioChunk, stop, isOpen };
   }
 }

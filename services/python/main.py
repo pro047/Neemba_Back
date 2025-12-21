@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import logging
 import traceback
 from contextlib import asynccontextmanager
@@ -169,15 +170,24 @@ async def websocket_endpoint(ws: WebSocket):
         })
 
         while True:
-            message = await ws.receive_json()
-            
-            message_type = message.get("type")
-            
+            raw_text = await ws.receive_text()
+
+            message_type = None
+            if raw_text:
+                try:
+                    decoded = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    if raw_text.strip().lower() == "pong":
+                        message_type = "pong"
+                else:
+                    if isinstance(decoded, dict):
+                        message_type = decoded.get("type")
+
             # pong 타입: 클라이언트가 주기적으로 보내는 pong (keepalive)
             if message_type == "pong":
                 await hub.on_pong()
                 continue
-            
+
             # 다른 메시지 타입은 여기서 처리 (현재는 없음)
             # 실제 데이터 메시지는 여기서 처리됨
 
