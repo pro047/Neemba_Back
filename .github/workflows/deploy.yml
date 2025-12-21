@@ -10,7 +10,7 @@ env:
 
 jobs:
   build-and-deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,7 +30,7 @@ jobs:
         run: npm run build
         working-directory: services/node
 
-      - name: Set up Python
+      - name: Set up Pytho
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -50,7 +50,6 @@ jobs:
             --exclude="services/node/node_modules" \
             --exclude="services/node/dist" \
             .
-          mv /tmp/release.tar.gz ./release.tar.gz
 
       - name: Upload bundle to EC2
         uses: appleboy/scp-action@v0.1.7
@@ -58,7 +57,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: release.tar.gz
+          source: /tmp/release.tar.gz
           target: /tmp
 
       - name: Deploy on EC2
