@@ -44,8 +44,9 @@ jobs:
 
       - name: Create deployment archive
         run: |
-          tar czf release.tar.gz \
+          tar czf /tmp/release.tar.gz \
             --exclude=".git" \
+            --exclude="release.tar.gz" \
             --exclude="services/node/node_modules" \
             --exclude="services/node/dist" \
             .
@@ -56,7 +57,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: release.tar.gz
+          source: /tmp/release.tar.gz
           target: /tmp
 
       - name: Deploy on EC2
