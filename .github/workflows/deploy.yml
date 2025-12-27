@@ -89,8 +89,10 @@ jobs:
           script: |
             set -euo pipefail
             REMOTE_PATH="${{ env.REMOTE_PATH }}"
-            mkdir -p $REMOTE_PATH
-            tar xzf /tmp/release.tar.gz -C $REMOTE_PATH
+            sudo mkdir -p "$REMOTE_PATH"
+            sudo rm -rf "$REMOTE_PATH"/*
+            sudo tar xzf /tmp/release.tar.gz -C "$REMOTE_PATH" --no-same-owner
+            sudo chown -R "$USER":"$USER" "$REMOTE_PATH"
             cd $REMOTE_PATH
             docker compose -f docker-compose.prod.yml pull
             docker compose -f docker-compose.prod.yml up -d --build
