@@ -8,6 +8,8 @@ export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private restarting = false;
+  private killedChildren = new WeakSet<ChildProcessWithoutNullStreams>();
+  private killTimers = new WeakMap<ChildProcessWithoutNullStreams, NodeJS.Timeout>();
 
   private spawnFfmpeg() {
     const ffmpegArguments = [
@@ -53,11 +55,14 @@ export class FfmpegTranscoder implements AudioTranscoder {
     const inputProxy = new PassThrough();
     let stopped = false;
     let lastProcessAt = Date.now();
+    let lastStderrLogAt = 0;
+    let childStartAt = Date.now();
 
     const attachTranscoder = () => {
       const child = this.spawnFfmpeg();
 
       lastProcessAt = Date.now();
+      childStartAt = lastProcessAt;
 
       child.stdout.on("data", (chunk) => {
         outputMultiplexer.write(chunk);
@@ -67,14 +72,26 @@ export class FfmpegTranscoder implements AudioTranscoder {
         const str = d.toString();
         if (str.includes("out_time_ms")) {
           lastProcessAt = Date.now();
+        } else {
+          const now = Date.now();
+          if (now - lastStderrLogAt > 1000) {
+            lastStderrLogAt = now;
+            console.warn("ffmpeg stderr:", str.trim());
+          }
         }
       });
 
-      child.on("error", (e) => console.error("spawn error:", e));
-      child.on("close", (code) => {
-        console.log("ffmpeg exit code :", code);
-        if (!stopped) {
-          this.requestRestart(attachTranscoder);
+      child.on("error", (e) => console.error("ffmpeg spawn error:", e));
+      child.on("close", (code, signal) => {
+        const killedByUs = this.killedChildren.has(child);
+        const killTimer = this.killTimers.get(child);
+        if (killTimer) {
+          clearTimeout(killTimer);
+          this.killTimers.delete(child);
+        }
+        console.log("ffmpeg exit:", { code, signal, killedByUs });
+        if (!stopped && !killedByUs) {
+          this.requestRestart(attachTranscoder, "exit");
         }
       });
     };
@@ -94,18 +111,20 @@ export class FfmpegTranscoder implements AudioTranscoder {
     attachTranscoder();
 
     this.healthCheckTimer = setInterval(() => {
-      if (Date.now() - lastProcessAt > 3000) {
-        console.warn("ffmpeg process not updated for 3s");
-        this.requestRestart(attachTranscoder);
+      const now = Date.now();
+      if (now - childStartAt < 15000) return;
+      if (now - lastProcessAt > 10000) {
+        console.warn("ffmpeg process not updated for 10s");
+        this.requestRestart(attachTranscoder, "stalled");
       }
-    }, 3000);
+    }, 5000);
 
     return {
       inputWritable: inputProxy,
       pcmReadable: outputMultiplexer,
       stop: () => {
         stopped = true;
-        this.disposeChild();
+        this.disposeChild("stop");
         if (this.healthCheckTimer) {
           clearInterval(this.healthCheckTimer);
           this.healthCheckTimer = null;
@@ -116,12 +135,16 @@ export class FfmpegTranscoder implements AudioTranscoder {
     };
   }
 
-  private requestRestart(attachTranscoder: () => void): void {
+  private requestRestart(
+    attachTranscoder: () => void,
+    reason: "stalled" | "exit"
+  ): void {
     if (this.restarting) return;
     this.restarting = true;
     queueMicrotask(() => {
       try {
-        this.disposeChild();
+        console.warn("ffmpeg restart requested:", reason);
+        this.disposeChild("restart");
         attachTranscoder();
       } finally {
         this.restarting = false;
@@ -129,11 +152,19 @@ export class FfmpegTranscoder implements AudioTranscoder {
     });
   }
 
-  private disposeChild() {
+  private disposeChild(reason: "restart" | "stop") {
     if (!this.childProcess) return;
+    const child = this.childProcess;
+    this.killedChildren.add(child);
     try {
-      this.childProcess.kill("SIGKILL");
+      child.kill("SIGTERM");
     } catch {}
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    }, 2000);
+    this.killTimers.set(child, timer);
     this.childProcess = undefined;
   }
 }
