@@ -88,6 +88,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euo pipefail
+            REMOTE_PATH="${{ env.REMOTE_PATH }}"
             mkdir -p $REMOTE_PATH
             tar xzf /tmp/release.tar.gz -C $REMOTE_PATH
             cd $REMOTE_PATH
