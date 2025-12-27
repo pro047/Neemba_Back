@@ -10,8 +10,17 @@ SG_ID="$1"
 PORT="${2:-22}"
 DESC="${3:-gha-actions}"
 
-META_JSON="$(curl -fsSL https://api.github.com/meta)"
-if [[ -z "$META_JSON" ]]; then
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+META_JSON_FILE="$TMP_DIR/meta.json"
+PERMS_FILE="$TMP_DIR/perms.txt"
+
+if ! curl -fsSL -H "Accept: application/vnd.github+json" https://api.github.com/meta -o "$META_JSON_FILE"; then
+  echo "Failed to fetch GitHub meta API. Check network access." >&2
+  exit 1
+fi
+if [[ ! -s "$META_JSON_FILE" ]]; then
   echo "GitHub meta API returned empty response. Check network access." >&2
   exit 1
 fi
@@ -74,7 +83,7 @@ if [[ -n "$REVOKE_JSON" && "$REVOKE_JSON" != "[]" ]]; then
     --ip-permissions "$REVOKE_JSON"
 fi
 
-echo "$META_JSON" | python3 - "$PORT" "$DESC" <<'PY' | while IFS= read -r perm; do
+if ! python3 - "$PORT" "$DESC" <<'PY' <"$META_JSON_FILE" >"$PERMS_FILE"; then
 import sys, json
 port = int(sys.argv[1])
 desc = sys.argv[2]
@@ -103,9 +112,18 @@ def emit(cidrs, ipv6=False):
 emit(ipv4, False)
 emit(ipv6, True)
 PY
+then
+  echo "GitHub meta JSON parse failed. First 200 chars:" >&2
+  head -c 200 "$META_JSON_FILE" >&2
+  echo >&2
+  exit 1
+fi
+
+while IFS= read -r perm; do
   aws ec2 authorize-security-group-ingress \
     --group-id "$SG_ID" \
     --ip-permissions "$perm"
 done
+
 
 echo "Updated SSH ingress rules for $SG_ID (port $PORT, description '$DESC')."
