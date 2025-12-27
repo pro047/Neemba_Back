@@ -11,17 +11,32 @@ PORT="${2:-22}"
 DESC="${3:-gha-actions}"
 
 META_JSON="$(curl -fsSL https://api.github.com/meta)"
+if [[ -z "$META_JSON" ]]; then
+  echo "GitHub meta API returned empty response. Check network access." >&2
+  exit 1
+fi
 
-REVOKE_JSON="$(
+SG_JSON="$(
   aws ec2 describe-security-groups \
     --group-ids "$SG_ID" \
     --query 'SecurityGroups[0].IpPermissions' \
-    --output json |
-  python3 - "$PORT" "$DESC" <<'PY'
+    --output json
+)"
+if [[ -z "$SG_JSON" ]]; then
+  echo "AWS returned empty security group data. Check credentials, region, and SG ID." >&2
+  exit 1
+fi
+
+REVOKE_JSON="$(
+  python3 - "$PORT" "$DESC" <<'PY' <<<"$SG_JSON"
 import sys, json
 port = int(sys.argv[1])
 desc = sys.argv[2]
-perms = json.load(sys.stdin)
+try:
+  perms = json.load(sys.stdin)
+except json.JSONDecodeError:
+  print("Failed to parse security group JSON from AWS.", file=sys.stderr)
+  sys.exit(1)
 
 def filter_ranges(key, cidr_key):
   ranges = []
@@ -63,7 +78,11 @@ echo "$META_JSON" | python3 - "$PORT" "$DESC" <<'PY' | while IFS= read -r perm; 
 import sys, json
 port = int(sys.argv[1])
 desc = sys.argv[2]
-data = json.load(sys.stdin)
+try:
+  data = json.load(sys.stdin)
+except json.JSONDecodeError:
+  print("Failed to parse GitHub meta JSON.", file=sys.stderr)
+  sys.exit(1)
 cidrs = data.get("actions", [])
 ipv4 = [c for c in cidrs if ":" not in c]
 ipv6 = [c for c in cidrs if ":" in c]
