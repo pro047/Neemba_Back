@@ -23,7 +23,9 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Update GHA SSH IP allowlist
-        run: scripts/update-gha-ssh-ips.sh "${{ secrets.EC2_SG_ID }}"
+        run: |
+          chmod +x scripts/update-gha-ssh-ips.sh
+          scripts/update-gha-ssh-ips.sh "${{ secrets.EC2_SG_ID }}"
 
   build-and-deploy:
     runs-on: ubuntu-latest
