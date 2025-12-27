@@ -95,6 +95,12 @@ except json.JSONDecodeError:
   print("Failed to parse GitHub meta JSON.", file=sys.stderr)
   sys.exit(1)
 cidrs = data.get("actions", [])
+if not cidrs:
+  keys = ", ".join(sorted(data.keys()))
+  print("GitHub meta JSON contains no 'actions' CIDRs.", file=sys.stderr)
+  print(f"Available keys: {keys}", file=sys.stderr)
+  sys.exit(1)
+print(f"Found {len(cidrs)} GitHub Actions CIDRs.", file=sys.stderr)
 ipv4 = [c for c in cidrs if ":" not in c]
 ipv6 = [c for c in cidrs if ":" in c]
 
