@@ -83,12 +83,14 @@ if [[ -n "$REVOKE_JSON" && "$REVOKE_JSON" != "[]" ]]; then
     --ip-permissions "$REVOKE_JSON"
 fi
 
-if ! python3 - "$PORT" "$DESC" <<'PY' <"$META_JSON_FILE" >"$PERMS_FILE"; then
+if ! python3 - "$PORT" "$DESC" "$META_JSON_FILE" <<'PY' >"$PERMS_FILE"; then
 import sys, json
 port = int(sys.argv[1])
 desc = sys.argv[2]
+meta_path = sys.argv[3]
 try:
-  data = json.load(sys.stdin)
+  with open(meta_path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
 except json.JSONDecodeError:
   print("Failed to parse GitHub meta JSON.", file=sys.stderr)
   sys.exit(1)
