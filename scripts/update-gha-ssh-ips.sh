@@ -68,7 +68,7 @@ print(json.dumps(out))
 PY
 )"
 
-if [[ "$REVOKE_JSON" != "[]" ]]; then
+if [[ -n "$REVOKE_JSON" && "$REVOKE_JSON" != "[]" ]]; then
   aws ec2 revoke-security-group-ingress \
     --group-id "$SG_ID" \
     --ip-permissions "$REVOKE_JSON"
