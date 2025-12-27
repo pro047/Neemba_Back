@@ -44,12 +44,15 @@ jobs:
 
       - name: Create deployment archive
         run: |
-          tar czf release.tar.gz \
+          tar czf /tmp/release.tar.gz \
             --exclude=".git" \
             --exclude="release.tar.gz" \
             --exclude="services/node/node_modules" \
             --exclude="services/node/dist" \
+            --exclude="services/python/.venv" \
+            --exclude="**/__pycache__" \
             .
+          mv /tmp/release.tar.gz release.tar.gz
 
       - name: Upload bundle to EC2
         uses: appleboy/scp-action@v0.1.7
