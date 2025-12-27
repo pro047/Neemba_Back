@@ -112,7 +112,6 @@ def emit(cidrs, ipv6=False):
 emit(ipv4, False)
 emit(ipv6, True)
 PY
-then
   echo "GitHub meta JSON parse failed. First 200 chars:" >&2
   head -c 200 "$META_JSON_FILE" >&2
   echo >&2
