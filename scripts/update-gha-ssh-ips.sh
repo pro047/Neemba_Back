@@ -1,136 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <security-group-id> [port] [description]" >&2
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <security-group-id> <allow|revoke> [port] [description] [ip]" >&2
   exit 1
 fi
 
 SG_ID="$1"
-PORT="${2:-22}"
-DESC="${3:-gha-actions}"
+ACTION="$2"
+PORT="${3:-22}"
+DESC="${4:-gha-runner}"
+IP="${5:-}"
 
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-META_JSON_FILE="$TMP_DIR/meta.json"
-PERMS_FILE="$TMP_DIR/perms.txt"
-
-if ! curl -fsSL -H "Accept: application/vnd.github+json" https://api.github.com/meta -o "$META_JSON_FILE"; then
-  echo "Failed to fetch GitHub meta API. Check network access." >&2
-  exit 1
-fi
-if [[ ! -s "$META_JSON_FILE" ]]; then
-  echo "GitHub meta API returned empty response. Check network access." >&2
+if [[ "$ACTION" != "allow" && "$ACTION" != "revoke" ]]; then
+  echo "Action must be 'allow' or 'revoke'." >&2
   exit 1
 fi
 
-SG_JSON="$(
-  aws ec2 describe-security-groups \
-    --group-ids "$SG_ID" \
-    --query 'SecurityGroups[0].IpPermissions' \
-    --output json
-)"
-if [[ -z "$SG_JSON" ]]; then
-  echo "AWS returned empty security group data. Check credentials, region, and SG ID." >&2
-  exit 1
+if [[ -z "$IP" ]]; then
+  if ! IP="$(curl -fsSL https://api.ipify.org)"; then
+    echo "Failed to fetch runner public IP." >&2
+    exit 1
+  fi
 fi
 
-REVOKE_JSON="$(
-  python3 - "$PORT" "$DESC" <<'PY' <<<"$SG_JSON"
-import sys, json
+if [[ "$IP" != */* ]]; then
+  CIDR="${IP}/32"
+else
+  CIDR="$IP"
+fi
+
+PERM_JSON="$(
+  python3 - "$PORT" "$DESC" "$CIDR" <<'PY'
+import json, sys
 port = int(sys.argv[1])
 desc = sys.argv[2]
-try:
-  perms = json.load(sys.stdin)
-except json.JSONDecodeError:
-  print("Failed to parse security group JSON from AWS.", file=sys.stderr)
-  sys.exit(1)
-
-def filter_ranges(key, cidr_key):
-  ranges = []
-  for p in perms:
-    if p.get("IpProtocol") != "tcp":
-      continue
-    if p.get("FromPort") != port or p.get("ToPort") != port:
-      continue
-    for r in p.get(key, []):
-      if r.get("Description") == desc and r.get(cidr_key):
-        ranges.append(r.get(cidr_key))
-  return ranges
-
-ipv4 = filter_ranges("IpRanges", "CidrIp")
-ipv6 = filter_ranges("Ipv6Ranges", "CidrIpv6")
-
-perm = {"IpProtocol": "tcp", "FromPort": port, "ToPort": port}
-out = []
-if ipv4:
-  perm_v4 = dict(perm)
-  perm_v4["IpRanges"] = [{"CidrIp": c, "Description": desc} for c in ipv4]
-  out.append(perm_v4)
-if ipv6:
-  perm_v6 = dict(perm)
-  perm_v6["Ipv6Ranges"] = [{"CidrIpv6": c, "Description": desc} for c in ipv6]
-  out.append(perm_v6)
-
-print(json.dumps(out))
+cidr = sys.argv[3]
+perm = {
+  "IpProtocol": "tcp",
+  "FromPort": port,
+  "ToPort": port,
+  "IpRanges": [{"CidrIp": cidr, "Description": desc}],
+}
+print(json.dumps([perm]))
 PY
 )"
 
-if [[ -n "$REVOKE_JSON" && "$REVOKE_JSON" != "[]" ]]; then
-  aws ec2 revoke-security-group-ingress \
-    --group-id "$SG_ID" \
-    --ip-permissions "$REVOKE_JSON"
-fi
-
-if ! python3 - "$PORT" "$DESC" "$META_JSON_FILE" <<'PY' >"$PERMS_FILE"; then
-import sys, json
-port = int(sys.argv[1])
-desc = sys.argv[2]
-meta_path = sys.argv[3]
-try:
-  with open(meta_path, "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-except json.JSONDecodeError:
-  print("Failed to parse GitHub meta JSON.", file=sys.stderr)
-  sys.exit(1)
-cidrs = data.get("actions", [])
-if not cidrs:
-  keys = ", ".join(sorted(data.keys()))
-  print("GitHub meta JSON contains no 'actions' CIDRs.", file=sys.stderr)
-  print(f"Available keys: {keys}", file=sys.stderr)
-  sys.exit(1)
-print(f"Found {len(cidrs)} GitHub Actions CIDRs.", file=sys.stderr)
-ipv4 = [c for c in cidrs if ":" not in c]
-ipv6 = [c for c in cidrs if ":" in c]
-
-def chunks(items, size=50):
-  for i in range(0, len(items), size):
-    yield items[i:i+size]
-
-def emit(cidrs, ipv6=False):
-  for chunk in chunks(cidrs):
-    perm = {"IpProtocol": "tcp", "FromPort": port, "ToPort": port}
-    if ipv6:
-      perm["Ipv6Ranges"] = [{"CidrIpv6": c, "Description": desc} for c in chunk]
-    else:
-      perm["IpRanges"] = [{"CidrIp": c, "Description": desc} for c in chunk]
-    print(json.dumps([perm]))
-
-emit(ipv4, False)
-emit(ipv6, True)
-PY
-  echo "GitHub meta JSON parse failed. First 200 chars:" >&2
-  head -c 200 "$META_JSON_FILE" >&2
-  echo >&2
-  exit 1
-fi
-
-while IFS= read -r perm; do
+if [[ "$ACTION" == "allow" ]]; then
   aws ec2 authorize-security-group-ingress \
     --group-id "$SG_ID" \
-    --ip-permissions "$perm"
-done
+    --ip-permissions "$PERM_JSON"
+else
+  if ! OUTPUT="$(
+    aws ec2 revoke-security-group-ingress \
+      --group-id "$SG_ID" \
+      --ip-permissions "$PERM_JSON" 2>&1
+  )"; then
+    if echo "$OUTPUT" | grep -q "InvalidPermission.NotFound"; then
+      echo "No matching ingress rule to revoke for $CIDR." >&2
+    else
+      echo "$OUTPUT" >&2
+      exit 1
+    fi
+  fi
+fi
 
-
-echo "Updated SSH ingress rules for $SG_ID (port $PORT, description '$DESC')."
+echo "${ACTION}ed SSH ingress for $CIDR on $SG_ID (port $PORT, description '$DESC')."
