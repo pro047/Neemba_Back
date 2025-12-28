@@ -1,4 +1,4 @@
-import { TokenBucket } from "../stream/TokenBucket";
+import { TokenBucket } from "../stream/TokenBucket.js";
 
 type RateGateOptions = {
   maximumEmitsPerSecond?: number;

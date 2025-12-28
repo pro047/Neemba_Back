@@ -1,4 +1,4 @@
-import type { ISegmentManager } from "../ports/segment";
+import type { ISegmentManager } from "../ports/segment.js";
 
 export class SegmentManager implements ISegmentManager {
   private perSession = new Map<string, number>();

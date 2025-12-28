@@ -1,15 +1,15 @@
 import { type Readable } from "node:stream";
-import type { SpeechToTextPort } from "../ports/sttPorts";
+import type { SpeechToTextPort } from "../ports/sttPorts.js";
 import type {
   AudioConsumerPort,
   StopStreaming,
-} from "../ports/audioConsumerPort";
-import { getSessionId } from "../ports/sessionStore";
-import type { ISegmentManager } from "../ports/segment";
-import type { IInterfaceOrchestra } from "../ports/interimOrchestra";
-import type { StreamSwitcher } from "../stream/StreamSwitcher";
-import type { StreamHandle } from "../ports/streamSwitcher";
-import { createSentenceSession } from "../sessions/createSentenceSession";
+} from "../ports/audioConsumerPort.js";
+import { getSessionId } from "../ports/sessionStore.js";
+import type { ISegmentManager } from "../ports/segment.js";
+import type { IInterfaceOrchestra } from "../ports/interimOrchestra.js";
+import type { StreamSwitcher } from "../stream/StreamSwitcher.js";
+import type { StreamHandle } from "../ports/streamSwitcher.js";
+import { createSentenceSession } from "../sessions/createSentenceSession.js";
 
 type RotationReason = "scheduled" | "error";
 

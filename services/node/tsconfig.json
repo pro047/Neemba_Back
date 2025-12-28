@@ -7,7 +7,7 @@
 
     // Environment Settings
     // See also https://aka.ms/tsconfig/module
-    "module": "es2022",
+    "module": "nodenext",
     "target": "es2022",
     "types": ["node"],
     // For nodejs:
@@ -43,7 +43,7 @@
 
     "esModuleInterop": true,
     "resolveJsonModule": true,
-    "moduleResolution": "bundler",
+    "moduleResolution": "nodenext",
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src"],

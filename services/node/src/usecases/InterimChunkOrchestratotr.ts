@@ -1,8 +1,8 @@
-import type { IInterfaceOrchestra } from "../ports/interimOrchestra";
+import type { IInterfaceOrchestra } from "../ports/interimOrchestra.js";
 import type {
   PublishEvent,
   TranscriptPublisherPort,
-} from "../ports/transcriptPublisher";
+} from "../ports/transcriptPublisher.js";
 
 export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   private text: string | null = "";

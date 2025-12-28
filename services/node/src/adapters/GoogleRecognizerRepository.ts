@@ -4,7 +4,7 @@ import type {
   RecognizerLocation,
   RecognizerRepository,
   RecognizerSummary,
-} from "../ports/RecongnizerRepository";
+} from "../ports/RecongnizerRepository.js";
 
 export class GoogleRecognizerRepository implements RecognizerRepository {
   createSpeechClientByParent(parent: string): speech.SpeechClient {

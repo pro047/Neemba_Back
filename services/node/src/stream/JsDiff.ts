@@ -1,5 +1,5 @@
 import { diffChars } from "diff";
-import type { GetDiffPort } from "../ports/getDiff";
+import type { GetDiffPort } from "../ports/getDiff.js";
 
 export class JsDiff implements GetDiffPort {
   diff(oldText: string, newText: string): Array<{ text: string }> {

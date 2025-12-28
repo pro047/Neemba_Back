@@ -1,5 +1,5 @@
-import type { AudioTranscoder } from "../ports/ports";
-import type { AudioConsumerPort } from "../ports/audioConsumerPort";
+import type { AudioTranscoder } from "../ports/ports.js";
+import type { AudioConsumerPort } from "../ports/audioConsumerPort.js";
 
 // 전역 변수로 리스너가 등록되었는지 추적
 let signalListenersRegistered = false;

@@ -1,7 +1,7 @@
 import express from "express";
 import { collectDefaultMetrics, Counter, Registry } from "prom-client";
-import rtmp from "./router/rtmp";
-import mic from "./router/mic";
+import rtmp from "./router/rtmp.js";
+import mic from "./router/mic.js";
 import http from "http";
 import { WebSocketServer } from "ws";
 import { v4 as uuidv4 } from "uuid";

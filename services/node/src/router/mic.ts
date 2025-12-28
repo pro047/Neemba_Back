@@ -1,7 +1,7 @@
 import express from "express";
-import { pythonHost } from "../config";
+import { pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
-import { removeSessionId, setSessionId } from "../ports/sessionStore";
+import { removeSessionId, setSessionId } from "../ports/sessionStore.js";
 
 const router = express.Router();
 

@@ -9,7 +9,7 @@ import {
 import type {
   PublishEvent,
   TranscriptPublisherPort,
-} from "./ports/transcriptPublisher";
+} from "./ports/transcriptPublisher.js";
 
 type ConnectionState = "connected" | "closed";
 

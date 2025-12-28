@@ -1,8 +1,8 @@
 import express from "express";
-import { pythonHost } from "../config";
+import { pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
-import { runPipelines } from "../runPipeLines";
-import { removeSessionId, setSessionId } from "../ports/sessionStore";
+import { runPipelines } from "../runPipeLines.js";
+import { removeSessionId, setSessionId } from "../ports/sessionStore.js";
 
 const router = express.Router();
 

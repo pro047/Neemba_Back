@@ -1,5 +1,5 @@
 import { v2 as speech } from "@google-cloud/speech";
-import type { SpeechToTextPort } from "../ports/sttPorts";
+import type { SpeechToTextPort } from "../ports/sttPorts.js";
 
 type TransciprtPayload = {
   isFinal: boolean;

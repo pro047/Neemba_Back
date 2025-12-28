@@ -1,4 +1,4 @@
-import type { IStreamSwitcher, StreamHandle } from "../ports/streamSwitcher";
+import type { IStreamSwitcher, StreamHandle } from "../ports/streamSwitcher.js";
 
 export class StreamSwitcher implements IStreamSwitcher {
   private active?:

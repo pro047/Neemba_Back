@@ -1,15 +1,15 @@
-import { FfmpegTranscoder } from "./adapters/FfmpegTranscoder";
-import { StreamlinkToConsumerService } from "./usecases/StreamlinkToConsumerService";
-import { StreamOrchestrator } from "./usecases/StreamOrchestrator";
-import { GoogleSttV2Adapter } from "./adapters/googleSttV2";
-import { JetStreamTranscriptPublisher } from "./js_pub";
-import { natsUrl } from "./config";
-import { GoogleRecognizerRepository } from "./adapters/GoogleRecognizerRepository";
+import { FfmpegTranscoder } from "./adapters/FfmpegTranscoder.js";
+import { StreamlinkToConsumerService } from "./usecases/StreamlinkToConsumerService.js";
+import { StreamOrchestrator } from "./usecases/StreamOrchestrator.js";
+import { GoogleSttV2Adapter } from "./adapters/googleSttV2.js";
+import { JetStreamTranscriptPublisher } from "./js_pub.js";
+import { natsUrl } from "./config.js";
+import { GoogleRecognizerRepository } from "./adapters/GoogleRecognizerRepository.js";
 import { GoogleAuth } from "google-auth-library";
 import { v2 as speech } from "@google-cloud/speech";
-import { InterimChunkOrchestrator } from "./usecases/InterimChunkOrchestratotr";
-import { SegmentManager } from "./stream/SegmentManager";
-import { StreamSwitcher } from "./stream/StreamSwitcher";
+import { InterimChunkOrchestrator } from "./usecases/InterimChunkOrchestratotr.js";
+import { SegmentManager } from "./stream/SegmentManager.js";
+import { StreamSwitcher } from "./stream/StreamSwitcher.js";
 
 const url = natsUrl || "nats://neemba:nats1234@localhost:4222";
 console.log(url);

@@ -1,6 +1,6 @@
 import { spawn } from "child_process";
 import type { ChildProcessWithoutNullStreams } from "child_process";
-import type { AudioTranscoder } from "../ports/ports";
+import type { AudioTranscoder } from "../ports/ports.js";
 import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 

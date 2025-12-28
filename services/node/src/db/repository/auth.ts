@@ -1,5 +1,5 @@
-import { checkUser, pool } from "../pool";
-import { getChurchQuery, insertChurchQuery } from "../sql/churches";
+import { checkUser, pool } from "../pool.js";
+import { getChurchQuery, insertChurchQuery } from "../sql/churches.js";
 
 class ChurchAuth {
   async getById(churchId: number) {
