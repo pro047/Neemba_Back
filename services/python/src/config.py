@@ -2,11 +2,11 @@ import os
 from dotenv import load_dotenv, find_dotenv
 
 
-def load_env_or_fail() -> None:
+def load_env_optional() -> None:
     env_path = find_dotenv(filename='.env')
     if not env_path:
-        raise RuntimeError(
-            f'no .env file found (cwd={os.getcwd()}) / env path : {env_path}')
+        print(f'no .env file found (cwd={os.getcwd()}); using process env')
+        return
     loaded = load_dotenv(env_path, override=False)
     if not loaded:
         raise RuntimeError(f'failed to load .env: {env_path}')
@@ -15,7 +15,6 @@ def load_env_or_fail() -> None:
 
 def require_env(key: str, *, mask: bool = False) -> str:
     value = os.getenv(key)
-    print(value)
     if value is None or value == "":
         raise RuntimeError(f'env {key} is not configured')
     if mask:
@@ -33,7 +32,7 @@ def require_env_int(key: str) -> int:
         raise RuntimeError(f'en {key} must be an integer, got: {raw!r}')
 
 
-load_env_or_fail()
+load_env_optional()
 
 
 def get_nats_config() -> dict[str, str]:
