@@ -84,6 +84,7 @@ class TranscriptConsumer:
 
     async def _handle_message(self, message: Msg) -> None:
         try:
+            print("NATS raw subject:", message.subject)
             req = self._parse_request(message.data)
             print(
                 "NATS received:",
@@ -96,8 +97,8 @@ class TranscriptConsumer:
                 #     f"req: {req} / seg : {req.segment_id} - req_text : {req.source_text}")
                 await self.separator.offer(req)
             await message.ack()
-        except Exception:
-            logging.exception("handle message error")
+        except Exception as exc:
+            print("NATS handle message error:", repr(exc))
             await message.nak()
 
     async def run(self):
@@ -112,6 +113,8 @@ class TranscriptConsumer:
             except TimeoutError:
                 continue
 
+            if msgs:
+                print("NATS fetched:", len(msgs))
             tasks = [asyncio.create_task(self._handle_message(msg))
                      for msg in msgs]
             if tasks:
