@@ -138,13 +138,21 @@ services:
       - .env.prod
     expose:
       - "4222"
+  nats-box:
+    image: synadia/nats-box:latest
+    container_name: nats-box
+    command: ["/bin/sh", "-lc", "sleep infinity"]
+    env_file:
+      - .env.prod
+    networks:
+      - appnet
+    depends_on:
+      - nats
+    restart: unless-stopped
       - "8222"
     volumes:
       - nats-data:/data
       - /srv/neemba/infra/nats/nats.conf:/etc/nats/nats.conf:ro
-    networks:
-      - appnet
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8222/varz"]
       interval: 10s
