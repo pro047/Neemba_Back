@@ -86,7 +86,11 @@ jobs:
             set -euo pipefail
             REMOTE_PATH="${{ env.REMOTE_PATH }}"
             sudo mkdir -p "$REMOTE_PATH"
-            sudo rm -rf "$REMOTE_PATH"/*
+            sudo find "$REMOTE_PATH" -mindepth 1 -maxdepth 1 \
+              ! -path "$REMOTE_PATH/infra" -exec rm -rf {} +
+            sudo mkdir -p "$REMOTE_PATH/infra"
+            sudo find "$REMOTE_PATH/infra" -mindepth 1 -maxdepth 1 \
+              ! -path "$REMOTE_PATH/infra/letsencrypt" -exec rm -rf {} +
             sudo tar xzf /tmp/release.tar.gz -C "$REMOTE_PATH" --no-same-owner
             sudo chown -R "$USER":"$USER" "$REMOTE_PATH"
             cd $REMOTE_PATH
