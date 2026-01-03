@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew LetsEncrypt certs for neemba
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/neemba-certbot-renew.sh
