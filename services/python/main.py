@@ -58,7 +58,8 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.exception('background task crasehd', exc_info=True)
+                print("background task crashed:", repr(task.exception()))
+                traceback.print_exc()
 
         app.state.consumer_task = asyncio.create_task(
             build(
