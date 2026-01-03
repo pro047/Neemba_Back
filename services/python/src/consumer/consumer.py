@@ -40,14 +40,22 @@ class TranscriptConsumer:
         async def on_close():
             print('NATS connection closed')
 
-        self.client = await nats.connect(
-            self.nats_url,
-            error_cb=on_error,
-            disconnected_cb=on_disconnect,
-            reconnected_cb=on_reconnect,
-            closed_cb=on_close
-        )
-        print('NATS connected to', self.nats_url)
+        safe_url = self.nats_url
+        if "@" in safe_url:
+            proto, rest = safe_url.split("://", 1) if "://" in safe_url else ("nats", safe_url)
+            safe_url = f"{proto}://{rest.split('@', 1)[1]}"
+        try:
+            self.client = await nats.connect(
+                self.nats_url,
+                error_cb=on_error,
+                disconnected_cb=on_disconnect,
+                reconnected_cb=on_reconnect,
+                closed_cb=on_close
+            )
+        except Exception as exc:
+            print("NATS connect failed to", safe_url, "error:", repr(exc))
+            raise
+        print('NATS connected to', safe_url)
 
         jetstream = self.client.jetstream()
 
@@ -55,6 +63,12 @@ class TranscriptConsumer:
             subject=self.nats_subject,
             durable=self.consumer_name,
             stream=self.stream_name,
+        )
+        print(
+            "NATS subscription ready:",
+            self.nats_subject,
+            self.stream_name,
+            self.consumer_name,
         )
 
     def _parse_request(self, raw: bytes) -> TranslationRequestDto:

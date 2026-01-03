@@ -41,12 +41,19 @@ export class JetStreamTranscriptPublisher implements TranscriptPublisherPort {
       throw new Error(`Invalid NATS schema: ${url.protocol}`);
     }
 
-    this.connection = await connect({
-      servers: `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ""}`,
-      user: decodeURIComponent(url.username),
-      pass: decodeURIComponent(url.password),
-    });
-    console.log("connected to:", this.connection.getServer());
+    const server = `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ""}`;
+    console.log("NATS connecting to:", server);
+    try {
+      this.connection = await connect({
+        servers: server,
+        user: decodeURIComponent(url.username),
+        pass: decodeURIComponent(url.password),
+      });
+    } catch (err) {
+      console.error("NATS connection failed:", err);
+      throw err;
+    }
+    console.log("NATS connected to:", this.connection.getServer());
 
     this.jetStream = this.connection.jetstream();
     this.state = "connected";
