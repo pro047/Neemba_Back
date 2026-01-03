@@ -43,7 +43,8 @@ class TranscriptConsumer:
 
         safe_url = self.nats_url
         if "@" in safe_url:
-            proto, rest = safe_url.split("://", 1) if "://" in safe_url else ("nats", safe_url)
+            proto, rest = safe_url.split(
+                "://", 1) if "://" in safe_url else ("nats", safe_url)
             safe_url = f"{proto}://{rest.split('@', 1)[1]}"
         try:
             self.client = await nats.connect(
@@ -115,6 +116,7 @@ class TranscriptConsumer:
                     timeout=1,
                 )
             except (TimeoutError, NatsTimeoutError):
+                print("Nats run timeout error")
                 continue
 
             if msgs:
