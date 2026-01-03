@@ -85,6 +85,12 @@ class TranscriptConsumer:
     async def _handle_message(self, message: Msg) -> None:
         try:
             req = self._parse_request(message.data)
+            print(
+                "NATS received:",
+                req.session_id,
+                req.sequence,
+                req.source_text,
+            )
             async with self.worker_semaphore:
                 # print(
                 #     f"req: {req} / seg : {req.segment_id} - req_text : {req.source_text}")
