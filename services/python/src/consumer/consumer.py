@@ -5,6 +5,7 @@ from typing import Protocol
 
 import nats
 from nats.aio.msg import Msg
+from nats.errors import TimeoutError as NatsTimeoutError
 
 from src.dto.translationDto import TranslationRequestDto
 
@@ -22,7 +23,7 @@ class TranscriptConsumer:
         self.stream_name = stream_name
         self.consumer_name = consumer_name
         self.worker_concurrency = worker_concurrency
-        self.worker_semaphore = asyncio.Semaphore(1)
+        self.worker_semaphore = asyncio.Semaphore(worker_concurrency)
         self.client = None
         self.subscription = None
         self.separator = separator
@@ -74,12 +75,12 @@ class TranscriptConsumer:
     def _parse_request(self, raw: bytes) -> TranslationRequestDto:
         data = json.loads(raw.decode('utf-8'))
         return TranslationRequestDto(
-            segment_id=data['segmentId'],
-            session_id=data["sessionId"],
-            sequence=data['sequence'],
-            source_text=data["transcriptText"],
-            target_lang=data["targetLanguage"],
-            source_lang=data.get("sourceLanguage")
+            data["sessionId"],
+            data["segmentId"],
+            data["sequence"],
+            data["transcriptText"],
+            data["targetLanguage"],
+            data.get("sourceLanguage"),
         )
 
     async def _handle_message(self, message: Msg) -> None:
@@ -109,8 +110,11 @@ class TranscriptConsumer:
 
         while True:
             try:
-                msgs = await self.subscription.fetch()
-            except TimeoutError:
+                msgs = await self.subscription.fetch(
+                    batch=self.worker_concurrency,
+                    timeout=1,
+                )
+            except (TimeoutError, NatsTimeoutError):
                 continue
 
             if msgs:
