@@ -32,7 +32,7 @@ jobs:
           cache: npm
           cache-dependency-path: services/node/package-lock.json
 
-      - name: Set up Pytho
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -87,17 +87,18 @@ jobs:
             set -euo pipefail
             REMOTE_PATH="${{ env.REMOTE_PATH }}"
             sudo mkdir -p "$REMOTE_PATH"
-            if [ -n "${ENV_PROD:-}" ]; then
-              printf "%s" "$ENV_PROD" | sudo tee "$REMOTE_PATH/.env.prod" > /dev/null
-              sudo chmod 600 "$REMOTE_PATH/.env.prod"
-            fi
             sudo find "$REMOTE_PATH" -mindepth 1 -maxdepth 1 \
-              ! -path "$REMOTE_PATH/infra" -exec rm -rf {} +
+              ! -path "$REMOTE_PATH/infra" \
+              ! -path "$REMOTE_PATH/.env.prod" -exec rm -rf {} +
             sudo mkdir -p "$REMOTE_PATH/infra"
             sudo find "$REMOTE_PATH/infra" -mindepth 1 -maxdepth 1 \
               ! -path "$REMOTE_PATH/infra/letsencrypt" -exec rm -rf {} +
             sudo tar xzf /tmp/release.tar.gz -C "$REMOTE_PATH" --no-same-owner
             sudo chown -R "$USER":"$USER" "$REMOTE_PATH"
+            if [ -n "${ENV_PROD:-}" ]; then
+              printf "%s" "$ENV_PROD" | sudo tee "$REMOTE_PATH/.env.prod" > /dev/null
+              sudo chmod 600 "$REMOTE_PATH/.env.prod"
+            fi
             cd $REMOTE_PATH
             docker compose -f docker-compose.prod.yml up -d --build
             rm -f /tmp/release.tar.gz
