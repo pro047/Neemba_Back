@@ -160,7 +160,8 @@ services:
   nats-box:
     image: synadia/nats-box:latest
     container_name: nats-box
-    command: ["/bin/sh", "-lc", "sleep infinity"]
+    entrypoint: ["/bin/sh", "-lc"]
+    command: ["sleep infinity"]
     env_file:
       - .env.prod
     networks:
