@@ -78,6 +78,7 @@ jobs:
         uses: appleboy/ssh-action@v1.2.0
         env:
           REMOTE_PATH: ${{ env.REMOTE_PATH }}
+          ENV_PROD: ${{ secrets.ENV_PROD }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
@@ -86,6 +87,10 @@ jobs:
             set -euo pipefail
             REMOTE_PATH="${{ env.REMOTE_PATH }}"
             sudo mkdir -p "$REMOTE_PATH"
+            if [ -n "${ENV_PROD:-}" ]; then
+              printf "%s" "$ENV_PROD" | sudo tee "$REMOTE_PATH/.env.prod" > /dev/null
+              sudo chmod 600 "$REMOTE_PATH/.env.prod"
+            fi
             sudo find "$REMOTE_PATH" -mindepth 1 -maxdepth 1 \
               ! -path "$REMOTE_PATH/infra" -exec rm -rf {} +
             sudo mkdir -p "$REMOTE_PATH/infra"
