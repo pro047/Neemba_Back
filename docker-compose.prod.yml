@@ -112,6 +112,8 @@ services:
       dockerfile: Dockerfile
       target: prod
     container_name: python
+    volumes:
+      - /var/lib/neemba/secrets:/var/lib/neemba/secrets:ro
     env_file:
       - .env.prod
     expose:
