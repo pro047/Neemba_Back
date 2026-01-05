@@ -113,10 +113,9 @@ class TranscriptConsumer:
             try:
                 msgs = await self.subscription.fetch(
                     batch=self.worker_concurrency,
-                    timeout=1,
+                    timeout=5,
                 )
             except (TimeoutError, NatsTimeoutError):
-                print("Nats run timeout error")
                 continue
 
             if msgs:
