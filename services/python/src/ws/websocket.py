@@ -164,8 +164,9 @@ class WebSocketHub:
                             await asyncio.sleep(5)
                             continue
                     else:
-                        # 첫 pong을 아직 받지 않았으면 타임아웃 체크 안 함
+                        # 첫 pong을 아직 받지 않았으면 핑을 보내지 않음
                         print('keepalive: waiting for first pong...')
+                        continue
 
                     # ping 전송
                     # ping 직전에 현재 클라이언트인지와 상태를 다시 확인

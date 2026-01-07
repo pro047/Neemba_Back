@@ -188,6 +188,13 @@ async def websocket_endpoint(ws: WebSocket):
             if message_type == "pong":
                 await hub.on_pong()
                 continue
+            # ping 타입: 클라이언트가 보내면 pong으로 응답
+            if message_type == "ping":
+                await ws.send_json({"type": "pong"})
+                await hub.on_pong()
+                continue
+            # 다른 메시지도 활동으로 간주해 keepalive 갱신
+            await hub.on_pong()
 
             # 다른 메시지 타입은 여기서 처리 (현재는 없음)
             # 실제 데이터 메시지는 여기서 처리됨
