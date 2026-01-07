@@ -87,6 +87,7 @@ class TranscriptConsumer:
     async def _handle_message(self, message: Msg) -> None:
         try:
             print("NATS raw subject:", message.subject)
+            print("NATS raw bytes:", len(message.data))
             req = self._parse_request(message.data)
             print(
                 "NATS received:",
@@ -97,7 +98,9 @@ class TranscriptConsumer:
             async with self.worker_semaphore:
                 # print(
                 #     f"req: {req} / seg : {req.segment_id} - req_text : {req.source_text}")
+                print("NATS offer to separator:", req.session_id, req.segment_id, req.sequence)
                 await self.separator.offer(req)
+                print("NATS offer done:", req.session_id, req.segment_id, req.sequence)
             await message.ack()
         except Exception as exc:
             print("NATS handle message error:", repr(exc))

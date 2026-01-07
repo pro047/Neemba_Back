@@ -131,6 +131,13 @@ class SentenceSeparator:
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
+                print(
+                    "store_text:",
+                    event.session_id,
+                    event.segment_id,
+                    event.sequence,
+                    f"len={len(state.buffer)}",
+                )
                 await self.state_queue.put(state)
         finally:
             self.queue.task_done()
@@ -143,9 +150,12 @@ class SentenceSeparator:
                 sentence = await self.sentence_queue.get()
                 print(f'push loop : {sentence}')
                 try:
+                    print("push loop: translate start", f"len={len(sentence)}")
                     translated = self.translator.translate(
                         sentence, target_language='en-US')
+                    print("push loop: translate ok", type(translated))
                     await self.pusher.push_to_client(translated, None)
+                    print("push loop: pushed")
                 finally:
                     self.sentence_queue.task_done()
         except asyncio.CancelledError:
@@ -169,9 +179,11 @@ class SentenceSeparator:
                 last = sentences[-1]
 
                 closed = _is_sentence_closed(last)
+                print("separator - last closed:", closed, "last:", last)
 
                 end = len(sentences) if closed else max(
                     0, len(sentences) - 1)
+                print("separator - flush end:", end, "total:", len(sentences))
 
                 for s in sentences[:end]:
                     s_clean = s.strip()

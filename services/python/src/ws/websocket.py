@@ -60,6 +60,8 @@ class WebSocketHub:
             ws = self.client
 
         if ws is None or ws.application_state != WebSocketState.CONNECTED:
+            state = ws.application_state if ws is not None else None
+            print("hub: skip send, ws not connected", state)
             return
 
         asyncio.create_task(self._send_text(ws, text))
