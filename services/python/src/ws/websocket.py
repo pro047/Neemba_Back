@@ -1,7 +1,8 @@
 import asyncio
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
-from typing import Dict, Any, Optional
+from typing import Deque, Dict, Any, Optional
+from collections import deque
 import time
 
 
@@ -15,6 +16,8 @@ class WebSocketHub:
         self._first_pong_received = False  # 첫 pong을 받았는지 추적
         self._reconnect_waiting = False
         self._reconnect_waiting_since = 0
+        self._pending: Deque[str] = deque()
+        self._max_pending = 100
 
     async def attach(self, ws: WebSocket) -> None:
         async with self._lock:
@@ -38,6 +41,7 @@ class WebSocketHub:
 
         # 새로운 keepalive 태스크 시작
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        asyncio.create_task(self._flush_pending(ws))
 
     async def detach(self) -> None:
         async with self._lock:
@@ -60,8 +64,12 @@ class WebSocketHub:
             ws = self.client
 
         if ws is None or ws.application_state != WebSocketState.CONNECTED:
+            async with self._lock:
+                if len(self._pending) >= self._max_pending:
+                    self._pending.popleft()
+                self._pending.append(text)
             state = ws.application_state if ws is not None else None
-            print("hub: skip send, ws not connected", state)
+            print("hub: queued send, ws not connected", state, f"pending={len(self._pending)}")
             return
 
         asyncio.create_task(self._send_text(ws, text))
@@ -86,6 +94,24 @@ class WebSocketHub:
                 await ws.close()
         except Exception:
             pass
+
+    async def _flush_pending(self, ws: WebSocket) -> None:
+        async with self._lock:
+            if not self._pending:
+                return
+            pending = list(self._pending)
+            self._pending.clear()
+        for text in pending:
+            if ws.application_state != WebSocketState.CONNECTED:
+                async with self._lock:
+                    for item in pending[pending.index(text):]:
+                        if len(self._pending) >= self._max_pending:
+                            self._pending.popleft()
+                        self._pending.append(item)
+                print("hub: flush interrupted, re-queued", f"pending={len(self._pending)}")
+                return
+            await self._send_text(ws, text)
+        print("hub: flushed pending", f"count={len(pending)}")
 
     async def _mark_waiting_for_reconnect(self) -> None:
         async with self._lock:
