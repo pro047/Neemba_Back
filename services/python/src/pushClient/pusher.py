@@ -8,10 +8,8 @@ class Pusher:
         self.hub = hub
 
     async def push_to_client(self, push_text: TextResult | list[TextResult],  sequence: int | None):
-        print("pusher: send", type(push_text))
         await self.hub.broadcast_to_session(payload={
             "sequence": sequence,
             "sentence": push_text,
             "isFinal": True
         })
-        print("pusher: send ok")

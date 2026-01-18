@@ -1,7 +1,5 @@
 import asyncio
-import os
 import re
-import threading
 
 
 from dataclasses import dataclass
@@ -99,10 +97,8 @@ class SentenceSeparator:
     async def start(self) -> None:
         async with self._lock:
             if self._start:
-                print(f'sep - start ignored {os.getpid()} {id(self)}')
                 return
             self._start = True
-            print(f'sep - start : {os.getpid} {id(self)}')
         self._tasks = [
             asyncio.create_task(self._flush()),
             asyncio.create_task(self._store_text_loop()),
@@ -122,8 +118,6 @@ class SentenceSeparator:
         await self.queue.put(event)
 
     async def _store_text_loop(self) -> None:
-        print('regist _store_text_loop')
-
         try:
             while not self._stop:
                 event: TranslationRequestDto = await self.queue.get()
@@ -131,68 +125,47 @@ class SentenceSeparator:
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
-                print(
-                    "store_text:",
-                    event.session_id,
-                    event.segment_id,
-                    event.sequence,
-                    f"len={len(state.buffer)}",
-                )
                 await self.state_queue.put(state)
         finally:
             self.queue.task_done()
 
     async def _push_loop(self) -> None:
-        print('regist _push_loop')
-
         try:
             while not self._stop:
                 sentence = await self.sentence_queue.get()
-                print(f'push loop : {sentence}')
                 try:
-                    print("push loop: translate start", f"len={len(sentence)}")
                     translated = self.translator.translate(
                         sentence, target_language='en-US')
-                    print("push loop: translate ok", type(translated))
                     await self.pusher.push_to_client(translated, None)
-                    print("push loop: pushed")
                 finally:
                     self.sentence_queue.task_done()
         except asyncio.CancelledError:
             pass
 
     async def _flush(self) -> None:
-        print('regist flush')
         try:
             while not self._stop:
                 if self._stop:
                     break
                 text = await self.state_queue.get()
-                print(f'text : {text.buffer}')
 
                 sentences: List[str] = await asyncio.to_thread(self.splitter, text.buffer)
-                print('separator - sentences : ', sentences)
                 if not sentences:
-                    print('empty sentences so continue')
                     continue
 
                 last = sentences[-1]
 
                 closed = _is_sentence_closed(last)
-                print("separator - last closed:", closed, "last:", last)
 
                 end = len(sentences) if closed else max(
                     0, len(sentences) - 1)
-                print("separator - flush end:", end, "total:", len(sentences))
 
                 for s in sentences[:end]:
                     s_clean = s.strip()
                     if s_clean:
                         await self.sentence_queue.put(s_clean)
-                        print(f's_clean : {s_clean}')
                 text.buffer = " " if closed else last
         except asyncio.CancelledError:
-            print('flush finished')
             raise
-        except Exception as e:
-            print('flush error:', e)
+        except Exception:
+            pass

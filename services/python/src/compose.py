@@ -4,9 +4,6 @@ from src.ws.websocket import WebSocketHub
 
 
 async def build(hub: WebSocketHub, separator: SentenceSeparator, nats_config: dict[str, str]) -> None:
-    print(
-        f'start build / nats url : {nats_config["nats_url"]} / nats subject : {nats_config["nats_subject"]} / nats stream : {nats_config["nats_stream_name"]} / nats consumer : {nats_config["nats_consumer_name"]}')
-
     consumer = TranscriptConsumer(
         nats_url=nats_config["nats_url"],
         nats_subject=nats_config["nats_subject"],

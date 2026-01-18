@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 from typing import Protocol
 
 import nats
@@ -66,12 +65,6 @@ class TranscriptConsumer:
             durable=self.consumer_name,
             stream=self.stream_name,
         )
-        print(
-            "NATS subscription ready:",
-            self.nats_subject,
-            self.stream_name,
-            self.consumer_name,
-        )
 
     def _parse_request(self, raw: bytes) -> TranslationRequestDto:
         data = json.loads(raw.decode('utf-8'))
@@ -86,28 +79,14 @@ class TranscriptConsumer:
 
     async def _handle_message(self, message: Msg) -> None:
         try:
-            print("NATS raw subject:", message.subject)
-            print("NATS raw bytes:", len(message.data))
             req = self._parse_request(message.data)
-            print(
-                "NATS received:",
-                req.session_id,
-                req.sequence,
-                req.source_text,
-            )
             async with self.worker_semaphore:
-                # print(
-                #     f"req: {req} / seg : {req.segment_id} - req_text : {req.source_text}")
-                print("NATS offer to separator:", req.session_id, req.segment_id, req.sequence)
                 await self.separator.offer(req)
-                print("NATS offer done:", req.session_id, req.segment_id, req.sequence)
             await message.ack()
         except Exception as exc:
-            print("NATS handle message error:", repr(exc))
             await message.nak()
 
     async def run(self):
-        print("consumer run")
         if not self.subscription:
             raise RuntimeError(
                 "Subscription not initialized")
@@ -121,8 +100,6 @@ class TranscriptConsumer:
             except (TimeoutError, NatsTimeoutError):
                 continue
 
-            if msgs:
-                print("NATS fetched:", len(msgs))
             tasks = [asyncio.create_task(self._handle_message(msg))
                      for msg in msgs]
             if tasks:
