@@ -13,20 +13,6 @@ RUN apt-get update && apt-get install -y \
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
 -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp
 
-# 필수 도구
-RUN apt-get update && apt-get install -y curl gnupg ca-certificates && rm -rf /var/lib/apt/lists/*
-
-# 구글 키를 keyring으로 설치
-RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-  | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
-
-# 리포 추가 (signed-by 지정 중요)
-RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
-  > /etc/apt/sources.list.d/google-cloud-sdk.list
-
-# 설치
-RUN apt-get update && apt-get install -y google-cloud-cli && rm -rf /var/lib/apt/lists/*
-
 RUN set -eux; \
     ARCH="$(dpkg --print-architecture)"; \
     # 최신 버전 태그 가져오기

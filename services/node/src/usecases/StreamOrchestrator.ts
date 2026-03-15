@@ -1,6 +1,7 @@
 import { type Readable } from "node:stream";
 import type { SpeechToTextPort } from "../ports/sttPorts.js";
 import type {
+  AudioConsumerContext,
   AudioConsumerPort,
   StopStreaming,
 } from "../ports/audioConsumerPort.js";
@@ -37,8 +38,15 @@ export class StreamOrchestrator implements AudioConsumerPort {
     private readonly restartRetryIntervalMs = 5_000
   ) {}
 
-  async start(pcmReadable: Readable): Promise<StopStreaming> {
-    const sessionId = getSessionId();
+  async start(
+    pcmReadable: Readable,
+    context?: AudioConsumerContext
+  ): Promise<StopStreaming> {
+    const sessionId = context?.sessionId ?? getSessionId();
+
+    if (!sessionId) {
+      throw new Error("sessionId required for mic streaming");
+    }
 
     const sessionSegmentId = this.segmentManager.next(sessionId);
 
