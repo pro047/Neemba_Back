@@ -71,7 +71,7 @@ services:
       - ./infra/letsencrypt:/etc/letsencrypt
       - ./infra/nginx/html:/var/www/html
     entrypoint: >
-      sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/html --quiet && nginx -s reload; sleep 12h & wait $${!}; done'
+      sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/html --quiet && echo reload | nc nginx-reloader 8888; sleep 12h & wait $${!}; done'
     networks:
       - appnet
     restart: unless-stopped
