@@ -190,6 +190,12 @@ services:
 
 **완료 기준**: `postgres` healthy → `pg_isready` 통과 → python 컨테이너에서 DB 도달 → 재기동 후 `pg-data` 영속 확인.
 
+**[Phase 1 구현 메모 — 2026-06-01]**
+- 위 제안 형태 그대로 `docker-compose.prod.yml`에 반영(파일 스타일에 맞춰 `env_file`/`expose`/`logging`은 확장 표기). `volumes:`에 `pg-data` 추가, `python`에 `depends_on: postgres(condition: service_healthy)` 추가.
+- ⚠️ **`POSTGRES_DB: ${POSTGRES_DATABASE}` 치환 주의**: postgres 이미지는 `POSTGRES_DB`를 읽지만 `.env.prod`/`config.py`는 `POSTGRES_DATABASE`를 쓴다(확인: `services/python/src/config.py` `get_postgres_config()`). 그래서 `environment:`에서 `POSTGRES_DB ← ${POSTGRES_DATABASE}`로 브리지함. 이 `${}` 치환은 **compose 호출 시 `--env-file .env.prod`가 있어야** 해소된다(Makefile `up-prod`는 이미 `--env-file .env.prod` 전달 → 정상). `--env-file` 없이 bare `docker compose -f docker-compose.prod.yml up`으로 띄우면 `POSTGRES_DB`가 공란이 되고, postgres가 DB명을 `POSTGRES_USER`(=neemba)로 기본 생성 → 우연히 같은 이름이라 "되는 것처럼" 보이지만 user/db명이 달라지면 깨짐. **검증·기동 시 반드시 `--env-file .env.prod` 사용**(Phase 0 미해결 TODO와 연결: prod 실기동 방식 확정 필요).
+- `healthcheck`는 `pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DATABASE}`로 `$$`(런타임 컨테이너 셸 확장)를 써서 compose config-time 치환에 의존하지 않게 함(컨테이너 env엔 env_file로 주입됨).
+- 검증 한계: 이 컨테이너엔 실 시크릿이 없어 실제 `up`/`pg_isready`/asyncpg/영속은 미수행. 더미 `.env.prod`(가짜값, gitignore)로 `config` 파싱만 검증 후 즉시 삭제함. **실 검증은 맥/실서버에서 `make up-prod`(또는 `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d`)로 수행.**
+
 ### Phase 2 — Python DB 배선
 - `src/database/pool.py` 정상화(깨진 import 수정), FastAPI **lifespan에서 풀 생성/종료**, DI 주입
 - `get_postgres_config()` 연결, POSTGRES_* 로딩 확인
@@ -255,7 +261,7 @@ iOS/모바일 + 멀티데이 작업 특성상:
 | Phase | 작업 | 상태 | 검증 방법/결과 | 담당 브랜치·PR | 비고 |
 |-------|------|------|----------------|----------------|------|
 | 0 | 선결 이슈 확정(base compose) | 검증완료(조사) | 레포 커밋 기준 확정: base `docker-compose.yml` 없음 / `docker-compose.prod.yml` self-contained(`config --services` exit 0) / Makefile `up-prod` 경로는 exit 1(`no such file`)로 동작 불가. §8-1 참조 | `claude/monitor-phase0-compose-baseline-C6XEo` | 코드/설정 무수정(문서만). 맥 실기동 방식 확인 + Makefile 정합성 수정은 별도 Phase 권고 |
-| 1 | Postgres 컨테이너 | 미착수 | 더미 env로 `pg_isready` + asyncpg 접속 | — | |
+| 1 | Postgres 컨테이너 | 구현완료(미검증) | `docker-compose.prod.yml`에 postgres/pg-data/`python.depends_on` 추가. 더미 `.env.prod`로 `config --quiet` **exit 0**, `--env-file` 시 `POSTGRES_DB=neemba` 정상 치환 확인. ⚠️실제 `up`/`pg_isready`/asyncpg 접속/재기동 영속은 **맥·실서버 미검증**(시크릿 없음) | `claude/monitor-phase0-compose-baseline-C6XEo` | `POSTGRES_DB`는 `${POSTGRES_DATABASE}` 치환→**`--env-file .env.prod` 필수**(아래 메모) |
 | 2 | Python DB 배선(pool/lifespan) | 미착수 | 앱 기동 + 풀 생성 확인 | — | |
 | 3 | Alembic + 스키마 | 미착수 | `alembic upgrade head` + 테이블 확인 | — | sync 드라이버 psycopg |
 | 4 | 저장+마스킹+모니터 WS | 미착수 | pytest + INSERT/WS 동작 | — | stop 멱등화 포함 |
@@ -268,6 +274,7 @@ iOS/모바일 + 멀티데이 작업 특성상:
 
 - (2026-06-01, 플랜 세션) 문서 최초 작성. 구현 시작 전. 실제 prod 키/시크릿은 채팅·커밋에 절대 포함 금지(더미로 구조검증, 실키 E2E는 맥/실서버).
 - (2026-06-01, Phase 0 조사 세션, 브랜치 `claude/monitor-phase0-compose-baseline-C6XEo`) **확정 사실**: 레포에 base `docker-compose.yml` 없음(gitignore도 아님 = 진짜 부재), `docker-compose.prod.yml`은 self-contained(8서비스, `config --services` exit 0), Makefile `up-prod`는 base 참조로 레포 상태에서 exit 1(`no such file`)로 깨짐. **Phase 1 담당 주의**: postgres/pg-data/depends_on는 `docker-compose.prod.yml`에 직접 추가(네트워크 `appnet`, `env_file: .env.prod`), 검증은 `make`가 아니라 `docker compose -f docker-compose.prod.yml` 직접 실행으로. **맥에서 사람이 확인할 TODO**: (1) prod 실기동이 `make up-prod`인지 `docker compose -f docker-compose.prod.yml` 직접인지, (2) 맥 로컬에 untracked base `docker-compose.yml`이 실제로 있는지, (3) 있다면 Makefile 정합성 수정을 별도 Phase로 진행할지 결정. **코드/설정/Makefile/.env 일체 무수정**(문서만 갱신).
+- (2026-06-01, Phase 1 구현 세션, 동일 브랜치 `claude/monitor-phase0-compose-baseline-C6XEo`) **`docker-compose.prod.yml`에 postgres 추가 완료**(image `postgres:16-alpine`, expose 5432 내부전용, `pg-data` 볼륨, `pg_isready` healthcheck, `python.depends_on: postgres(service_healthy)`). 더미 `.env.prod`(가짜값)로 `config --quiet` **exit 0** 확인 후 삭제. **다음 세션(Phase 2) 주의**: ① 기동/검증 시 **`--env-file .env.prod` 필수**(POSTGRES_DB ← ${POSTGRES_DATABASE} 치환 때문, §7 Phase 1 메모 참조). ② Python은 `POSTGRES_DATABASE`/`POSTGRES_USER` 등을 `config.py get_postgres_config()`로 읽음 — `.env.prod`에 `POSTGRES_HOST=postgres`(서비스명) 포함 5개 변수 수동 추가 필요(서버/맥, 실비번은 커밋·채팅 금지). ③ **맥 실검증 TODO**: `make up-prod`(또는 직접 compose+`--env-file`)로 실제 `up` → `pg_isready` healthy → python 컨테이너에서 DB 도달 → 재기동 후 `pg-data` 영속 확인(이 4개가 Phase 1 "검증완료" 승격 조건). ④ Phase 0 Makefile 불일치 미해결 — 맥 실기동 방식 따라 별도 Phase로 수정 결정.
 
 ### 각 구현 세션 종료 시 체크리스트
 1. 위 표의 해당 Phase 상태·검증결과·브랜치 갱신

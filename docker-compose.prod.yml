@@ -5,6 +5,7 @@ networks:
 
 volumes:
   nats-data:
+  pg-data:
 
 services:
   nginx:
@@ -112,6 +113,9 @@ services:
       dockerfile: Dockerfile
       target: prod
     container_name: python
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - /var/lib/neemba/secrets:/var/lib/neemba/secrets:ro
     env_file:
@@ -171,3 +175,30 @@ services:
     depends_on:
       - nats
     restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    expose:
+      - "5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - appnet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DATABASE}"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
