@@ -1,0 +1,237 @@
+# 번역 결과 모니터링 페이지 — 구현 플랜
+
+> 목적: 세션별 **원문(STT 텍스트) ↔ 번역문** 페어를 보는 전용 모니터링 페이지 구현.
+> 이 문서는 분석 결과와 확정 결정사항, Phase별 작업 명세를 담은 **구현 핸드오프 문서**다.
+> 새 구현 세션은 이 문서를 읽고 해당 Phase부터 진행하면 된다.
+
+---
+
+## 0. 한눈에 보기 (확정 결정사항)
+
+| 항목 | 결정 |
+|------|------|
+| 보는 형태 | **자체 페이지** (원문↔번역 2열 표). Grafana/Loki 아님 |
+| 실시간/이력 | **둘 다** — 진행중 세션은 실시간 스트림, 종료 세션은 DB 조회 |
+| 데이터 저장 | **PostgreSQL** (마스킹된 원문+번역문 + 세션 메타) |
+| 마이그레이션 | **Alembic** + PostgreSQL (런타임 asyncpg, 마이그레이션용 sync 드라이버 psycopg 별도) |
+| 보존 기간 | **30일** 자동 삭제 |
+| 민감정보 | **마스킹** 처리 (저장 시점 mask-at-write, 원문+번역문 양쪽) |
+| 실시간 방식 | **모니터 전용 WS** (방식 1). 클라이언트 WS와 분리 |
+| DB 연동 범위 | **Python 서비스에만.** Node는 DB write 없음 |
+| Node DB 코드 | `db/pool.ts`/`db/repository/auth.ts`/`db/sql/churches.ts` = **죽은 로그인 잔재 → 폐기** |
+| 접근 제어 | nginx Basic Auth 또는 IP 화이트리스트 (현재 인증 전무) |
+
+**예상 공수: 약 1.5~2일** (Python-only 범위). 신규 비용 대부분은 Postgres 컨테이너 구축.
+
+---
+
+## 1. 레포 아키텍처 요약
+
+듀얼 스택 모노레포:
+- **Node (TS/Express, :3000)** — RTMP/mic 스트리밍 파이프라인, STT(Google), NATS publish
+- **Python (FastAPI, :8000)** — NATS consume → DeepL 번역 → WebSocket 송출
+- **NATS JetStream** — 메시지 브로커 (`transcript.session.*`)
+- **Nginx** — 리버스 프록시 + SSL(certbot)
+- **PostgreSQL** — **현재 compose에 없음 / 연동된 적 없음** (아래 참조)
+
+데이터 흐름:
+```
+Node STT → NATS(transcript.session.{id}) → Python consumer
+   → DeepL 번역 → pusher → WebSocketHub → 클라이언트 WS
+```
+
+### 기존 모니터링 인프라
+- Node/Python 모두 `/metrics`(Prometheus), `/health` 존재
+- `infra/prometheus/`, `infra/grafana/` 설정 폴더는 있으나 **compose에 Prometheus/Grafana 컨테이너 자체가 없음**
+- 로그는 Docker json-file(콘솔)뿐, 집계 없음
+
+---
+
+## 2. 번역 결과 데이터 흐름 분석 (중요)
+
+현재 **번역 결과는 어디에도 저장되지 않는다.**
+- DB 저장 ❌ (Python `src/repository/`는 빈 폴더, asyncpg 풀은 미사용)
+- NATS 재발행 ❌ (Python은 소비자 전용)
+- 유일한 흔적: `src/ws/websocket.py`의 `print('hub: broadcast:', text)` → stdout으로 흘러가고 소멸
+- 클라이언트 WS payload: `{"sequence", "sentence", "isFinal"}` — **원문이 빠져 있어** 페어 매칭 불가
+
+### 핵심 객체/위치
+| 항목 | 위치 |
+|------|------|
+| 번역 입력 DTO | `services/python/src/dto/translationDto.py` — `TranslationRequestDto`(session_id, segment_id, sequence, source_text, source_lang, target_lang, confidence) |
+| 번역 결과 DTO | 동 파일 `TranslationResultDto`(session_id, translated_text만 — **보강 필요**) |
+| DeepL 호출 | `services/python/src/deepL/deepL.py` (TextResult 반환) |
+| 클라 송출 | `services/python/src/pushClient/pusher.py` → `src/ws/websocket.py` `broadcast_to_session()` |
+| Node publish | `services/node/src/js_pub.ts` `PublishEvent`(transcriptText=원문, source/targetLanguage, createdAt 등) |
+
+→ **캡처 지점**: `pusher.py` 경로에서 원문(`source_text`)을 함께 들고 와 마스킹 후 저장 + 모니터 WS 송출.
+
+---
+
+## 3. Node 세션 종료 로직 분석
+
+### 종료 경로 2개
+| | mic 경로 (메인) | RTMP 경로 (레거시) |
+|---|---|---|
+| 엔드포인트 | `POST /api/mic/stop` | `POST /api/sessions/stop` |
+| 핸들러 | `router/mic.ts:145-173` | `router/rtmp.ts:73-109` |
+| 세션 저장 | In-memory Map (`sessionRuntimeStore.ts`), 다중 세션 | 모듈 전역변수, 단일 세션 |
+
+### mic/stop 시퀀스 (`router/mic.ts:158-166`)
+1. `runtimeStore.get(sessionId)`
+2. `runtime.stop()` — 파이프라인 teardown (stopFlag, 타이머 취소, NATS `drain()`/`closed()`, Google STT `stream.end()`, FFmpeg SIGTERM→2s→SIGKILL)
+3. `runtimeStore.delete(sessionId)`
+4. `removeSessionId()`
+5. **`POST {PYTHON_HOST}/internal/sessions/stop` body `{sessionId}`** ← 크로스 서비스 "세션 종료" 신호
+
+### 모니터링 관점 핵심
+- **"세션 종료" 신호의 종점 = Python `/internal/sessions/stop`.** 세션 종료시각 기록 / 라이브→이력 전환 / 모니터 WS 종료 이벤트를 **여기서** 처리.
+- **Node는 DB write 없음** → 번역 저장/세션 메타는 전부 Python(Alembic 테이블)에서 관리.
+
+### 종료 로직 약점 (구현 시 유의)
+1. **멱등성 취약**: stop 2회 호출 시 Python을 또 호출 → Python stop 핸들러를 **멱등하게** 구현 필요
+2. stop 실패 시 store 정리 누락 가능(고아 런타임/프로세스)
+3. Python 통지 실패해도 Node는 이미 정리 → 양쪽 상태 불일치 가능
+4. 클라 WS에 명시적 close 없음
+5. **비정상 종료(크래시/클라 이탈) 시 stop 미호출** → "종료시각 없는 dangling 세션" 발생 가능 → **무활동 타임아웃 기반 세션 종료 보정** 고려
+
+---
+
+## 4. DB 현황 진단 (greenfield)
+
+DB는 "연동된 적 없는" 상태:
+- **Postgres 컨테이너가 compose에 없음** (`docker-compose.prod.yml`에 postgres 서비스 부재)
+- Python `src/database/pool.py` = **깨진 스텁** (`from services.python.src.config import postgres_host...` — 존재하지 않는 경로/심볼 import, config는 `get_postgres_config()` dict만 제공)
+- `src/repository/` = 빈 폴더
+- Alembic/SQL 스키마/마이그레이션 전무 (deps에 `asyncpg`만)
+- `config.py`의 `get_postgres_config()`는 `require_env`라 **POSTGRES_* 없으면 기동 실패**
+
+### Node DB 코드 = 죽은 코드 (폐기 대상)
+import 체인 추적 결과 `index.ts → app.ts → 라우터들`은 DB를 import하지 않음.
+- `db/pool.ts`를 import하는 곳은 `db/repository/auth.ts` 하나뿐
+- 그 `auth.ts`를 import하는 곳은 **0건** → 앱 실행 경로에서 절대 로드 안 됨
+- 로그인 기능 시도 잔재. **삭제해도 다른 곳 수정 불필요** (`db/pool.ts`, `db/repository/auth.ts`, `db/sql/churches.ts` 한 세트)
+
+---
+
+## 5. 데이터 모델 (Phase 3에서 Alembic 마이그레이션)
+
+### `app.translations`
+| 컬럼 | 설명 |
+|------|------|
+| id (PK) | 자동 증가 |
+| session_id | 세션 식별 (인덱스) |
+| segment_id, sequence | 순서 정렬 |
+| source_text | 원문 (마스킹됨) |
+| translated_text | 번역문 (마스킹됨) |
+| source_lang, target_lang | 언어쌍 |
+| confidence | STT 신뢰도 (옵션) |
+| created_at | 저장 시각 (인덱스, 정렬/기간조회/보존) |
+
+### 세션 메타 테이블 (예: `app.sessions`)
+- session_id(PK), started_at, ended_at, source_lang, target_lang, 건수 등
+- `ended_at`은 Python `/internal/sessions/stop`에서 기록
+
+권장: `created_at` 기준 **일 단위 파티셔닝** → 30일 지난 파티션 DROP으로 보존 처리(대량 DELETE 회피).
+
+---
+
+## 6. 마스킹 정책
+
+- **위치**: 저장 직전(INSERT) + 라이브 broadcast 직전 — 공용 마스킹 유틸 공유
+- **방식**: mask-at-write (DB에 원본 민감정보 미저장, 가장 안전). 원문+번역문 **양쪽** 적용
+- **대상 패턴**(정규식, 한국어 서비스): 주민등록번호, 휴대폰번호, 이메일, 카드번호. (이름/계좌는 오탐 위험 → 신중)
+- 위치: `services/python/src` 공용 유틸 → `pusher.py` 경로에서 호출
+
+---
+
+## 7. Phase별 작업 명세
+
+### Phase 1 — PostgreSQL 컨테이너 추가 (인프라)
+**대상 파일**
+- `docker-compose.prod.yml`: `postgres` 서비스 + `pg-data` named volume 추가, `python.depends_on`에 `postgres: condition: service_healthy` 추가
+- `.env.prod`(**gitignore → 서버 수동**): `POSTGRES_HOST=postgres`(⚠️ 서비스명, localhost 아님), `POSTGRES_PORT=5432`, `POSTGRES_USER=neemba`, `POSTGRES_PASSWORD=<강한 비번>`, `POSTGRES_DATABASE=neemba`
+
+**postgres 서비스 제안 형태**
+```yaml
+volumes:
+  nats-data:
+  pg-data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    env_file: [.env.prod]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    expose: ["5432"]            # 내부 전용 (외부 노출 비권장)
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks: [appnet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DATABASE}"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+```
+
+**결정 사항**: 이미지 버전(16-alpine 권장), 외부 포트 노출 여부(내부 전용 권장), 계정명 통일(`neemba`).
+
+**완료 기준**: `postgres` healthy → `pg_isready` 통과 → python 컨테이너에서 DB 도달 → 재기동 후 `pg-data` 영속 확인.
+
+### Phase 2 — Python DB 배선
+- `src/database/pool.py` 정상화(깨진 import 수정), FastAPI **lifespan에서 풀 생성/종료**, DI 주입
+- `get_postgres_config()` 연결, POSTGRES_* 로딩 확인
+
+### Phase 3 — Alembic 도입 + 스키마
+- deps에 `alembic` + 마이그레이션용 sync 드라이버 `psycopg` 추가
+- `alembic init`, `env.py`에서 DATABASE_URL(env) 읽기
+- 첫 마이그레이션: `app.translations` + `app.sessions`(인덱스, 일 파티션 선택)
+- 컨테이너 기동 엔트리포인트에 `alembic upgrade head`
+
+### Phase 4 — 저장 + 마스킹 + 모니터 WS
+- 공용 마스킹 유틸
+- `pusher.py` 경로에서 원문+번역문 마스킹 후 **비동기 INSERT**(번역 지연 영향 최소화, fire-and-forget/배치)
+- `TranslationResultDto` 보강(source_text/source_lang/target_lang/sequence/segment_id/confidence)
+- **모니터 전용 WS**(`/ws/monitor?sessionId=`) — 풀 페이로드 broadcast
+- Python `/internal/sessions/stop`을 **멱등화** + `ended_at` 기록 + 모니터 WS 종료 이벤트
+
+### Phase 5 — 이력 조회 API
+- `GET /api/monitor/sessions` — 세션 목록
+- `GET /api/monitor/sessions/{id}/translations?cursor=&limit=` — 페어, sequence 정렬, 커서 페이지네이션
+- `GET /api/monitor/translations?lang=&from=&to=&q=` — 기간/언어/키워드 검색
+
+### Phase 6 — `/monitor` 프론트 페이지
+- 경량 정적 페이지(별도 SPA 불필요), nginx `/monitor` 경로 서빙
+- 세션 목록 → 상세(원문↔번역 2열 표) → 라이브(WS)/이력(API) 토글 + 검색/기간 필터
+
+### Phase 7 — 접근 제어 + 보존
+- nginx Basic Auth 또는 IP 화이트리스트 (민감정보 노출 방지, 필수)
+- **30일 보존 자동화**: 파티션 DROP 또는 스케줄 DELETE
+- (선택) dangling 세션 무활동 타임아웃 보정, 물리 백업(pg_dump)
+
+---
+
+## 8. 미해결 선결 이슈 (구현 전 확인)
+
+1. **base `docker-compose.yml` 부재** — `Makefile`은 `up-prod`에서 `-f docker-compose.yml -f docker-compose.prod.yml`(base+오버레이)를 기대하나 레포엔 base 파일이 없고 `docker-compose.prod.yml`이 단독 완결형.
+   - 현재 인지: **base 파일 없음** (prod는 prod 파일 단독 기동으로 추정)
+   - **TODO: 맥(로컬)에서 실제 기동 방식 / base 파일 존재 여부 최종 확인.** 본 명세는 `docker-compose.prod.yml` 단독 기준으로 작성됨.
+2. `.env.prod`, `docker-compose.dev/stage.yml`은 `.gitignore` 처리 → 로컬에만 존재. POSTGRES_* 변수는 서버에서 수동 추가 필요.
+3. Node/Python 계정 정합성: 죽은 Node 코드는 `node_auth`, config 기본은 `neemba` → **`neemba`로 통일** (Node DB 폐기로 충돌 없음).
+
+---
+
+## 9. 구현 진행 방식 (권장)
+
+iOS/모바일 + 멀티데이 작업 특성상:
+- 이 문서를 핸드오프로 삼아 **Phase별 새 세션 + 별도 브랜치/PR**로 진행
+- 각 세션 시작: *"`docs/monitoring-plan.md` 읽고 Phase N 구현해줘"*
+- 현재 작업 브랜치: `claude/neemba-server-monitoring-plan-1GcsS`
