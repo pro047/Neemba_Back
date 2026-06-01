@@ -196,6 +196,11 @@ services:
 - `healthcheck`는 `pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DATABASE}`로 `$$`(런타임 컨테이너 셸 확장)를 써서 compose config-time 치환에 의존하지 않게 함(컨테이너 env엔 env_file로 주입됨).
 - 검증 한계: 이 컨테이너엔 실 시크릿이 없어 실제 `up`/`pg_isready`/asyncpg/영속은 미수행. 더미 `.env.prod`(가짜값, gitignore)로 `config` 파싱만 검증 후 즉시 삭제함. **실 검증은 맥/실서버에서 `make up-prod`(또는 `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d`)로 수행.**
 
+**[Phase 1 런타임 검증 — 2026-06-01, iOS 클라우드 컨테이너]**
+- 컨테이너에 docker daemon이 미기동 상태(`/var/run/docker.sock` 부재)였으나 root 권한으로 `dockerd` 직접 기동 가능(overlayfs, cgroup v1). 이미지 pull은 Docker Hub 매니페스트는 도달하나 **블롭(`production.cloudfront.docker.com`)이 403 Forbidden으로 차단** → `mirror.gcr.io/library/postgres:16-alpine`로 우회 pull 성공, `postgres:16-alpine`로 태깅하여 compose 무수정 사용.
+- 더미 `.env.prod`(`POSTGRES_USER=neemba`, `POSTGRES_DATABASE=neemba_monitor`로 **USER≠DB명**) + `--env-file`로 postgres 단독 기동 → **healthy / `pg_isready` accepting / `neemba_monitor` DB 생성(USER명 아님) / down(−v 없이)→up 후 마커 영속** 모두 통과.
+- ⚠️ **`--env-file` 함정의 실제 거동은 위 메모 예측과 다름**(런타임으로 확정): bare `up`(--env-file 없이) 시 `environment:`의 `${POSTGRES_USER/PASSWORD/DB}`가 전부 빈 문자열 `""`로 치환되고, compose에서 `environment:`는 `env_file:`을 **덮어쓰므로** `.env.prod`의 값(neemba/dummy/neemba_monitor)이 무시되어 컨테이너 env가 공란이 된다. 결과는 "DB가 USER명으로 잘못 생성"이 아니라 **`POSTGRES_PASSWORD` 공란 → postgres `initdb` 거부("Database is uninitialized and superuser password is not specified") → 컨테이너 crash loop(unhealthy)**. 즉 함정은 실재하되 실패는 조용한 오생성이 아니라 **요란한 기동 실패**다. 결론은 동일: **기동·검증 시 반드시 `--env-file .env.prod`**.
+
 ### Phase 2 — Python DB 배선
 - `src/database/pool.py` 정상화(깨진 import 수정), FastAPI **lifespan에서 풀 생성/종료**, DI 주입
 - `get_postgres_config()` 연결, POSTGRES_* 로딩 확인
@@ -236,10 +241,13 @@ services:
      - 추적되는 compose 파일은 **`docker-compose.prod.yml` 단 하나**. base `docker-compose.yml`은 추적·워킹트리·`.gitignore` 어디에도 없음(= gitignore된 게 아니라 진짜로 레포에 존재하지 않음).
      - `docker-compose.prod.yml`은 **self-contained**: `name: neemba` + `networks.appnet` + `volumes.nats-data` + 8개 서비스(nginx/rtmp/reloader/certbot/node/python/nats/nats-box) 전부 자체 정의. `extends`나 base 참조 **없음**. → `docker compose -f docker-compose.prod.yml config --services` **exit 0**(8개 서비스 정상 파싱, YAML 구조 유효).
      - `Makefile`의 `PROD?=-f docker-compose.yml -f docker-compose.prod.yml` 그대로 실행 시 **exit 1, `open docker-compose.yml: no such file or directory`** → **레포 커밋 상태에서는 `make up-prod`가 동작 불가**(Makefile↔실제 파일 불일치 = 사실로 확정).
+   - **(부분 해소: Phase 1 런타임 검증, 2026-06-01)** `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres` 경로가 iOS 클라우드 컨테이너에서 **실기동·검증 통과**(healthy/pg_isready/DB브리지/영속) → prod 기동을 이 직접 compose 호출로 하는 것이 동작함을 실증. **단 "맥에서 prod가 실제로 어떤 방식으로 떠 있는지" 확정은 iOS 컨테이너에서 알 수 없어 TODO 유지.**
    - **잔여 TODO(맥/실서버에서 사람이 확인):** 실제 prod가 어떻게 떠 있는지 — (a) `make up-prod` 대신 `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d` 직접 실행, (b) 맥 로컬에 untracked `docker-compose.yml`(base)가 별도로 존재, (c) Makefile을 로컬에서 수정해 사용 — 중 무엇인지 1개로 확정. base `docker-compose.yml`은 `.gitignore` 대상이 **아니므로**, 맥에 존재한다면 단지 commit 안 된 상태일 뿐(존재 여부 직접 확인 필요).
    - **Makefile 정합성 수정은 Phase 0 범위 밖(별도 Phase 권고).** Phase 1 명세는 `docker-compose.prod.yml` 단독 기준으로 작성되어 있고 그대로 유효함.
 2. `.env.prod`, `docker-compose.dev/stage.yml`은 `.gitignore` 처리 → 로컬에만 존재. POSTGRES_* 변수는 서버에서 수동 추가 필요.
+   - **(구조 해소: Phase 1 런타임 검증, 2026-06-01)** 필요한 5개 변수(`POSTGRES_HOST=postgres`/`POSTGRES_PORT`/`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DATABASE`)만으로 postgres가 정상 기동·DB 생성됨을 더미값으로 실증. **실 비번/값 주입은 여전히 서버·맥에서 수동(커밋·채팅 금지) — 운영 비밀 자체는 미해결.**
 3. Node/Python 계정 정합성: 죽은 Node 코드는 `node_auth`, config 기본은 `neemba` → **`neemba`로 통일** (Node DB 폐기로 충돌 없음).
+   - **(해소: Phase 1 런타임 검증, 2026-06-01)** `POSTGRES_USER=neemba`로 postgres 기동·`pg_isready -U neemba`·`psql -U neemba` 정상 동작 확인. `neemba` 계정명으로 문제 없음.
 
 ---
 
@@ -261,7 +269,7 @@ iOS/모바일 + 멀티데이 작업 특성상:
 | Phase | 작업 | 상태 | 검증 방법/결과 | 담당 브랜치·PR | 비고 |
 |-------|------|------|----------------|----------------|------|
 | 0 | 선결 이슈 확정(base compose) | 검증완료(조사) | 레포 커밋 기준 확정: base `docker-compose.yml` 없음 / `docker-compose.prod.yml` self-contained(`config --services` exit 0) / Makefile `up-prod` 경로는 exit 1(`no such file`)로 동작 불가. §8-1 참조 | `claude/monitor-phase0-compose-baseline-C6XEo` | 코드/설정 무수정(문서만). 맥 실기동 방식 확인 + Makefile 정합성 수정은 별도 Phase 권고 |
-| 1 | Postgres 컨테이너 | 구현완료(미검증) | `docker-compose.prod.yml`에 postgres/pg-data/`python.depends_on` 추가. 더미 `.env.prod`로 `config --quiet` **exit 0**, `--env-file` 시 `POSTGRES_DB=neemba` 정상 치환 확인. ⚠️실제 `up`/`pg_isready`/asyncpg 접속/재기동 영속은 **맥·실서버 미검증**(시크릿 없음) | `claude/monitor-phase0-compose-baseline-C6XEo` | `POSTGRES_DB`는 `${POSTGRES_DATABASE}` 치환→**`--env-file .env.prod` 필수**(아래 메모) |
+| 1 | Postgres 컨테이너 | 검증완료(런타임) | iOS 클라우드 컨테이너에서 `dockerd` 직접 기동 후 더미 `.env.prod`로 **postgres 단독 실기동 검증(4/4 통과)**: (a) `ps`→**healthy**, (b) `pg_isready -U neemba -d neemba_monitor`→**accepting connections (exit 0)**, (c) DB명 브리지→`psql -lqt`에 **`neemba_monitor` 생성**(USER명 `neemba`로 잘못 생기지 **않음**)=`POSTGRES_DB←${POSTGRES_DATABASE}` 치환 성공, (e) **영속**: 마커 테이블 insert→`down`(−v 없이)→`up`→마커·DB 유지 확인. (d) **`--env-file` 함정 실재 재현**: bare `up`(--env-file 없이)→`environment:`의 `${}`가 전부 `""`로 치환되고 이 빈값이 `env_file`을 덮어써 **POSTGRES_PASSWORD 공란→initdb 거부→crash loop(unhealthy)**. ⚠️asyncpg 접속·python 컨테이너 도달은 실시크릿/풀 코드 없어 Phase 2로 이월 | `claude/monitor-phase0-compose-baseline-C6XEo` | 이미지 pull: Docker Hub 블롭(`production.cloudfront.docker.com`) **403 차단** → `mirror.gcr.io/library/postgres:16-alpine`로 우회 pull 후 `postgres:16-alpine` 태깅. `POSTGRES_DB`는 `${POSTGRES_DATABASE}` 치환→**`--env-file .env.prod` 필수** |
 | 2 | Python DB 배선(pool/lifespan) | 미착수 | 앱 기동 + 풀 생성 확인 | — | |
 | 3 | Alembic + 스키마 | 미착수 | `alembic upgrade head` + 테이블 확인 | — | sync 드라이버 psycopg |
 | 4 | 저장+마스킹+모니터 WS | 미착수 | pytest + INSERT/WS 동작 | — | stop 멱등화 포함 |
@@ -274,6 +282,7 @@ iOS/모바일 + 멀티데이 작업 특성상:
 
 - (2026-06-01, 플랜 세션) 문서 최초 작성. 구현 시작 전. 실제 prod 키/시크릿은 채팅·커밋에 절대 포함 금지(더미로 구조검증, 실키 E2E는 맥/실서버).
 - (2026-06-01, Phase 0 조사 세션, 브랜치 `claude/monitor-phase0-compose-baseline-C6XEo`) **확정 사실**: 레포에 base `docker-compose.yml` 없음(gitignore도 아님 = 진짜 부재), `docker-compose.prod.yml`은 self-contained(8서비스, `config --services` exit 0), Makefile `up-prod`는 base 참조로 레포 상태에서 exit 1(`no such file`)로 깨짐. **Phase 1 담당 주의**: postgres/pg-data/depends_on는 `docker-compose.prod.yml`에 직접 추가(네트워크 `appnet`, `env_file: .env.prod`), 검증은 `make`가 아니라 `docker compose -f docker-compose.prod.yml` 직접 실행으로. **맥에서 사람이 확인할 TODO**: (1) prod 실기동이 `make up-prod`인지 `docker compose -f docker-compose.prod.yml` 직접인지, (2) 맥 로컬에 untracked base `docker-compose.yml`이 실제로 있는지, (3) 있다면 Makefile 정합성 수정을 별도 Phase로 진행할지 결정. **코드/설정/Makefile/.env 일체 무수정**(문서만 갱신).
+- (2026-06-01, **Phase 1 런타임 검증 세션**, 동일 브랜치 `claude/monitor-phase0-compose-baseline-C6XEo`) iOS 클라우드 컨테이너에서 `dockerd` 직접 기동 후 더미 `.env.prod`로 **postgres 단독 실기동 4/4 통과**(healthy / `pg_isready` accepting / `neemba_monitor` DB 브리지 성공(USER명 아님) / `down`(−v 없이)→`up` 마커 영속). 이미지 pull은 Docker Hub 블롭이 403 차단 → **`mirror.gcr.io/library/postgres:16-alpine` 우회 pull 후 `postgres:16-alpine` 태깅**. **`--env-file` 함정 실재 재현**: 빼고 띄우면 `environment:` `${}`→`""`가 `env_file`을 덮어 **PASSWORD 공란→initdb 거부→crash loop**(메모의 "USER명으로 오생성" 예측과 달리 조용한 오류가 아닌 기동 실패). 코드/compose 무수정(문서만 갱신), 더미 `.env.prod` 삭제, 컨테이너 down(볼륨 `neemba_pg-data`는 더미데이터로 잔존—사람이 `docker volume rm`). **Phase 2 주의**: ① 기동·검증 시 `--env-file .env.prod` 필수, ② asyncpg/python 컨테이너 DB 도달은 실시크릿+`pool.py` 정상화(Phase 2) 후에야 검증 가능—이번 세션 범위 밖, ③ 실서버 이미지 pull도 Docker Hub 블롭 차단 가능성 있으니 mirror/사내 레지스트리 확인 권장.
 - (2026-06-01, Phase 1 구현 세션, 동일 브랜치 `claude/monitor-phase0-compose-baseline-C6XEo`) **`docker-compose.prod.yml`에 postgres 추가 완료**(image `postgres:16-alpine`, expose 5432 내부전용, `pg-data` 볼륨, `pg_isready` healthcheck, `python.depends_on: postgres(service_healthy)`). 더미 `.env.prod`(가짜값)로 `config --quiet` **exit 0** 확인 후 삭제. **다음 세션(Phase 2) 주의**: ① 기동/검증 시 **`--env-file .env.prod` 필수**(POSTGRES_DB ← ${POSTGRES_DATABASE} 치환 때문, §7 Phase 1 메모 참조). ② Python은 `POSTGRES_DATABASE`/`POSTGRES_USER` 등을 `config.py get_postgres_config()`로 읽음 — `.env.prod`에 `POSTGRES_HOST=postgres`(서비스명) 포함 5개 변수 수동 추가 필요(서버/맥, 실비번은 커밋·채팅 금지). ③ **맥 실검증 TODO**: `make up-prod`(또는 직접 compose+`--env-file`)로 실제 `up` → `pg_isready` healthy → python 컨테이너에서 DB 도달 → 재기동 후 `pg-data` 영속 확인(이 4개가 Phase 1 "검증완료" 승격 조건). ④ Phase 0 Makefile 불일치 미해결 — 맥 실기동 방식 따라 별도 Phase로 수정 결정.
 
 ### 각 구현 세션 종료 시 체크리스트
