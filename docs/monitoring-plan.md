@@ -148,6 +148,10 @@ import 체인 추적 결과 `index.ts → app.ts → 라우터들`은 DB를 impo
 ## 7. Phase별 작업 명세
 
 ### Phase 1 — PostgreSQL 컨테이너 추가 (인프라)
+> **[Phase 0 확정]** prod 기동은 `docker-compose.prod.yml` **단독**이다(base 없음, §8-1). 따라서 `postgres` 서비스·`pg-data` 볼륨·`python.depends_on`은 **반드시 `docker-compose.prod.yml`에 직접 추가**한다. base나 별도 오버레이를 새로 만들지 말 것.
+> - 이 파일의 네트워크명은 `appnet`, 현재 `volumes:` 블록엔 `nats-data`만 있음 → `pg-data` 추가. 다른 서비스가 `env_file: .env.prod`를 쓰므로 `postgres`도 동일하게 `.env.prod` 사용(아래 제안 형태와 일치).
+> - ⚠️ `Makefile up-prod`는 base를 참조해 레포 상태에서 깨져 있다(미수정). Phase 1 검증은 `docker compose -f docker-compose.prod.yml ...` **직접 실행**으로 하거나, 맥 실기동 방식 확정 후 그에 맞춰 진행.
+
 **대상 파일**
 - `docker-compose.prod.yml`: `postgres` 서비스 + `pg-data` named volume 추가, `python.depends_on`에 `postgres: condition: service_healthy` 추가
 - `.env.prod`(**gitignore → 서버 수동**): `POSTGRES_HOST=postgres`(⚠️ 서비스명, localhost 아님), `POSTGRES_PORT=5432`, `POSTGRES_USER=neemba`, `POSTGRES_PASSWORD=<강한 비번>`, `POSTGRES_DATABASE=neemba`
@@ -222,8 +226,12 @@ services:
 ## 8. 미해결 선결 이슈 (구현 전 확인)
 
 1. **base `docker-compose.yml` 부재** — `Makefile`은 `up-prod`에서 `-f docker-compose.yml -f docker-compose.prod.yml`(base+오버레이)를 기대하나 레포엔 base 파일이 없고 `docker-compose.prod.yml`이 단독 완결형.
-   - 현재 인지: **base 파일 없음** (prod는 prod 파일 단독 기동으로 추정)
-   - **TODO: 맥(로컬)에서 실제 기동 방식 / base 파일 존재 여부 최종 확인.** 본 명세는 `docker-compose.prod.yml` 단독 기준으로 작성됨.
+   - **(해소: Phase 0 조사, 2026-06-01)** 레포(이 컨테이너) 커밋 기준으로 확정:
+     - 추적되는 compose 파일은 **`docker-compose.prod.yml` 단 하나**. base `docker-compose.yml`은 추적·워킹트리·`.gitignore` 어디에도 없음(= gitignore된 게 아니라 진짜로 레포에 존재하지 않음).
+     - `docker-compose.prod.yml`은 **self-contained**: `name: neemba` + `networks.appnet` + `volumes.nats-data` + 8개 서비스(nginx/rtmp/reloader/certbot/node/python/nats/nats-box) 전부 자체 정의. `extends`나 base 참조 **없음**. → `docker compose -f docker-compose.prod.yml config --services` **exit 0**(8개 서비스 정상 파싱, YAML 구조 유효).
+     - `Makefile`의 `PROD?=-f docker-compose.yml -f docker-compose.prod.yml` 그대로 실행 시 **exit 1, `open docker-compose.yml: no such file or directory`** → **레포 커밋 상태에서는 `make up-prod`가 동작 불가**(Makefile↔실제 파일 불일치 = 사실로 확정).
+   - **잔여 TODO(맥/실서버에서 사람이 확인):** 실제 prod가 어떻게 떠 있는지 — (a) `make up-prod` 대신 `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d` 직접 실행, (b) 맥 로컬에 untracked `docker-compose.yml`(base)가 별도로 존재, (c) Makefile을 로컬에서 수정해 사용 — 중 무엇인지 1개로 확정. base `docker-compose.yml`은 `.gitignore` 대상이 **아니므로**, 맥에 존재한다면 단지 commit 안 된 상태일 뿐(존재 여부 직접 확인 필요).
+   - **Makefile 정합성 수정은 Phase 0 범위 밖(별도 Phase 권고).** Phase 1 명세는 `docker-compose.prod.yml` 단독 기준으로 작성되어 있고 그대로 유효함.
 2. `.env.prod`, `docker-compose.dev/stage.yml`은 `.gitignore` 처리 → 로컬에만 존재. POSTGRES_* 변수는 서버에서 수동 추가 필요.
 3. Node/Python 계정 정합성: 죽은 Node 코드는 `node_auth`, config 기본은 `neemba` → **`neemba`로 통일** (Node DB 폐기로 충돌 없음).
 
@@ -246,7 +254,7 @@ iOS/모바일 + 멀티데이 작업 특성상:
 
 | Phase | 작업 | 상태 | 검증 방법/결과 | 담당 브랜치·PR | 비고 |
 |-------|------|------|----------------|----------------|------|
-| 0 | 선결 이슈 확정(base compose) | 미착수 | — | — | "base 없음, prod 단독" 전제 / 맥 최종확인 대기 |
+| 0 | 선결 이슈 확정(base compose) | 검증완료(조사) | 레포 커밋 기준 확정: base `docker-compose.yml` 없음 / `docker-compose.prod.yml` self-contained(`config --services` exit 0) / Makefile `up-prod` 경로는 exit 1(`no such file`)로 동작 불가. §8-1 참조 | `claude/monitor-phase0-compose-baseline-C6XEo` | 코드/설정 무수정(문서만). 맥 실기동 방식 확인 + Makefile 정합성 수정은 별도 Phase 권고 |
 | 1 | Postgres 컨테이너 | 미착수 | 더미 env로 `pg_isready` + asyncpg 접속 | — | |
 | 2 | Python DB 배선(pool/lifespan) | 미착수 | 앱 기동 + 풀 생성 확인 | — | |
 | 3 | Alembic + 스키마 | 미착수 | `alembic upgrade head` + 테이블 확인 | — | sync 드라이버 psycopg |
@@ -259,6 +267,7 @@ iOS/모바일 + 멀티데이 작업 특성상:
 > 각 세션이 다음 세션에게 남기는 메모. 발견한 함정, 바꾼 결정, 미해결 TODO 등.
 
 - (2026-06-01, 플랜 세션) 문서 최초 작성. 구현 시작 전. 실제 prod 키/시크릿은 채팅·커밋에 절대 포함 금지(더미로 구조검증, 실키 E2E는 맥/실서버).
+- (2026-06-01, Phase 0 조사 세션, 브랜치 `claude/monitor-phase0-compose-baseline-C6XEo`) **확정 사실**: 레포에 base `docker-compose.yml` 없음(gitignore도 아님 = 진짜 부재), `docker-compose.prod.yml`은 self-contained(8서비스, `config --services` exit 0), Makefile `up-prod`는 base 참조로 레포 상태에서 exit 1(`no such file`)로 깨짐. **Phase 1 담당 주의**: postgres/pg-data/depends_on는 `docker-compose.prod.yml`에 직접 추가(네트워크 `appnet`, `env_file: .env.prod`), 검증은 `make`가 아니라 `docker compose -f docker-compose.prod.yml` 직접 실행으로. **맥에서 사람이 확인할 TODO**: (1) prod 실기동이 `make up-prod`인지 `docker compose -f docker-compose.prod.yml` 직접인지, (2) 맥 로컬에 untracked base `docker-compose.yml`이 실제로 있는지, (3) 있다면 Makefile 정합성 수정을 별도 Phase로 진행할지 결정. **코드/설정/Makefile/.env 일체 무수정**(문서만 갱신).
 
 ### 각 구현 세션 종료 시 체크리스트
 1. 위 표의 해당 Phase 상태·검증결과·브랜치 갱신
