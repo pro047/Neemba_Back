@@ -14,7 +14,12 @@ from src.config import get_nats_config, get_deepl_config, get_ws_url
 from src.database.pool import Db
 from src.deepL.deepL import DeeplTranslationService
 from src.pushClient.pusher import Pusher
+from src.repository.implementation.translation_repository import (
+    ensure_session,
+    end_session,
+)
 from src.separator.kss_separator import SentenceSeparator
+from src.ws.monitor import MonitorHub
 from src.ws.websocket import WebSocketHub
 
 logger = logging.getLogger("app")
@@ -48,8 +53,9 @@ async def lifespan(app: FastAPI):
         deepl_api = app.state.deepl_config['deepl_api_key']
 
         hub = WebSocketHub()
+        monitor_hub = MonitorHub()
         translator = DeeplTranslationService(deepl_api)
-        pusher = Pusher(hub)
+        pusher = Pusher(hub, monitor_hub=monitor_hub, db_pool=app.state.db_pool)
 
         separator = SentenceSeparator(
             translator=translator,
@@ -57,6 +63,7 @@ async def lifespan(app: FastAPI):
         )
 
         app.state.hub = hub
+        app.state.monitor_hub = monitor_hub
         app.state.translator = translator
         app.state.pusher = pusher
 
@@ -165,17 +172,48 @@ async def start_session(req: StartRequest, request: Request):
     print('base url', base_ws_url)
     webSocket_url = f"{base_ws_url}?sessionId={req.session_id}"
     print('ws url', webSocket_url)
+
+    # Create the session row up front so ended_at always has a target on stop.
+    # Isolated: a DB hiccup must not fail the session start signal.
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        try:
+            await ensure_session(pool, req.session_id, req.source_lang, req.target_lang)
+        except Exception as e:
+            print("start_session: ensure_session failed (ignored):", repr(e))
+
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
 
 @app.post('/internal/sessions/stop')
-async def stop_session(req: StopRequest):
+async def stop_session(req: StopRequest, request: Request):
     print(f'sessionId: {req.session_id} stopped')
 
-    hub: WebSocketHub = app.state.hub
+    # Idempotent end: ended_at is stamped once, the monitor close event is
+    # emitted once. A duplicate stop (docs §3 weakness 1) is a no-op. The DB
+    # call is isolated so a failure never blocks client teardown below.
+    ended = False
+    translation_count = 0
+    pool = getattr(request.app.state, "db_pool", None)
+    if pool is not None:
+        try:
+            ended, translation_count = await end_session(pool, req.session_id)
+        except Exception as e:
+            print("stop_session: end_session failed (ignored):", repr(e))
 
+    hub: WebSocketHub = request.app.state.hub
     await hub.detach()
-    return {"ok": True}
+
+    # Only the first (transitioning) stop emits the monitor close event.
+    monitor_hub: MonitorHub = getattr(request.app.state, "monitor_hub", None)
+    if ended and monitor_hub is not None:
+        await monitor_hub.close_session(req.session_id, {
+            "type": "session_closed",
+            "sessionId": req.session_id,
+            "translationCount": translation_count,
+        })
+
+    return {"ok": True, "ended": ended, "translationCount": translation_count}
 
 
 @app.websocket("/ws")
@@ -229,3 +267,31 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         print(f'main : websocket error: {e}')
         await hub.detach()
+
+
+@app.websocket("/ws/monitor")
+async def monitor_endpoint(ws: WebSocket):
+    """Monitor dashboard stream: live masked source↔translation payloads.
+
+    Subscribe with ``/ws/monitor?sessionId=<id>``. Receives every payload the
+    capture path produces for that session plus a final ``session_closed``
+    event when the session is stopped. Read-only: inbound frames are ignored.
+    """
+    session_id = ws.query_params.get("sessionId")
+    monitor_hub: MonitorHub = ws.app.state.monitor_hub
+
+    if not session_id:
+        await ws.close(code=4000)
+        return
+
+    await monitor_hub.attach(session_id, ws)
+    try:
+        while True:
+            # Monitors are read-only; just drain inbound frames to detect close.
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        print(f'monitor : websocket disconnected session={session_id}')
+    except Exception as e:
+        print(f'monitor : websocket error: {e}')
+    finally:
+        await monitor_hub.detach(session_id, ws)
