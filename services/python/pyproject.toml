@@ -18,6 +18,8 @@ dependencies = [
   "httpx",
   "deepl",
   "asyncpg",
+  "alembic",
+  "psycopg[binary]",
   "gunicorn",
   "mecab-python3"
 ]
