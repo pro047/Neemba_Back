@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from src.compose import build
 from src.config import get_nats_config, get_deepl_config, get_ws_url
+from src.database.pool import Db
 from src.deepL.deepL import DeeplTranslationService
 from src.pushClient.pusher import Pusher
 from src.separator.kss_separator import SentenceSeparator
@@ -29,11 +30,20 @@ async def lifespan(app: FastAPI):
     separator = None
     consumer_task = None
     separator_task = None
+    db = None
 
     try:
         app.state.nats_config = get_nats_config()
         app.state.deepl_config = get_deepl_config()
         app.state.get_ws_config = get_ws_url()
+
+        # DB pool (asyncpg). get_postgres_config() uses require_env, so
+        # missing POSTGRES_* env vars fail fast here — same policy as
+        # the NATS/DeepL configs above. Actual queries land in Phase 4.
+        db = Db()
+        app.state.db = db
+        app.state.db_pool = await db.create_pool()
+        print(">>> lifespan : db pool created")
 
         deepl_api = app.state.deepl_config['deepl_api_key']
 
@@ -96,6 +106,11 @@ async def lifespan(app: FastAPI):
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+
+        if getattr(app.state, "db", None):
+            with contextlib.suppress(Exception):
+                await app.state.db.close()
+
         logger.info(">>> lifespan : cleanup done")
 
 
@@ -117,6 +132,15 @@ class StopRequest(BaseModel):
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
+
+
+def get_db_pool(request: Request):
+    """DI helper: access the asyncpg pool from routes.
+
+    Usage: ``pool = Depends(get_db_pool)`` or ``request.app.state.db_pool``.
+    Actual queries are wired in Phase 4.
+    """
+    return request.app.state.db_pool
 
 
 @app.get("/ping")
