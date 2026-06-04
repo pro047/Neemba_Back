@@ -4,16 +4,27 @@ import json
 import logging
 import traceback
 from contextlib import asynccontextmanager
+from datetime import datetime
 
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.compose import build
 from src.config import get_nats_config, get_deepl_config, get_ws_url
 from src.database.pool import Db
 from src.deepL.deepL import DeeplTranslationService
 from src.pushClient.pusher import Pusher
+from src.repository.implementation import monitor_query_repository as mq
 from src.repository.implementation.translation_repository import (
     ensure_session,
     end_session,
@@ -136,6 +147,70 @@ class StopRequest(BaseModel):
     session_id: str = Field(alias="sessionId")
 
 
+# --- monitor history API (Phase 5) response models -------------------------
+# Field names are snake_case but serialized as camelCase (alias) to match the
+# existing API style (StartResponse etc.). datetime fields serialize to ISO8601
+# automatically. populate_by_name lets us build straight from asyncpg records
+# (snake_case keys).
+
+
+class MonitorSession(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_id: str = Field(alias="sessionId")
+    started_at: datetime = Field(alias="startedAt")
+    ended_at: datetime | None = Field(default=None, alias="endedAt")
+    source_lang: str | None = Field(default=None, alias="sourceLang")
+    target_lang: str | None = Field(default=None, alias="targetLang")
+    translation_count: int = Field(alias="translationCount")
+    # ended_at IS NULL ⇒ still running (docs §7 Phase 5: 라이브/종료 구분).
+    live: bool
+
+
+class SessionListResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[MonitorSession]
+    limit: int
+    offset: int
+    next_offset: int | None = Field(default=None, alias="nextOffset")
+
+
+class TranslationPair(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int
+    segment_id: int | None = Field(default=None, alias="segmentId")
+    sequence: int | None = None
+    source_text: str = Field(alias="sourceText")
+    translated_text: str = Field(alias="translatedText")
+    source_lang: str | None = Field(default=None, alias="sourceLang")
+    target_lang: str | None = Field(default=None, alias="targetLang")
+    confidence: float | None = None
+    created_at: datetime = Field(alias="createdAt")
+
+
+class SessionTranslationsResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[TranslationPair]
+    limit: int
+    next_cursor: int | None = Field(default=None, alias="nextCursor")
+
+
+class TranslationSearchItem(TranslationPair):
+    # Search spans sessions, so each row carries its session id.
+    session_id: str = Field(alias="sessionId")
+
+
+class TranslationSearchResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[TranslationSearchItem]
+    limit: int
+    next_cursor: str | None = Field(default=None, alias="nextCursor")
+
+
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
@@ -145,7 +220,7 @@ def get_db_pool(request: Request):
     """DI helper: access the asyncpg pool from routes.
 
     Usage: ``pool = Depends(get_db_pool)`` or ``request.app.state.db_pool``.
-    Actual queries are wired in Phase 4.
+    Used by the Phase 4 capture path and the Phase 5 history API.
     """
     return request.app.state.db_pool
 
@@ -164,6 +239,109 @@ def healthz():
 def get_metrics():
     request_count.inc()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+def _parse_dt(value: str | None, field: str) -> datetime | None:
+    """Parse an ISO8601 query param into a datetime, or 422 on bad input."""
+    if value is None or value == "":
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"invalid {field}: expected ISO8601 datetime"
+        ) from e
+
+
+@app.get('/api/monitor/sessions', response_model=SessionListResponse)
+async def monitor_sessions(
+    limit: int | None = Query(default=None),
+    offset: int | None = Query(default=None),
+    pool=Depends(get_db_pool),
+):
+    """Session list, newest-first (started_at DESC), OFFSET-paginated."""
+    limit = mq.clamp_limit(
+        limit, default=mq.SESSIONS_LIMIT_DEFAULT, maximum=mq.SESSIONS_LIMIT_MAX
+    )
+    offset = mq.clamp_offset(offset)
+    rows, next_offset = await mq.list_sessions(pool, limit=limit, offset=offset)
+    items = [
+        MonitorSession(**dict(r), live=r["ended_at"] is None) for r in rows
+    ]
+    return SessionListResponse(
+        items=items, limit=limit, offset=offset, next_offset=next_offset
+    )
+
+
+@app.get(
+    '/api/monitor/sessions/{session_id}/translations',
+    response_model=SessionTranslationsResponse,
+)
+async def monitor_session_translations(
+    session_id: str,
+    cursor: str | None = Query(default=None),
+    limit: int | None = Query(default=None),
+    pool=Depends(get_db_pool),
+):
+    """One session's source↔translation pairs, keyset-paginated on PK id."""
+    limit = mq.clamp_limit(
+        limit,
+        default=mq.SESSION_TRANSLATIONS_LIMIT_DEFAULT,
+        maximum=mq.SESSION_TRANSLATIONS_LIMIT_MAX,
+    )
+    try:
+        cur = mq.parse_int_cursor(cursor)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail="invalid cursor") from e
+
+    rows, next_cursor = await mq.list_session_translations(
+        pool, session_id, limit=limit, cursor=cur
+    )
+    items = [TranslationPair(**dict(r)) for r in rows]
+    return SessionTranslationsResponse(
+        items=items, limit=limit, next_cursor=next_cursor
+    )
+
+
+@app.get('/api/monitor/translations', response_model=TranslationSearchResponse)
+async def monitor_translations_search(
+    lang: str | None = Query(default=None),
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int | None = Query(default=None),
+    pool=Depends(get_db_pool),
+):
+    """Search pairs by language / created_at range / masked keyword.
+
+    ``lang`` matches **either** source_lang or target_lang. ``from``/``to`` are
+    the inclusive created_at range. ``q`` is an ILIKE substring match over the
+    already-masked text. Keyset-paginated on (created_at DESC, id DESC).
+    """
+    limit = mq.clamp_limit(
+        limit, default=mq.SEARCH_LIMIT_DEFAULT, maximum=mq.SEARCH_LIMIT_MAX
+    )
+    dt_from = _parse_dt(from_, "from")
+    dt_to = _parse_dt(to, "to")
+    try:
+        cur = mq.decode_search_cursor(cursor)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail="invalid cursor") from e
+
+    rows, next_cursor = await mq.search_translations(
+        pool,
+        lang=lang,
+        dt_from=dt_from,
+        dt_to=dt_to,
+        q=q,
+        cursor=cur,
+        limit=limit,
+    )
+    items = [TranslationSearchItem(**dict(r)) for r in rows]
+    return TranslationSearchResponse(
+        items=items, limit=limit, next_cursor=next_cursor
+    )
 
 
 @app.post('/internal/sessions/start', response_model=StartResponse)
