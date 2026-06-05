@@ -250,6 +250,8 @@ sudo chmod 640 /var/lib/neemba/secrets/monitor.htpasswd
 - `DELETE FROM app.sessions WHERE ended_at IS NOT NULL AND ended_at < now() - interval '30 days'` — **라이브(ended_at IS NULL) 세션은 나이 무관 보호**, 종료된 세션만 30일 경과 시 삭제. 외래키 없어 순서 무관, 재실행 멱등.
 - `to_regclass()` 가드로 스키마 생성(python alembic) 전이라도 에러 아닌 no-op. 튜너블: `RETENTION_DAYS`(기본 30)·`RETENTION_SLEEP_INTERVAL`(기본 24h)·`RETENTION_ONESHOT`(테스트용 1회 실행). compose `pg-retention` 서비스가 `postgres` healthy 후 기동.
 
+**라이브(실환경) 검증 런북** → `docs/phase7-live-verification-runbook.md`. 클라우드 컨테이너 독립 검증(더미·스텁)이 입증 못한 부분 — ⭐**브라우저 WS 자격증명 자동첨부**(결정 #2 핵심 전제)·실 htpasswd(bcrypt)·실 인증서/시크릿 prod 전체 기동·pg-retention 24h 스케줄 — 을 맥/실서버 + 실제 브라우저(Chrome/FF/Safari)에서 사람이 따라 실행하는 체크리스트. 4번(브라우저 WS) 실패 시 `/ws/monitor` IP 화이트 폴백 절차 포함.
+
 ---
 
 ## 8. 미해결 선결 이슈 (구현 전 확인)
