@@ -211,3 +211,87 @@ docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" postgres \
 
 > 결과는 `docs/monitoring-plan.md` §10 인계 메모에 한 줄(`(YYYY-MM-DD, Phase 7 라이브 검증)`)로 기록.
 > 4번 폴백을 발동했다면 그 conf 수정은 별도 커밋으로 남길 것.
+
+---
+
+## 부록 A. 맥 로컬 브라우저 테스트 (실서버 배포 전 빠른 사전검증)
+
+> 실 도메인/인증서/배포 없이 **맥의 진짜 브라우저(Chrome·Safari·Firefox)** 로 monitor 페이지 +
+> Basic 인증 + WS 자격증명 자동첨부(결정 #2 핵심)를 먼저 확인하는 경로.
+> prod conf는 `neemba.app`+443/TLS 전용이라(+실서버 HSTS면 self-signed 거부) 로컬엔 부적합 →
+> **dev conf를 `localhost:8080`(http)로 띄운다.** 자격증명 캐싱·WS 자동첨부는 origin 단위라 localhost http에서 동일 재현.
+> 맥에선 Docker Hub 정상(403 블롭은 iOS 클라우드 컨테이너 egress 한정) → mirror 불필요.
+
+### A-1. 기동 (브랜치 체크아웃된 레포 루트에서)
+
+```sh
+# 1) .env.prod — POSTGRES는 dummy 가능, NATS/DeepL/WS는 "값만 있으면" 됨(파이프라인 미동작은 monitor와 무관)
+cat > .env.prod <<'EOF'
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_USER=neemba
+POSTGRES_PASSWORD=devpass
+POSTGRES_DATABASE=neemba_monitor
+NATS_URL=nats://nats:4222
+NATS_SUBJECT=transcript.session.*
+NATS_STREAM_NAME=transcripts
+NATS_CONSUMER_NAME=python
+WS_URL=ws://localhost/ws
+DEEPL_API_KEY=dummy
+EOF
+
+# 2) htpasswd (monitor / testpass) — 레포 커밋 금지
+sudo mkdir -p /var/lib/neemba/secrets
+docker run --rm httpd:alpine htpasswd -nbB monitor 'testpass' \
+  | sudo tee /var/lib/neemba/secrets/monitor.htpasswd >/dev/null
+
+# 3) postgres + python (python entrypoint가 alembic upgrade head 자동 실행; 최초 1회 python 이미지 빌드)
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d postgres python
+
+# 4) dev nginx를 localhost:8080 으로 (TLS/도메인 불필요, node는 dead로 박아 upstream DNS만 충족)
+docker run -d --name monitor-nginx --network neemba_appnet --add-host node:127.0.0.1 -p 8080:80 \
+  -v "$PWD/infra/nginx/dev/nginx.conf:/etc/nginx/nginx.conf:ro" \
+  -v "$PWD/infra/nginx/html:/var/www/html:ro" \
+  -v /var/lib/neemba/secrets/monitor.htpasswd:/var/lib/neemba/secrets/monitor.htpasswd:ro \
+  nginx:1.27-alpine
+
+# 5) (선택) 라이브 세션 1개 시드 → 페이지에 LIVE 토글이 보이게
+docker exec -e PGPASSWORD=devpass postgres psql -U neemba -d neemba_monitor -c \
+"INSERT INTO app.sessions(session_id,started_at,ended_at,source_lang,target_lang,translation_count) \
+ VALUES('live-demo',now(),NULL,'ko','en-US',0) ON CONFLICT DO NOTHING;"
+```
+
+> 기동 확인: `docker compose -f docker-compose.prod.yml --env-file .env.prod ps`(postgres healthy·python Up),
+> `docker logs python 2>&1 | grep -E "migrations applied|db pool created"`,
+> `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/health`(=200).
+
+### A-2. 브라우저 검증 (Chrome·Safari·Firefox 각각)
+
+1. `http://localhost:8080/monitor/` → Basic 로그인 `monitor` / `testpass` → 페이지 렌더.
+2. **무자격 음성검증**: 시크릿/프라이빗 창에서 같은 주소 → 인증 취소 → **401**.
+3. **⭐ WS 자동첨부(결정 #2 핵심)** — 로그인된 탭 DevTools 콘솔:
+   ```js
+   const ws = new WebSocket(`ws://${location.host}/ws/monitor?sessionId=live-demo`);
+   ws.onopen  = () => console.log('✅ WS 101 — 브라우저가 캐시된 Basic 자격증명을 자동첨부함 (app.js 무수정 입증)');
+   ws.onclose = e  => console.log('close', e.code);
+   ```
+   - `✅ WS 101` → JS는 Authorization 헤더를 못 싣는데 101 = **브라우저가 자동첨부**(입증 완료).
+   - **세 브라우저 전부** 확인(Safari가 역사적으로 가장 보수적).
+   - 어느 하나라도 실패(연결 안 됨/401) → 결정 #2 폴백 발동 신호(`/ws/monitor`만 IP 화이트, §7).
+4. **CLI 교차확인(선택)**:
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/api/monitor/sessions                       # 401 (무자격)
+   curl -s -o /dev/null -w '%{http_code}\n' -u monitor:testpass http://localhost:8080/api/monitor/sessions   # 200
+   ```
+
+### A-3. 정리
+
+```sh
+docker rm -f monitor-nginx
+docker compose -f docker-compose.prod.yml --env-file .env.prod down -v
+rm -f .env.prod
+sudo rm -f /var/lib/neemba/secrets/monitor.htpasswd
+```
+
+> ⚠️ 로컬은 **동작/계약 검증**(페이지·인증·WS 자동첨부)까지다. 443/TLS/wss·실 데이터·certbot 등
+> **진짜 라이브**는 §1~7대로 실서버에 배포해 `https://neemba.app`에서 확인할 것.
