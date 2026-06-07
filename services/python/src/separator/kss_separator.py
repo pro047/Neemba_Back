@@ -15,7 +15,8 @@ from src.dto.translationDto import TranslationRequestDto
 class SegmentState:
     buffer: str = ''
     # Metadata carried alongside the buffer so a flushed sentence can be paired
-    # back to its source segment for monitoring/storage (Phase 4).
+    # back to its source segment for monitoring/storage (Phase 4), and so the
+    # hub can gate delivery to the session that owns the client slot.
     session_id: str = ''
     segment_id: int = 0
     sequence: int = 0
@@ -65,14 +66,14 @@ def _is_sentence_closed(text: str) -> bool:
     text = text.strip()
     if not text:
         return False
-    
+
     # 구두점으로 끝나는지 확인
     if re.search(r'[\.!\?…]\s*$', text):
         return True
-    
+
     # 한국어 종결어미로 끝나는지 확인
     # 단순 종결어미: 다, 요, 죠, 네, 어요, 아요
-    # 복합 종결어미: ~는데요, ~습니다, ~습니까, ~지요, ~게요, ~을게요, ~을까요, 
+    # 복합 종결어미: ~는데요, ~습니다, ~습니까, ~지요, ~게요, ~을게요, ~을까요,
     #                ~으니까요, ~네요, ~인데요, ~래요, ~거예요 등
     # 공백이 있을 수도 있고 없을 수도 있음
     endings = [
@@ -94,11 +95,11 @@ def _is_sentence_closed(text: str) -> bool:
         r'거예요\s*$',
         r'니다\s*$',
     ]
-    
+
     for ending in endings:
         if re.search(ending, text):
             return True
-    
+
     return False
 
 
@@ -172,9 +173,9 @@ class SentenceSeparator:
             while not self._stop:
                 item = await self.sentence_queue.get()
                 try:
-                    # Translation target stays "en-US" (unchanged behavior);
-                    # we record that as the actual target_lang of the pair.
-                    target_language = 'en-US'
+                    # Translate to the segment's requested target language
+                    # (falls back to en-US); recorded as the pair's target_lang.
+                    target_language = item.target_lang or 'en-US'
                     translated = self.translator.translate(
                         item.source_text, target_language=target_language)
                     await self.pusher.push_to_client(

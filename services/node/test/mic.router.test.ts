@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createMicTtsHandler,
   createStartMicSessionHandler,
   createStopMicSessionHandler,
+  type MicTtsSynthesizer,
   type PythonSessionClient,
 } from "../src/router/mic.js";
 import { removeSessionId } from "../src/ports/sessionStore.js";
@@ -216,5 +218,86 @@ describe("mic router", () => {
     await handler({ body: {} } as never, response as never, vi.fn());
 
     expect(response.statusCode).toBe(400);
+  });
+
+  it("POST /api/mic/tts returns synthesized audio for requested language", async () => {
+    const synthesizer: MicTtsSynthesizer = {
+      synthesize: vi.fn(async ({ languageCode }) => ({
+        audioContent: `audio-${languageCode}`,
+        audioMimeType: "audio/mpeg",
+      })),
+    };
+    const handler = createMicTtsHandler({ ttsSynthesizer: synthesizer });
+    const response = createMockResponse();
+
+    await handler(
+      {
+        body: {
+          text: "Habari",
+          language: "sw-KE",
+          fallbackLanguage: "en-US",
+        },
+      } as never,
+      response as never,
+      vi.fn()
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({
+      audioContent: "audio-sw-KE",
+      audioMimeType: "audio/mpeg",
+      requestedLanguage: "sw-KE",
+      resolvedLanguage: "sw-KE",
+      usedFallback: false,
+    });
+    expect(synthesizer.synthesize).toHaveBeenCalledWith({
+      text: "Habari",
+      languageCode: "sw-KE",
+    });
+  });
+
+  it("POST /api/mic/tts falls back to English when requested language synthesis fails", async () => {
+    const synthesizer: MicTtsSynthesizer = {
+      synthesize: vi.fn(async ({ languageCode }) => {
+        if (languageCode === "sw-KE") {
+          throw new Error("voice unavailable");
+        }
+        return {
+          audioContent: "audio-en-US",
+          audioMimeType: "audio/mpeg",
+        };
+      }),
+    };
+    const handler = createMicTtsHandler({ ttsSynthesizer: synthesizer });
+    const response = createMockResponse();
+
+    await handler(
+      {
+        body: {
+          text: "Habari",
+          language: "sw-KE",
+          fallbackLanguage: "en-US",
+        },
+      } as never,
+      response as never,
+      vi.fn()
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toEqual({
+      audioContent: "audio-en-US",
+      audioMimeType: "audio/mpeg",
+      requestedLanguage: "sw-KE",
+      resolvedLanguage: "en-US",
+      usedFallback: true,
+    });
+    expect(synthesizer.synthesize).toHaveBeenNthCalledWith(1, {
+      text: "Habari",
+      languageCode: "sw-KE",
+    });
+    expect(synthesizer.synthesize).toHaveBeenNthCalledWith(2, {
+      text: "Habari",
+      languageCode: "en-US",
+    });
   });
 });
