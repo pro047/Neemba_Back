@@ -1,4 +1,6 @@
 import os
+from urllib.parse import quote_plus
+
 from dotenv import load_dotenv, find_dotenv
 
 
@@ -65,3 +67,21 @@ def get_postgres_config() -> dict[str, str]:
         "postgres_password": require_env("POSTGRES_PASSWORD"),
         "postgres_database": require_env("POSTGRES_DATABASE"),
     }
+
+
+def get_postgres_sync_url() -> str:
+    """Assemble a sync SQLAlchemy URL for Alembic from the POSTGRES_* env vars.
+
+    Runtime queries use asyncpg (see ``src/database/pool.py``); only Alembic
+    migrations use the sync psycopg (psycopg3) driver. We assemble the URL
+    from the existing ``POSTGRES_*`` secrets rather than introducing a new
+    ``DATABASE_URL`` env var, to keep the secret surface minimal. Credentials
+    are percent-encoded so special characters in the password are URL-safe.
+    """
+    cfg = get_postgres_config()
+    user = quote_plus(cfg["postgres_user"])
+    password = quote_plus(cfg["postgres_password"])
+    host = cfg["postgres_host"]
+    port = cfg["postgres_port"]
+    database = cfg["postgres_database"]
+    return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{database}"

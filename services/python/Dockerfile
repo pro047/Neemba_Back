@@ -47,9 +47,14 @@ FROM deps AS runtime
 
 COPY . /app
 
+# Migration-then-serve entrypoint (alembic upgrade head, then exec CMD).
+RUN chmod +x /app/entrypoint.sh
+
 USER appuser
 
 EXPOSE 8000
+
+ENTRYPOINT ["/app/entrypoint.sh"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 CMD curl -fsS http://127.0.0.1:8000/health || exit 1

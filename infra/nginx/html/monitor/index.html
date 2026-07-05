@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>번역 모니터</title>
+  <!-- Pure static page: no external CDN / build step. Offline-capable. -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>번역 모니터링</h1>
+    <nav class="tabs">
+      <button id="tab-sessions" class="tab active" type="button">세션</button>
+      <button id="tab-search" class="tab" type="button">검색</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ===== 세션 뷰 ===== -->
+    <section id="view-sessions" class="view">
+      <div class="split">
+        <!-- 왼쪽: 세션 목록 -->
+        <aside class="pane pane-list">
+          <div class="pane-head">
+            <h2>세션 목록</h2>
+            <button id="sessions-refresh" class="btn" type="button">새로고침</button>
+          </div>
+          <ul id="session-list" class="session-list"></ul>
+          <div class="pane-foot">
+            <button id="sessions-more" class="btn btn-block" type="button" hidden>더 보기</button>
+            <p id="sessions-status" class="status"></p>
+          </div>
+        </aside>
+
+        <!-- 오른쪽: 선택 세션 상세 -->
+        <div class="pane pane-detail">
+          <div class="pane-head">
+            <h2 id="detail-title">세션을 선택하세요</h2>
+            <div id="detail-controls" class="detail-controls" hidden>
+              <span id="detail-mode-label" class="mode-label"></span>
+              <button id="live-toggle" class="btn" type="button" hidden>라이브 시작</button>
+            </div>
+          </div>
+          <div id="detail-meta" class="meta"></div>
+          <div class="table-wrap">
+            <table class="pairs">
+              <thead>
+                <tr>
+                  <th class="col-seq">#</th>
+                  <th class="col-src">원문</th>
+                  <th class="col-tgt">번역</th>
+                  <th class="col-time">시각</th>
+                </tr>
+              </thead>
+              <tbody id="detail-rows"></tbody>
+            </table>
+          </div>
+          <div class="pane-foot">
+            <button id="detail-more" class="btn btn-block" type="button" hidden>더 보기</button>
+            <p id="detail-status" class="status"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== 검색 뷰 ===== -->
+    <section id="view-search" class="view" hidden>
+      <form id="search-form" class="search-form">
+        <label>언어
+          <input id="f-lang" type="text" placeholder="ko / ja / en-US (원문·번역 양쪽)" />
+        </label>
+        <label>시작(from)
+          <input id="f-from" type="text" placeholder="2026-06-01 또는 ISO8601" />
+        </label>
+        <label>종료(to)
+          <input id="f-to" type="text" placeholder="2026-06-04 또는 ISO8601" />
+        </label>
+        <label>키워드(q)
+          <input id="f-q" type="text" placeholder="마스킹된 텍스트 검색" />
+        </label>
+        <button class="btn" type="submit">검색</button>
+      </form>
+      <div class="table-wrap">
+        <table class="pairs">
+          <thead>
+            <tr>
+              <th class="col-sess">세션</th>
+              <th class="col-src">원문</th>
+              <th class="col-tgt">번역</th>
+              <th class="col-lang">언어</th>
+              <th class="col-time">시각</th>
+            </tr>
+          </thead>
+          <tbody id="search-rows"></tbody>
+        </table>
+      </div>
+      <div class="pane-foot">
+        <button id="search-more" class="btn btn-block" type="button" hidden>더 보기</button>
+        <p id="search-status" class="status"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

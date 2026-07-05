@@ -5,6 +5,7 @@ networks:
 
 volumes:
   nats-data:
+  pg-data:
 
 services:
   nginx:
@@ -17,6 +18,9 @@ services:
       - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./infra/letsencrypt:/etc/letsencrypt
       - ./infra/nginx/html:/var/www/html
+      # Monitor Basic Auth htpasswd (Phase 7) — same secrets dir as node/python,
+      # never committed. Create with: htpasswd -B -c monitor.htpasswd <user>
+      - /var/lib/neemba/secrets:/var/lib/neemba/secrets:ro
     restart: unless-stopped
     networks:
       - appnet
@@ -112,6 +116,9 @@ services:
       dockerfile: Dockerfile
       target: prod
     container_name: python
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - /var/lib/neemba/secrets:/var/lib/neemba/secrets:ro
     env_file:
@@ -171,3 +178,50 @@ services:
     depends_on:
       - nats
     restart: unless-stopped
+
+  pg-retention:
+    image: postgres:16-alpine
+    container_name: pg-retention
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env.prod
+    volumes:
+      - ./infra/postgres/retention.sh:/usr/local/bin/retention.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/retention.sh"]
+    networks:
+      - appnet
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    expose:
+      - "5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - appnet
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DATABASE}"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

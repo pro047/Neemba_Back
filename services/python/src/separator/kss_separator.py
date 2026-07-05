@@ -14,11 +14,41 @@ from src.dto.translationDto import TranslationRequestDto
 @dataclass
 class SegmentState:
     buffer: str = ''
+    # Metadata carried alongside the buffer so a flushed sentence can be paired
+    # back to its source segment for monitoring/storage (Phase 4).
+    session_id: str = ''
+    segment_id: int = 0
+    sequence: int = 0
+    source_lang: str | None = None
+    target_lang: str | None = None
+    confidence: float = 0.0
+
+
+@dataclass
+class PendingSentence:
+    """A split source sentence plus the metadata needed to store the pair."""
+    source_text: str
+    session_id: str
+    segment_id: int
+    sequence: int
+    source_lang: str | None
+    target_lang: str | None
+    confidence: float
 
 
 class Pusher(Protocol):
-    async def push_to_client(self,
-                             push_text: TextResult | list[TextResult], sequence: int | None): ...
+    async def push_to_client(
+        self,
+        push_text: TextResult | list[TextResult],
+        sequence: int | None,
+        *,
+        source_text: str | None = None,
+        session_id: str | None = None,
+        segment_id: int | None = None,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+        confidence: float | None = None,
+    ): ...
 
 
 class Translator(Protocol):
@@ -81,7 +111,7 @@ class SentenceSeparator:
         self._tasks: list[asyncio.Task[None]] = []
         self.queue: asyncio.Queue[TranslationRequestDto] = asyncio.Queue(
             maxsize=1000)
-        self.sentence_queue: asyncio.Queue[str] = asyncio.Queue(
+        self.sentence_queue: asyncio.Queue[PendingSentence] = asyncio.Queue(
         )
         self.state_queue: asyncio.Queue[SegmentState] = asyncio.Queue()
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
@@ -125,6 +155,14 @@ class SentenceSeparator:
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
+                # Carry the latest metadata so a flushed sentence keeps its
+                # session/segment context for monitoring + storage.
+                state.session_id = event.session_id
+                state.segment_id = event.segment_id
+                state.sequence = event.sequence
+                state.source_lang = event.source_lang
+                state.target_lang = event.target_lang
+                state.confidence = event.confidence
                 await self.state_queue.put(state)
         finally:
             self.queue.task_done()
@@ -132,11 +170,23 @@ class SentenceSeparator:
     async def _push_loop(self) -> None:
         try:
             while not self._stop:
-                sentence = await self.sentence_queue.get()
+                item = await self.sentence_queue.get()
                 try:
+                    # Translation target stays "en-US" (unchanged behavior);
+                    # we record that as the actual target_lang of the pair.
+                    target_language = 'en-US'
                     translated = self.translator.translate(
-                        sentence, target_language='en-US')
-                    await self.pusher.push_to_client(translated, None)
+                        item.source_text, target_language=target_language)
+                    await self.pusher.push_to_client(
+                        translated,
+                        item.sequence,
+                        source_text=item.source_text,
+                        session_id=item.session_id,
+                        segment_id=item.segment_id,
+                        source_lang=item.source_lang,
+                        target_lang=target_language,
+                        confidence=item.confidence,
+                    )
                 finally:
                     self.sentence_queue.task_done()
         except asyncio.CancelledError:
@@ -163,7 +213,15 @@ class SentenceSeparator:
                 for s in sentences[:end]:
                     s_clean = s.strip()
                     if s_clean:
-                        await self.sentence_queue.put(s_clean)
+                        await self.sentence_queue.put(PendingSentence(
+                            source_text=s_clean,
+                            session_id=text.session_id,
+                            segment_id=text.segment_id,
+                            sequence=text.sequence,
+                            source_lang=text.source_lang,
+                            target_lang=text.target_lang,
+                            confidence=text.confidence,
+                        ))
                 text.buffer = " " if closed else last
         except asyncio.CancelledError:
             raise
