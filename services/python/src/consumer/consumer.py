@@ -84,7 +84,14 @@ class TranscriptConsumer:
                 await self.separator.offer(req)
             await message.ack()
         except Exception as exc:
-            await message.nak()
+            print('consumer: message handling failed, nak:', repr(exc))
+            try:
+                await message.nak()
+            except Exception as nak_exc:
+                # A nak can itself fail during a NATS outage; swallow it so
+                # the consumer task never dies — the broker redelivers after
+                # ack_wait anyway.
+                print('consumer: nak failed (ignored):', repr(nak_exc))
 
     async def run(self):
         if not self.subscription:
@@ -103,7 +110,13 @@ class TranscriptConsumer:
             tasks = [asyncio.create_task(self._handle_message(msg))
                      for msg in msgs]
             if tasks:
-                await asyncio.gather(*tasks)
+                # return_exceptions keeps one failed handler from killing the
+                # whole consume loop (it would stop silently otherwise).
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        print('consumer: handler error (ignored):',
+                              repr(result))
 
     async def close(self):
         if self.client:

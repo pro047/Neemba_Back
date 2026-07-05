@@ -169,62 +169,84 @@ class SentenceSeparator:
             self.queue.task_done()
 
     async def _push_loop(self) -> None:
-        try:
-            while not self._stop:
-                item = await self.sentence_queue.get()
-                try:
-                    # Translate to the segment's requested target language
-                    # (falls back to en-US); recorded as the pair's target_lang.
-                    target_language = item.target_lang or 'en-US'
-                    translated = self.translator.translate(
-                        item.source_text, target_language=target_language)
-                    await self.pusher.push_to_client(
-                        translated,
-                        item.sequence,
-                        source_text=item.source_text,
-                        session_id=item.session_id,
-                        segment_id=item.segment_id,
-                        source_lang=item.source_lang,
-                        target_lang=target_language,
-                        confidence=item.confidence,
-                    )
-                finally:
-                    self.sentence_queue.task_done()
-        except asyncio.CancelledError:
-            pass
+        while not self._stop:
+            item = await self.sentence_queue.get()
+            try:
+                # Translate to the segment's requested target language
+                # (falls back to en-US); recorded as the pair's target_lang.
+                target_language = item.target_lang or 'en-US'
+                translated = self.translator.translate(
+                    item.source_text, target_language=target_language)
+                await self.pusher.push_to_client(
+                    translated,
+                    item.sequence,
+                    source_text=item.source_text,
+                    session_id=item.session_id,
+                    segment_id=item.segment_id,
+                    source_lang=item.source_lang,
+                    target_lang=target_language,
+                    confidence=item.confidence,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # One failed translation must not kill the pipeline task; the
+                # sentence is logged and dropped (retry policy is a follow-up).
+                print(
+                    f'separator: translate/push failed, sentence dropped '
+                    f'(session={item.session_id} seq={item.sequence}): {exc!r}')
+            finally:
+                self.sentence_queue.task_done()
 
     async def _flush(self) -> None:
-        try:
-            while not self._stop:
-                if self._stop:
-                    break
-                text = await self.state_queue.get()
+        while not self._stop:
+            state = await self.state_queue.get()
 
-                sentences: List[str] = await asyncio.to_thread(self.splitter, text.buffer)
-                if not sentences:
-                    continue
+            # Snapshot-and-clear with no await in between, so the store loop
+            # cannot interleave here. Deltas arriving while KSS runs in the
+            # worker thread accumulate in state.buffer and are re-merged
+            # below instead of being overwritten (data-loss race).
+            snapshot = state.buffer
+            state.buffer = ''
+            if not snapshot.strip():
+                continue
 
-                last = sentences[-1]
+            try:
+                sentences: List[str] = await asyncio.to_thread(
+                    self.splitter, snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Transient splitter failure: put the text back (in front of
+                # any deltas that arrived meanwhile) and keep the task alive.
+                state.buffer = snapshot + state.buffer
+                print(f'separator: split failed, buffer retained: {exc!r}')
+                continue
 
-                closed = _is_sentence_closed(last)
+            if not sentences:
+                state.buffer = snapshot + state.buffer
+                continue
 
-                end = len(sentences) if closed else max(
-                    0, len(sentences) - 1)
+            last = sentences[-1]
 
-                for s in sentences[:end]:
-                    s_clean = s.strip()
-                    if s_clean:
-                        await self.sentence_queue.put(PendingSentence(
-                            source_text=s_clean,
-                            session_id=text.session_id,
-                            segment_id=text.segment_id,
-                            sequence=text.sequence,
-                            source_lang=text.source_lang,
-                            target_lang=text.target_lang,
-                            confidence=text.confidence,
-                        ))
-                text.buffer = " " if closed else last
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
+            closed = _is_sentence_closed(last)
+
+            end = len(sentences) if closed else max(
+                0, len(sentences) - 1)
+
+            for s in sentences[:end]:
+                s_clean = s.strip()
+                if s_clean:
+                    await self.sentence_queue.put(PendingSentence(
+                        source_text=s_clean,
+                        session_id=state.session_id,
+                        segment_id=state.segment_id,
+                        sequence=state.sequence,
+                        source_lang=state.source_lang,
+                        target_lang=state.target_lang,
+                        confidence=state.confidence,
+                    ))
+            if not closed:
+                # The unfinished tail goes back in front of whatever arrived
+                # while the splitter was running.
+                state.buffer = last + state.buffer
