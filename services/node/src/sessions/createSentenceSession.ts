@@ -77,7 +77,12 @@ export function createSentenceSession(
       const hasKoreanEnding = hasKoreanSentenceEnding(text);
       const growthEnough = text.length >= minimumGrowthCharacters;
 
-      if ((hasPunctuation || hasKoreanEnding || growthEnough) && bucket.allow()) {
+      // Finals bypass both the heuristic gate and the rate limit: they are the
+      // last chance to deliver this text, so dropping one loses it forever.
+      const passesGate =
+        isFinal ||
+        ((hasPunctuation || hasKoreanEnding || growthEnough) && bucket.allow());
+      if (passesGate) {
         onSentence(
           text,
           isFinal,
