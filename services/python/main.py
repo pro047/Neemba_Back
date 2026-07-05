@@ -380,7 +380,9 @@ async def stop_session(req: StopRequest, request: Request):
             print("stop_session: end_session failed (ignored):", repr(e))
 
     hub: WebSocketHub = request.app.state.hub
-    await hub.detach()
+    # Session-aware detach: a stop for a stale session cannot close the
+    # socket owned by the currently live session.
+    await hub.detach(req.session_id)
 
     # Only the first (transitioning) stop emits the monitor close event.
     monitor_hub: MonitorHub = getattr(request.app.state, "monitor_hub", None)
@@ -400,12 +402,20 @@ async def websocket_endpoint(ws: WebSocket):
 
     hub: WebSocketHub = ws.app.state.hub
 
-    print(">>> hub at endpoint:", id(hub), "ws:", id(ws))
+    # wss://.../ws?sessionId={id} 의 쿼리에서 슬롯 주인을 식별한다.
+    # sessionId 없는 접속은 라우팅 대상이 없으므로 거절(handshake close).
+    session_id = ws.query_params.get("sessionId")
+    if not session_id:
+        print('main : websocket rejected, missing sessionId')
+        await ws.close(code=1008)
+        return
 
-    await hub.attach(ws)
+    print(">>> hub at endpoint:", id(hub), "ws:", id(ws), "session:", session_id)
+
+    await hub.attach(ws, session_id)
 
     try:
-        await hub.broadcast_to_session({
+        await hub.broadcast_to_session(session_id, {
             "sentence": "Connect!",
             "isFinal": True
         })
@@ -444,7 +454,7 @@ async def websocket_endpoint(ws: WebSocket):
         pass
     except Exception as e:
         print(f'main : websocket error: {e}')
-        await hub.detach()
+        await hub.detach(session_id)
 
 
 @app.websocket("/ws/monitor")

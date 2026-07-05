@@ -19,7 +19,16 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   private lastInputAt: number = 0;
   private queue: string[] = [];
 
-  constructor(private readonly publisher: TranscriptPublisherPort) {}
+  constructor(
+    private readonly publisher: TranscriptPublisherPort,
+    private readonly languages: {
+      sourceLanguage: string;
+      targetLanguage: string;
+    } = {
+      sourceLanguage: "ko-KR",
+      targetLanguage: "en-US",
+    }
+  ) {}
 
   async onSttResult(result: {
     transcript: string;
@@ -112,8 +121,8 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
       sessionId: sessionId,
       segmentId: segmentId,
       sequence: ++this.sequence,
-      sourceLanguage: "ko-KR",
-      targetLanguage: "en-US",
+      sourceLanguage: this.languages.sourceLanguage,
+      targetLanguage: this.languages.targetLanguage,
       sampleRateHz: 16000,
       transcriptText: merged,
       createdAt: new Date().toISOString(),

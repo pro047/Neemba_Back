@@ -61,7 +61,9 @@ class Pusher:
         confidence: float | None = None,
     ) -> None:
         # 1) Client delivery — hot path, must not be blocked by capture.
-        await self.hub.broadcast_to_session(payload={
+        # session_id gates the hub slot: stale sessions are dropped there.
+        # A missing session_id can never match the slot owner, so it drops too.
+        await self.hub.broadcast_to_session(session_id or '', payload={
             "sequence": sequence,
             "sentence": push_text,
             "isFinal": True,

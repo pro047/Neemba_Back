@@ -58,7 +58,10 @@ router.post("/sessions/start", async (req, res) => {
     }
     console.log("python ok:", t);
 
-    const { stop } = await runPipelines();
+    const { stop } = await runPipelines({
+      sourceLanguage: sourceLang,
+      targetLanguage: targetLang,
+    });
     stopPipeline = stop;
 
     return res.status(202).json({ sessionId, webSocketUrl: t.webSocketUrl });

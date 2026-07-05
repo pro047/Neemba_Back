@@ -11,7 +11,14 @@ import { StreamOrchestrator } from "./usecases/StreamOrchestrator.js";
 
 const url = natsUrl || "nats://neemba:nats1234@localhost:4222";
 
-export async function createStreamOrchestrator(): Promise<StreamOrchestrator> {
+type StreamLanguages = {
+  sourceLanguage?: string;
+  targetLanguage?: string;
+};
+
+export async function createStreamOrchestrator(
+  languages: StreamLanguages = {}
+): Promise<StreamOrchestrator> {
   const auth = new GoogleAuth({
     scopes: "https://www.googleapis.com/auth/cloud-platform",
   });
@@ -43,7 +50,11 @@ export async function createStreamOrchestrator(): Promise<StreamOrchestrator> {
     console.log("stream switcher : current segmentId = ", segmentId);
   });
   const interimChunkOrchestra = new InterimChunkOrchestrator(
-    transcriptPublisher
+    transcriptPublisher,
+    {
+      sourceLanguage: languages.sourceLanguage ?? "ko-KR",
+      targetLanguage: languages.targetLanguage ?? "en-US",
+    }
   );
 
   return new StreamOrchestrator(
