@@ -37,9 +37,13 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
     segmentId: number;
     sessionId: string;
   }) {
+    // Empty transcripts must not touch delta state: overwriting `text` with ""
+    // would make the next result look like a session start and re-publish it
+    // in full (duplication). Bail before mutating.
+    const next = this.normalize(result.transcript);
+    if (!next) return;
     this.prevText = this.text;
-    this.text = this.normalize(result.transcript);
-    if (!this.prevText || !this.text) return;
+    this.text = next;
 
     const segmentId = result.segmentId;
     const sessionId = result.sessionId;
