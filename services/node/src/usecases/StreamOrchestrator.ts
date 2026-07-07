@@ -72,7 +72,11 @@ export class StreamOrchestrator implements AudioConsumerPort {
       }
     );
 
-    const firstHandle = this._createSttHandle(session, sessionId);
+    const firstHandle = this._createSttHandle(
+      session,
+      sessionId,
+      sessionSegmentId
+    );
 
     await this.switcher.handoff(firstHandle, sessionSegmentId);
     this._scheduleNextRestart(sessionId, session);
@@ -97,13 +101,17 @@ export class StreamOrchestrator implements AudioConsumerPort {
 
   private _createSttHandle(
     session: ReturnType<typeof createSentenceSession>,
-    sessionId: string
+    sessionId: string,
+    segmentId: number
   ): StreamHandle {
     const stt = this.sttPort.startStreaming({
       languageCodes: ["ko-KR"],
       model: "latest_long",
       onTranscript: (p) => {
-        const segmentId = this.switcher.currentSegmentId();
+        // Attribute results to the stream that produced them: after a
+        // rotation the old stream still flushes its last results, and those
+        // must keep the OLD segmentId instead of adopting the switcher's
+        // current one.
         session.handleInterim({
           ...p,
           segmentId: segmentId,
@@ -157,7 +165,11 @@ export class StreamOrchestrator implements AudioConsumerPort {
       this._clearRestartTimer();
       try {
         const nextSegmentId = this.segmentManager.next(sessionId);
-        const nextHandle = this._createSttHandle(session, sessionId);
+        const nextHandle = this._createSttHandle(
+          session,
+          sessionId,
+          nextSegmentId
+        );
         await this.switcher.handoff(nextHandle, nextSegmentId);
         this._scheduleNextRestart(sessionId, session);
       } catch (err) {
