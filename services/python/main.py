@@ -379,6 +379,16 @@ async def stop_session(req: StopRequest, request: Request):
         except Exception as e:
             print("stop_session: end_session failed (ignored):", repr(e))
 
+    # Flush the session's buffered tail before tearing anything down so the
+    # capture path (DB + monitor) still records it. Isolated like the rest of
+    # the stop path: a separator failure must not block the stop.
+    separator = getattr(request.app.state, "separator", None)
+    if separator is not None:
+        try:
+            await separator.close_session(req.session_id)
+        except Exception as e:
+            print("stop_session: separator flush failed (ignored):", repr(e))
+
     hub: WebSocketHub = request.app.state.hub
     # Session-aware detach: a stop for a stale session cannot close the
     # socket owned by the currently live session.
