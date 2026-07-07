@@ -331,21 +331,42 @@ export function createStopMicSessionHandler({
     }
 
     try {
-      const runtime = runtimeStore.get(sessionId);
-
-      if (runtime) {
-        await runtime.stop();
-        runtimeStore.delete(sessionId);
-      }
-
-      removeSessionId();
-      await pythonClient.stopSession(sessionId);
+      await stopMicSession(sessionId, { pythonClient, runtimeStore });
 
       return res.status(200).json({ ok: true });
     } catch (err) {
       return res.status(500).json({ error: "Failed to stop mic session" });
     }
   };
+}
+
+/** Full session teardown shared by /mic/stop and the ghost-session sweeper. */
+export async function stopMicSession(
+  sessionId: string,
+  {
+    pythonClient,
+    runtimeStore,
+  }: {
+    pythonClient: PythonSessionClient;
+    runtimeStore: SessionRuntimeStore;
+  }
+): Promise<void> {
+  const runtime = runtimeStore.get(sessionId);
+
+  if (runtime) {
+    await runtime.stop();
+    runtimeStore.delete(sessionId);
+  }
+
+  removeSessionId();
+  await pythonClient.stopSession(sessionId);
+}
+
+export function createMicSessionStopper(
+  runtimeStore: SessionRuntimeStore = micRuntimeStore
+): (sessionId: string) => Promise<void> {
+  const pythonClient = createPythonSessionClient(PY_HOST);
+  return (sessionId) => stopMicSession(sessionId, { pythonClient, runtimeStore });
 }
 
 export function createMicRouter({
