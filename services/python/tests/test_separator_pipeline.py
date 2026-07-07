@@ -162,10 +162,12 @@ async def test_push_loop_survives_translator_exception():
         await separator.stop()
 
 
-class DummySeparator:
+class FailingSeparator:
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
-    async def offer(self, event) -> None: ...
+
+    async def offer(self, event) -> None:
+        raise RuntimeError('offer boom')
 
 
 class FakeMsg:
@@ -173,6 +175,7 @@ class FakeMsg:
         self.data = data
         self.acked = False
         self.naked = False
+        self.termed = False
         self._nak_raises = nak_raises
 
     async def ack(self) -> None:
@@ -183,25 +186,35 @@ class FakeMsg:
             raise RuntimeError('nak failed: connection lost')
         self.naked = True
 
+    async def term(self) -> None:
+        self.termed = True
+
+
+VALID_PAYLOAD = (b'{"sessionId": "s", "segmentId": 1, "sequence": 1, '
+                 b'"transcriptText": "t", "targetLanguage": "en-US", '
+                 b'"sourceLanguage": "ko-KR"}')
+
 
 def make_consumer() -> TranscriptConsumer:
     return TranscriptConsumer(
         'nats://unused', 'subject', 'stream', 'durable',
-        separator=DummySeparator())
+        separator=FailingSeparator())
 
 
-async def test_handle_message_naks_poison_message():
+async def test_handle_message_naks_when_offer_fails():
+    # Parseable message whose processing fails → nak so the broker retries.
+    # (Unparseable messages are termed instead — see test_consumer_dedup.py.)
     consumer = make_consumer()
-    message = FakeMsg(b'not-json')
+    message = FakeMsg(VALID_PAYLOAD)
 
     await consumer._handle_message(message)
 
-    assert message.naked and not message.acked
+    assert message.naked and not message.acked and not message.termed
 
 
 async def test_handle_message_survives_nak_failure():
     consumer = make_consumer()
-    message = FakeMsg(b'not-json', nak_raises=True)
+    message = FakeMsg(VALID_PAYLOAD, nak_raises=True)
 
     # A nak failing mid-outage must not propagate — an escaped exception here
     # kills the consumer task for good (silent, /health stays 200).
