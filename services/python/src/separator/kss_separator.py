@@ -23,9 +23,12 @@ class SegmentState:
     source_lang: str | None = None
     target_lang: str | None = None
     confidence: float = 0.0
-    # Set when the segment's stream is gone (rotation): the flush treats the
-    # buffer as closed regardless of sentence-ending heuristics.
+    # Set when the segment's stream is gone (rotation), the session stopped,
+    # or input went quiet past the flush timeout: the next flush treats the
+    # buffer as closed regardless of sentence-ending heuristics (one-shot).
     force_closed: bool = False
+    # Monotonic clock of the last buffer append; drives the timeout flush.
+    last_appended_at: float = 0.0
 
 
 @dataclass
@@ -110,7 +113,12 @@ class SentenceSeparator:
     def __init__(self,
                  translator: Translator,
                  pusher: Pusher,
+                 flush_timeout_seconds: float = 2.0,
                  ) -> None:
+        # After this much input silence, an unfinished buffered sentence is
+        # shipped as-is instead of waiting (possibly forever) for a closing
+        # ending. Tune against real speech pauses.
+        self._flush_timeout = flush_timeout_seconds
         self._lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
         self.queue: asyncio.Queue[TranslationRequestDto] = asyncio.Queue(
@@ -137,6 +145,7 @@ class SentenceSeparator:
             asyncio.create_task(self._flush()),
             asyncio.create_task(self._store_text_loop()),
             asyncio.create_task(self._push_loop()),
+            asyncio.create_task(self._timeout_sweeper()),
         ]
 
     async def stop(self) -> None:
@@ -175,6 +184,7 @@ class SentenceSeparator:
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
+                state.last_appended_at = asyncio.get_running_loop().time()
                 # Carry the latest metadata so a flushed sentence keeps its
                 # session/segment context for monitoring + storage.
                 state.session_id = event.session_id
@@ -249,6 +259,9 @@ class SentenceSeparator:
             last = sentences[-1]
 
             closed = state.force_closed or _is_sentence_closed(last)
+            # One-shot: a rotation/stop/timeout mark applies to this flush
+            # only, never to the segment's future sentences.
+            state.force_closed = False
 
             end = len(sentences) if closed else max(
                 0, len(sentences) - 1)
@@ -269,3 +282,37 @@ class SentenceSeparator:
                 # The unfinished tail goes back in front of whatever arrived
                 # while the splitter was running.
                 state.buffer = last + state.buffer
+
+    async def _timeout_sweeper(self) -> None:
+        interval = max(self._flush_timeout / 4, 0.05)
+        while not self._stop:
+            await asyncio.sleep(interval)
+            try:
+                now = asyncio.get_running_loop().time()
+                for state in list(self.state_by_key.values()):
+                    if not state.buffer.strip():
+                        continue
+                    if now - state.last_appended_at < self._flush_timeout:
+                        continue
+                    state.force_closed = True
+                    # Reset the clock so the state is not re-queued on every
+                    # sweep while it waits in state_queue.
+                    state.last_appended_at = now
+                    await self.state_queue.put(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f'separator: timeout sweeper error (ignored): {exc!r}')
+
+    async def close_session(self, session_id: str) -> None:
+        """Flush and drop every segment buffer of a stopped session.
+
+        Called from /internal/sessions/stop — without this, a stopped
+        session's buffered tail is lost and its state_by_key entries leak.
+        """
+        keys = [k for k in self.state_by_key if k[0] == session_id]
+        for key in keys:
+            state = self.state_by_key.pop(key)
+            if state.buffer.strip():
+                state.force_closed = True
+                await self.state_queue.put(state)
