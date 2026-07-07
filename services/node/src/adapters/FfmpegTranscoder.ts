@@ -11,6 +11,8 @@ export class FfmpegTranscoder implements AudioTranscoder {
   private killedChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   private killTimers = new WeakMap<ChildProcessWithoutNullStreams, NodeJS.Timeout>();
 
+  constructor(private readonly spawnProcess: typeof spawn = spawn) {}
+
   private spawnFfmpeg() {
     const ffmpegArguments = [
       "-hide_banner",
@@ -38,9 +40,16 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "pipe:2",
     ];
 
-    const child = spawn("ffmpeg", ffmpegArguments, {
+    const child = this.spawnProcess("ffmpeg", ffmpegArguments, {
       stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
+
+    // Without an 'error' listener, a write into a just-died ffmpeg (the
+    // EPIPE window before 'close' fires) raises an uncaught 'error' event
+    // and kills the whole process. Restart handling stays on 'close'.
+    child.stdin.on("error", (e: Error) => {
+      console.warn("ffmpeg stdin error (ignored):", e.message);
+    });
 
     this.childProcess = child;
     return child;

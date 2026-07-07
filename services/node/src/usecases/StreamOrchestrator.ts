@@ -61,14 +61,19 @@ export class StreamOrchestrator implements AudioConsumerPort {
       ) => {
         if (!text.trim()) return;
 
-        this.interimOrchestra.onSttResult({
-          transcript: text,
-          isFinal: isFinal,
-          resultEndTimeMs: endTimeMilliseconds,
-          confidence,
-          segmentId,
-          sessionId,
-        });
+        // Fire-and-forget: without the catch, a rejection here is unhandled
+        // and crashes the process (defense in depth — publishSpan also
+        // contains its own failures).
+        this.interimOrchestra
+          .onSttResult({
+            transcript: text,
+            isFinal: isFinal,
+            resultEndTimeMs: endTimeMilliseconds,
+            confidence,
+            segmentId,
+            sessionId,
+          })
+          .catch((err) => console.error("interim onSttResult error", err));
       }
     );
 

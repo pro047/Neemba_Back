@@ -134,7 +134,16 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   }
 
   private async publishSpan(segmentId: number, sessionId: string, force = false) {
-    await this.ensurePublisher();
+    // publishSpan is reached from fire-and-forget callers (STT callback,
+    // trailing timer): any rejection escaping here becomes an unhandled
+    // rejection and kills the whole Node process — every live session.
+    try {
+      await this.ensurePublisher();
+    } catch (err) {
+      // Connection failed: keep the queue intact so the next span retries.
+      console.error("interim publish: publisher start failed", err);
+      return;
+    }
 
     // Boundary/final flushes must never be dropped by the rapid-publish
     // guard: a skipped flush would leave old-segment slices in the queue and
@@ -156,7 +165,11 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
       createdAt: new Date().toISOString(),
     };
 
-    await this.publisher.publish(chunk);
+    try {
+      await this.publisher.publish(chunk);
+    } catch (err) {
+      console.error("interim publish failed, span dropped", err);
+    }
   }
 
   async dispose() {
