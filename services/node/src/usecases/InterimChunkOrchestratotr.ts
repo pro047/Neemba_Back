@@ -7,6 +7,7 @@ import type {
 export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   private text: string | null = "";
   private prevText: string | null = "";
+  private currentSegmentId: number | null = null;
   private sequence = 0;
   private silenceTimer?: NodeJS.Timeout;
   private trailingTimer: NodeJS.Timeout | null = null;
@@ -42,21 +43,41 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
     // in full (duplication). Bail before mutating.
     const next = this.normalize(result.transcript);
     if (!next) return;
-    this.prevText = this.text;
-    this.text = next;
 
     const segmentId = result.segmentId;
     const sessionId = result.sessionId;
+
+    // Segment boundary (stream rotation): texts from different streams must
+    // never be diffed against each other. Ship whatever is still queued
+    // under the old segment, then restart delta tracking from scratch.
+    if (this.currentSegmentId !== null && segmentId !== this.currentSegmentId) {
+      if (this.queue.length > 0) {
+        await this.publishSpan(this.currentSegmentId, sessionId, true);
+      }
+      this.prevText = "";
+      this.text = "";
+    }
+    this.currentSegmentId = segmentId;
+
+    this.prevText = this.text;
+    this.text = next;
 
     const slice = this.computeDelta(this.prevText, this.text);
 
     if (slice === "") return;
 
-    console.log("interim - slice :", slice);
-    console.log("--------------------------");
-
     this.queue.push(slice);
     this.lastInputAt = Date.now();
+
+    if (result.isFinal) {
+      // A final closes the utterance: Google restarts the next interim from
+      // "", so ship the tail now and reset the diff baseline.
+      if (this.trailingTimer) clearTimeout(this.trailingTimer);
+      await this.publishSpan(segmentId, sessionId, true);
+      this.prevText = "";
+      this.text = "";
+      return;
+    }
 
     if (this.lastInputAt - this.lastSentAt >= this.throttleMs) {
       await this.publishSpan(segmentId, sessionId);
@@ -112,10 +133,13 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
     }
   }
 
-  private async publishSpan(segmentId: number, sessionId: string) {
+  private async publishSpan(segmentId: number, sessionId: string, force = false) {
     await this.ensurePublisher();
 
-    if (Date.now() - this.lastSentAt < 5) return;
+    // Boundary/final flushes must never be dropped by the rapid-publish
+    // guard: a skipped flush would leave old-segment slices in the queue and
+    // merge them into the next segment's publish.
+    if (!force && Date.now() - this.lastSentAt < 5) return;
 
     const merged = this.queue.join("");
     this.queue = [];

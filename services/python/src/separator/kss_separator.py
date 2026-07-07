@@ -23,6 +23,9 @@ class SegmentState:
     source_lang: str | None = None
     target_lang: str | None = None
     confidence: float = 0.0
+    # Set when the segment's stream is gone (rotation): the flush treats the
+    # buffer as closed regardless of sentence-ending heuristics.
+    force_closed: bool = False
 
 
 @dataclass
@@ -153,6 +156,22 @@ class SentenceSeparator:
             while not self._stop:
                 event: TranslationRequestDto = await self.queue.get()
                 key = (event.session_id, event.segment_id)
+
+                if key not in self.state_by_key:
+                    # A new segment means the session's previous stream was
+                    # rotated away: its buffered tail can never be completed,
+                    # so force-flush it now instead of orphaning it forever
+                    # (text loss + state_by_key leak).
+                    stale_keys = [
+                        k for k in self.state_by_key
+                        if k[0] == event.session_id and k != key
+                    ]
+                    for stale_key in stale_keys:
+                        stale = self.state_by_key.pop(stale_key)
+                        if stale.buffer.strip():
+                            stale.force_closed = True
+                            await self.state_queue.put(stale)
+
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
@@ -229,7 +248,7 @@ class SentenceSeparator:
 
             last = sentences[-1]
 
-            closed = _is_sentence_closed(last)
+            closed = state.force_closed or _is_sentence_closed(last)
 
             end = len(sentences) if closed else max(
                 0, len(sentences) - 1)
