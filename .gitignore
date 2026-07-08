@@ -39,3 +39,6 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# runtime-verify generated audio (regenerate with scripts/verify/gen-audio.sh)
+scripts/verify/audio/
