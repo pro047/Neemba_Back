@@ -11,6 +11,13 @@ services:
   nginx:
     image: nginx:1.27-alpine
     container_name: nginx
+    # Self-reload every 12h so renewed certbot certificates get picked up
+    # without the docker.sock-mounted reloader sidecar (removed — it was
+    # effectively host-root). Certs renew ~30 days before expiry, so a
+    # worst-case 12h pickup delay is harmless.
+    command: >
+      sh -c '(while :; do sleep 12h; nginx -s reload && echo "[cert-reload] nginx reloaded"; done) &
+            exec nginx -g "daemon off;"'
     ports:
       - "80:80"
       - "443:443"
@@ -49,33 +56,16 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  reloader:
-    image: alpine:3.20
-    container_name: nginx-reloader
-    command: >
-      sh -c "apk add --no-cache curl docker-cli netcat-openbsd &&
-            while true; do
-              nc -l -p 8888 -e sh -c 'docker kill -s HUP nginx';
-            done"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - appnet
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   certbot:
     image: certbot/certbot
     container_name: certbot
     volumes:
       - ./infra/letsencrypt:/etc/letsencrypt
       - ./infra/nginx/html:/var/www/html
+    # Renews cert files only — nginx picks them up via its own periodic
+    # reload (see the nginx service command).
     entrypoint: >
-      sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/html --quiet && echo reload | nc nginx-reloader 8888; sleep 12h & wait $${!}; done'
+      sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/html --quiet; sleep 12h & wait $${!}; done'
     networks:
       - appnet
     restart: unless-stopped
