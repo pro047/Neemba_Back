@@ -9,7 +9,8 @@ import { StreamSwitcher } from "./stream/StreamSwitcher.js";
 import { InterimChunkOrchestrator } from "./usecases/InterimChunkOrchestratotr.js";
 import { StreamOrchestrator } from "./usecases/StreamOrchestrator.js";
 
-const url = natsUrl || "nats://neemba:nats1234@localhost:4222";
+// Missing NATS_URL fails fast inside JetStreamTranscriptPublisher.start().
+const url = natsUrl;
 
 type StreamLanguages = {
   sourceLanguage?: string;
