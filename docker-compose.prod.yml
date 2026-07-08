@@ -147,8 +147,9 @@ services:
       - .env.prod
     expose:
       - "4222"
-    ports:
-      - "8222:8222"
+      # 8222 (HTTP monitoring, unauthenticated) is network-internal only:
+      # the healthcheck below runs inside the container and still reaches it.
+      - "8222"
     volumes:
       - nats-data:/data
       - ./infra/nats/nats.conf:/etc/nats/nats.conf:ro
