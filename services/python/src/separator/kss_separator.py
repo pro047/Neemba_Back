@@ -14,11 +14,48 @@ from src.dto.translationDto import TranslationRequestDto
 @dataclass
 class SegmentState:
     buffer: str = ''
+    # Metadata carried alongside the buffer so a flushed sentence can be paired
+    # back to its source segment for monitoring/storage (Phase 4), and so the
+    # hub can gate delivery to the session that owns the client slot.
+    session_id: str = ''
+    segment_id: int = 0
+    sequence: int = 0
+    source_lang: str | None = None
+    target_lang: str | None = None
+    confidence: float = 0.0
+    # Set when the segment's stream is gone (rotation), the session stopped,
+    # or input went quiet past the flush timeout: the next flush treats the
+    # buffer as closed regardless of sentence-ending heuristics (one-shot).
+    force_closed: bool = False
+    # Monotonic clock of the last buffer append; drives the timeout flush.
+    last_appended_at: float = 0.0
+
+
+@dataclass
+class PendingSentence:
+    """A split source sentence plus the metadata needed to store the pair."""
+    source_text: str
+    session_id: str
+    segment_id: int
+    sequence: int
+    source_lang: str | None
+    target_lang: str | None
+    confidence: float
 
 
 class Pusher(Protocol):
-    async def push_to_client(self,
-                             push_text: TextResult | list[TextResult], sequence: int | None): ...
+    async def push_to_client(
+        self,
+        push_text: TextResult | list[TextResult],
+        sequence: int | None,
+        *,
+        source_text: str | None = None,
+        session_id: str | None = None,
+        segment_id: int | None = None,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+        confidence: float | None = None,
+    ): ...
 
 
 class Translator(Protocol):
@@ -35,14 +72,14 @@ def _is_sentence_closed(text: str) -> bool:
     text = text.strip()
     if not text:
         return False
-    
+
     # 구두점으로 끝나는지 확인
     if re.search(r'[\.!\?…]\s*$', text):
         return True
-    
+
     # 한국어 종결어미로 끝나는지 확인
     # 단순 종결어미: 다, 요, 죠, 네, 어요, 아요
-    # 복합 종결어미: ~는데요, ~습니다, ~습니까, ~지요, ~게요, ~을게요, ~을까요, 
+    # 복합 종결어미: ~는데요, ~습니다, ~습니까, ~지요, ~게요, ~을게요, ~을까요,
     #                ~으니까요, ~네요, ~인데요, ~래요, ~거예요 등
     # 공백이 있을 수도 있고 없을 수도 있음
     endings = [
@@ -64,11 +101,11 @@ def _is_sentence_closed(text: str) -> bool:
         r'거예요\s*$',
         r'니다\s*$',
     ]
-    
+
     for ending in endings:
         if re.search(ending, text):
             return True
-    
+
     return False
 
 
@@ -76,12 +113,17 @@ class SentenceSeparator:
     def __init__(self,
                  translator: Translator,
                  pusher: Pusher,
+                 flush_timeout_seconds: float = 2.0,
                  ) -> None:
+        # After this much input silence, an unfinished buffered sentence is
+        # shipped as-is instead of waiting (possibly forever) for a closing
+        # ending. Tune against real speech pauses.
+        self._flush_timeout = flush_timeout_seconds
         self._lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
         self.queue: asyncio.Queue[TranslationRequestDto] = asyncio.Queue(
             maxsize=1000)
-        self.sentence_queue: asyncio.Queue[str] = asyncio.Queue(
+        self.sentence_queue: asyncio.Queue[PendingSentence] = asyncio.Queue(
         )
         self.state_queue: asyncio.Queue[SegmentState] = asyncio.Queue()
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
@@ -103,6 +145,7 @@ class SentenceSeparator:
             asyncio.create_task(self._flush()),
             asyncio.create_task(self._store_text_loop()),
             asyncio.create_task(self._push_loop()),
+            asyncio.create_task(self._timeout_sweeper()),
         ]
 
     async def stop(self) -> None:
@@ -122,50 +165,154 @@ class SentenceSeparator:
             while not self._stop:
                 event: TranslationRequestDto = await self.queue.get()
                 key = (event.session_id, event.segment_id)
+
+                if key not in self.state_by_key:
+                    # A new segment means the session's previous stream was
+                    # rotated away: its buffered tail can never be completed,
+                    # so force-flush it now instead of orphaning it forever
+                    # (text loss + state_by_key leak).
+                    stale_keys = [
+                        k for k in self.state_by_key
+                        if k[0] == event.session_id and k != key
+                    ]
+                    for stale_key in stale_keys:
+                        stale = self.state_by_key.pop(stale_key)
+                        if stale.buffer.strip():
+                            stale.force_closed = True
+                            await self.state_queue.put(stale)
+
                 state = self.state_by_key.setdefault(key, SegmentState())
 
                 state.buffer = (state.buffer + event.source_text).strip()
+                state.last_appended_at = asyncio.get_running_loop().time()
+                # Carry the latest metadata so a flushed sentence keeps its
+                # session/segment context for monitoring + storage.
+                state.session_id = event.session_id
+                state.segment_id = event.segment_id
+                state.sequence = event.sequence
+                state.source_lang = event.source_lang
+                state.target_lang = event.target_lang
+                state.confidence = event.confidence
                 await self.state_queue.put(state)
         finally:
             self.queue.task_done()
 
     async def _push_loop(self) -> None:
-        try:
-            while not self._stop:
-                sentence = await self.sentence_queue.get()
-                try:
-                    translated = self.translator.translate(
-                        sentence, target_language='en-US')
-                    await self.pusher.push_to_client(translated, None)
-                finally:
-                    self.sentence_queue.task_done()
-        except asyncio.CancelledError:
-            pass
+        while not self._stop:
+            item = await self.sentence_queue.get()
+            try:
+                # Translate to the segment's requested target language
+                # (falls back to en-US); recorded as the pair's target_lang.
+                target_language = item.target_lang or 'en-US'
+                translated = self.translator.translate(
+                    item.source_text, target_language=target_language)
+                await self.pusher.push_to_client(
+                    translated,
+                    item.sequence,
+                    source_text=item.source_text,
+                    session_id=item.session_id,
+                    segment_id=item.segment_id,
+                    source_lang=item.source_lang,
+                    target_lang=target_language,
+                    confidence=item.confidence,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # One failed translation must not kill the pipeline task; the
+                # sentence is logged and dropped (retry policy is a follow-up).
+                print(
+                    f'separator: translate/push failed, sentence dropped '
+                    f'(session={item.session_id} seq={item.sequence}): {exc!r}')
+            finally:
+                self.sentence_queue.task_done()
 
     async def _flush(self) -> None:
-        try:
-            while not self._stop:
-                if self._stop:
-                    break
-                text = await self.state_queue.get()
+        while not self._stop:
+            state = await self.state_queue.get()
 
-                sentences: List[str] = await asyncio.to_thread(self.splitter, text.buffer)
-                if not sentences:
-                    continue
+            # Snapshot-and-clear with no await in between, so the store loop
+            # cannot interleave here. Deltas arriving while KSS runs in the
+            # worker thread accumulate in state.buffer and are re-merged
+            # below instead of being overwritten (data-loss race).
+            snapshot = state.buffer
+            state.buffer = ''
+            if not snapshot.strip():
+                continue
 
-                last = sentences[-1]
+            try:
+                sentences: List[str] = await asyncio.to_thread(
+                    self.splitter, snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Transient splitter failure: put the text back (in front of
+                # any deltas that arrived meanwhile) and keep the task alive.
+                state.buffer = snapshot + state.buffer
+                print(f'separator: split failed, buffer retained: {exc!r}')
+                continue
 
-                closed = _is_sentence_closed(last)
+            if not sentences:
+                state.buffer = snapshot + state.buffer
+                continue
 
-                end = len(sentences) if closed else max(
-                    0, len(sentences) - 1)
+            last = sentences[-1]
 
-                for s in sentences[:end]:
-                    s_clean = s.strip()
-                    if s_clean:
-                        await self.sentence_queue.put(s_clean)
-                text.buffer = " " if closed else last
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
+            closed = state.force_closed or _is_sentence_closed(last)
+            # One-shot: a rotation/stop/timeout mark applies to this flush
+            # only, never to the segment's future sentences.
+            state.force_closed = False
+
+            end = len(sentences) if closed else max(
+                0, len(sentences) - 1)
+
+            for s in sentences[:end]:
+                s_clean = s.strip()
+                if s_clean:
+                    await self.sentence_queue.put(PendingSentence(
+                        source_text=s_clean,
+                        session_id=state.session_id,
+                        segment_id=state.segment_id,
+                        sequence=state.sequence,
+                        source_lang=state.source_lang,
+                        target_lang=state.target_lang,
+                        confidence=state.confidence,
+                    ))
+            if not closed:
+                # The unfinished tail goes back in front of whatever arrived
+                # while the splitter was running.
+                state.buffer = last + state.buffer
+
+    async def _timeout_sweeper(self) -> None:
+        interval = max(self._flush_timeout / 4, 0.05)
+        while not self._stop:
+            await asyncio.sleep(interval)
+            try:
+                now = asyncio.get_running_loop().time()
+                for state in list(self.state_by_key.values()):
+                    if not state.buffer.strip():
+                        continue
+                    if now - state.last_appended_at < self._flush_timeout:
+                        continue
+                    state.force_closed = True
+                    # Reset the clock so the state is not re-queued on every
+                    # sweep while it waits in state_queue.
+                    state.last_appended_at = now
+                    await self.state_queue.put(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f'separator: timeout sweeper error (ignored): {exc!r}')
+
+    async def close_session(self, session_id: str) -> None:
+        """Flush and drop every segment buffer of a stopped session.
+
+        Called from /internal/sessions/stop — without this, a stopped
+        session's buffered tail is lost and its state_by_key entries leak.
+        """
+        keys = [k for k in self.state_by_key if k[0] == session_id]
+        for key in keys:
+            state = self.state_by_key.pop(key)
+            if state.buffer.strip():
+                state.force_closed = True
+                await self.state_queue.put(state)

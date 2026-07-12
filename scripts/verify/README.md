@@ -1,0 +1,81 @@
+# 런타임 검증 하네스
+
+모바일 앱·OBS 없이 이 맥에서 서버 파이프라인을 검증한다. 합성 음성(PCM)을
+`/api/mic` WebSocket으로 실시간 속도로 송출하면서 `/ws` 번역 결과를 출력한다.
+검증 항목 전체 목록은 `docs/handover-2026-07-07.md` §5-3 참조.
+
+## 준비 (1회)
+
+```bash
+# 1. 스택 기동 (.env.dev에 실키 필요 — GOOGLE_APPLICATION_CREDENTIALS, DEEPL_API_KEY)
+docker compose -f docker-compose.dev.yml --env-file .env.dev up -d --build
+
+# 2. 테스트 음성 생성 (say + ffmpeg 필요: brew install ffmpeg)
+./scripts/verify/gen-audio.sh          # audio/short.pcm(~30s), audio/long.pcm(340s+ 필요)
+# long이 340초 미만으로 나오면: REPEATS=120 ./scripts/verify/gen-audio.sh
+```
+
+## 시나리오 실행 (Node ≥ 22)
+
+```bash
+cd scripts/verify
+
+node run-scenario.mjs basic       # 첫 발화 + 타임아웃 flush + JetStream 로그
+node run-scenario.mjs long        # 285s rotation 경계 (약 6분 소요)
+node run-scenario.mjs ghost       # WS만 끊기 → 10초 후 유령 세션 teardown
+node run-scenario.mjs stop-tail   # 발화 도중 stop → 잔여 문장 DB 기록
+```
+
+각 시나리오가 끝나면 **무엇을 확인해야 하는지** 요약에 출력된다.
+
+## 시나리오 ↔ 수정 PR 매핑
+
+| 시나리오 | 검증 대상 | 통과 기준 |
+|---|---|---|
+| basic | PR #4 첫 발화, PR #8 타임아웃 flush, PR #7 JetStream 설정 | 첫 문장 [RECV] 도착 / 미완성 꼬리가 종료 ~2초 후 도착 / python 로그에 stream·durable exists\|created |
+| long | PR #6 rotation 경계 | ~285초 전후 문장 뒤섞임·중복 없음 (단어 1~2개 절단은 알려진 한계) |
+| ghost | PR #10 유령 세션 | `docker logs node --since 2m \| grep 'tearing down ghost session'` + 세션 ended |
+| stop-tail | PR #8 close_session | `curl -s localhost:8080/api/monitor/sessions`에서 해당 세션 잔여 문장 확인 |
+| (수동) 장애 생존 | PR #5·#9 | DEEPL_API_KEY를 틀린 값으로 재기동 → 실패 로그 반복되되 프로세스 생존 / NATS 컨테이너 stop → node 크래시 없이 `publish ... failed` 로그 |
+| (수동) 중복 차단 | PR #7 | basic 도중 `docker restart nats` → python 로그 `duplicate dropped`, 결과 문장 중복 없음 |
+
+## RTMP 경로 (OBS 대체)
+
+```bash
+# 아무 mp4나 rtmp로 push (검증 때만, 상시 불필요)
+curl -s -X POST localhost:3000/api/sessions/start -H 'Content-Type: application/json' -d '{}'
+ffmpeg -re -i sample.mp4 -c:a aac -f flv rtmp://localhost:1935/live/translation
+```
+
+## 자주 쓰는 로그
+
+```bash
+docker logs -f node          # ghost teardown, publish 실패, rotation
+docker logs -f python        # consumer/dedup/separator, JetStream 선언
+docker logs nats --since 5m  # 인증 실패(자격증명 회전 후 확인)
+```
+
+## 주의
+
+- `.env.dev`의 NATS 비밀번호는 2026-07-08 회전됨 — nats.conf가 `$NATS_*` env를
+  읽으므로 dev compose의 nats 서비스에 `env_file: [.env.dev]`가 있어야 한다
+  (docker-compose.dev.yml은 gitignore된 로컬 파일 — 다른 머신에서는 직접 추가).
+- **NATS 비밀번호는 반드시 영문자로 시작해야 한다** (2026-07-12 재회전됨).
+  NATS는 conf의 unquoted `$VAR` 치환값을 config 토큰으로 파싱하므로 숫자로
+  시작하는 값(예: `624e35…`)은 숫자 리터럴로 오인되어 서버가 기동하지 못한다
+  (`variable reference … could not be parsed` 재시작 루프). `.env.prod`를 서버에
+  반영할 때도 동일한 제약이 적용된다.
+- dev compose에는 `postgres` 서비스가 필요하다 (python이 기동 시 DB 풀을 만든다).
+  볼륨 `pg-data`(초기화 당시 DB명 `neemba_monitor`) 재사용, `.env.dev`는
+  `POSTGRES_HOST=postgres`, `POSTGRES_DATABASE=neemba_monitor`여야 한다.
+  볼륨의 실제 계정 비밀번호와 env가 어긋나면 컨테이너 안에서
+  `ALTER USER neemba PASSWORD '<env 값>'`으로 맞춘다.
+- `/ws` keepalive: 서버가 `{"type":"ping"}`을 보내면 클라이언트는 60초 안에
+  `{"type":"pong"}`을 보내야 한다. 안 보내면 서버가 소켓을 닫고 재접속 대기
+  버퍼링으로 전환한다(라이브 수신만 끊기고 DB 기록은 계속됨) —
+  run-scenario.mjs는 자동으로 pong을 응답한다.
+- python/node 컨테이너를 재생성(recreate)했으면 **nginx도 재시작**해야 한다 —
+  dev nginx는 upstream IP를 기동 시 한 번만 해석하므로 stale IP로 /ws 프록시가
+  조용히 실패한다 (증상: 서버는 정상 처리하는데 result WS 수신 0건,
+  python 로그에 `drop stale broadcast ... current= None`).
+- Google STT는 스트리밍 과금이 발생한다. long 시나리오(6분)는 필요할 때만.

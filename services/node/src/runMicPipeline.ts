@@ -3,6 +3,11 @@ import { createStreamOrchestrator } from "./createStreamOrchestrator.js";
 import type { AudioConsumerPort } from "./ports/audioConsumerPort.js";
 import type { MicRuntime } from "./sessionRuntimeStore.js";
 
+type StreamLanguages = {
+  sourceLanguage?: string;
+  targetLanguage?: string;
+};
+
 type RunMicPipelineDependencies = {
   consumer: AudioConsumerPort;
   sessionId?: string;
@@ -33,8 +38,11 @@ export async function runMicPipeline({
   };
 }
 
-export async function runDefaultMicPipeline(sessionId?: string): Promise<MicRuntime> {
-  const orchestrator = await createStreamOrchestrator();
+export async function runDefaultMicPipeline(
+  sessionId?: string,
+  languages: StreamLanguages = {}
+): Promise<MicRuntime> {
+  const orchestrator = await createStreamOrchestrator(languages);
   return runMicPipeline(
     sessionId == null
       ? { consumer: orchestrator }

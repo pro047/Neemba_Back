@@ -7,6 +7,7 @@ import type {
 export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   private text: string | null = "";
   private prevText: string | null = "";
+  private currentSegmentId: number | null = null;
   private sequence = 0;
   private silenceTimer?: NodeJS.Timeout;
   private trailingTimer: NodeJS.Timeout | null = null;
@@ -19,7 +20,16 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
   private lastInputAt: number = 0;
   private queue: string[] = [];
 
-  constructor(private readonly publisher: TranscriptPublisherPort) {}
+  constructor(
+    private readonly publisher: TranscriptPublisherPort,
+    private readonly languages: {
+      sourceLanguage: string;
+      targetLanguage: string;
+    } = {
+      sourceLanguage: "ko-KR",
+      targetLanguage: "en-US",
+    }
+  ) {}
 
   async onSttResult(result: {
     transcript: string;
@@ -28,22 +38,46 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
     segmentId: number;
     sessionId: string;
   }) {
-    this.prevText = this.text;
-    this.text = this.normalize(result.transcript);
-    if (!this.prevText || !this.text) return;
+    // Empty transcripts must not touch delta state: overwriting `text` with ""
+    // would make the next result look like a session start and re-publish it
+    // in full (duplication). Bail before mutating.
+    const next = this.normalize(result.transcript);
+    if (!next) return;
 
     const segmentId = result.segmentId;
     const sessionId = result.sessionId;
+
+    // Segment boundary (stream rotation): texts from different streams must
+    // never be diffed against each other. Ship whatever is still queued
+    // under the old segment, then restart delta tracking from scratch.
+    if (this.currentSegmentId !== null && segmentId !== this.currentSegmentId) {
+      if (this.queue.length > 0) {
+        await this.publishSpan(this.currentSegmentId, sessionId, true);
+      }
+      this.prevText = "";
+      this.text = "";
+    }
+    this.currentSegmentId = segmentId;
+
+    this.prevText = this.text;
+    this.text = next;
 
     const slice = this.computeDelta(this.prevText, this.text);
 
     if (slice === "") return;
 
-    console.log("interim - slice :", slice);
-    console.log("--------------------------");
-
     this.queue.push(slice);
     this.lastInputAt = Date.now();
+
+    if (result.isFinal) {
+      // A final closes the utterance: Google restarts the next interim from
+      // "", so ship the tail now and reset the diff baseline.
+      if (this.trailingTimer) clearTimeout(this.trailingTimer);
+      await this.publishSpan(segmentId, sessionId, true);
+      this.prevText = "";
+      this.text = "";
+      return;
+    }
 
     if (this.lastInputAt - this.lastSentAt >= this.throttleMs) {
       await this.publishSpan(segmentId, sessionId);
@@ -99,10 +133,22 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
     }
   }
 
-  private async publishSpan(segmentId: number, sessionId: string) {
-    await this.ensurePublisher();
+  private async publishSpan(segmentId: number, sessionId: string, force = false) {
+    // publishSpan is reached from fire-and-forget callers (STT callback,
+    // trailing timer): any rejection escaping here becomes an unhandled
+    // rejection and kills the whole Node process — every live session.
+    try {
+      await this.ensurePublisher();
+    } catch (err) {
+      // Connection failed: keep the queue intact so the next span retries.
+      console.error("interim publish: publisher start failed", err);
+      return;
+    }
 
-    if (Date.now() - this.lastSentAt < 5) return;
+    // Boundary/final flushes must never be dropped by the rapid-publish
+    // guard: a skipped flush would leave old-segment slices in the queue and
+    // merge them into the next segment's publish.
+    if (!force && Date.now() - this.lastSentAt < 5) return;
 
     const merged = this.queue.join("");
     this.queue = [];
@@ -112,14 +158,18 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
       sessionId: sessionId,
       segmentId: segmentId,
       sequence: ++this.sequence,
-      sourceLanguage: "ko-KR",
-      targetLanguage: "en-US",
+      sourceLanguage: this.languages.sourceLanguage,
+      targetLanguage: this.languages.targetLanguage,
       sampleRateHz: 16000,
       transcriptText: merged,
       createdAt: new Date().toISOString(),
     };
 
-    await this.publisher.publish(chunk);
+    try {
+      await this.publisher.publish(chunk);
+    } catch (err) {
+      console.error("interim publish failed, span dropped", err);
+    }
   }
 
   async dispose() {

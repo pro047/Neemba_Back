@@ -18,6 +18,8 @@ dependencies = [
   "httpx",
   "deepl",
   "asyncpg",
+  "alembic",
+  "psycopg[binary]",
   "gunicorn",
   "mecab-python3"
 ]
@@ -29,6 +31,10 @@ dev = [
   "mypy",
   "ruff",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 150
@@ -66,6 +72,18 @@ ignore = []
 [tool.ruff.lint.isort]
 known-first-party = ["src"]  # 프로젝트 루트 패키지명으로 바꿔
 combine-as-imports = true
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI 의존성 주입 관례(B008): 함수 기본값에서 Depends()/Query() 등을 호출하는 것은
+# 의도된 패턴이므로 불변 호출로 취급(거짓 양성 B008 방지).
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.Query",
+  "fastapi.Path",
+  "fastapi.Body",
+  "fastapi.Header",
+  "fastapi.Cookie",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # 패키지 노출 목적으로 남겨둔 unused import 허용

@@ -27,7 +27,11 @@ export class JetStreamTranscriptPublisher implements TranscriptPublisherPort {
   async start() {
     console.log("publisher start");
 
-    const raw = (this.natsUrl ?? "nats://neemba:nats1234@nats:4222")
+    if (!this.natsUrl) {
+      // Fail fast: the old fallback embedded leaked credentials.
+      throw new Error("NATS_URL is not configured");
+    }
+    const raw = this.natsUrl
       .replace(/^\[|\]$/g, "")
       .replace("@localhost:", "@nats:");
 

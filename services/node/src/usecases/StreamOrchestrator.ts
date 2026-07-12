@@ -28,6 +28,11 @@ export class StreamOrchestrator implements AudioConsumerPort {
   private stopFlag = false;
   private restartTimer: NodeJS.Timeout | undefined;
   private rotationInFlight: Promise<void> | null = null;
+  // Consecutive STT errors with no transcript in between. A disconnected
+  // client stops sending audio → Google times out and errors ~every 5s;
+  // rotating on each would recreate (and bill) streams forever. Reset to 0
+  // whenever a transcript arrives (proof the client is still streaming).
+  private consecutiveErrorRotations = 0;
 
   constructor(
     private readonly sttPort: SpeechToTextPort,
@@ -35,7 +40,8 @@ export class StreamOrchestrator implements AudioConsumerPort {
     private readonly interimOrchestra: IInterfaceOrchestra,
     private readonly segmentManager: ISegmentManager,
     private readonly restartIntervalMs = 285_000,
-    private readonly restartRetryIntervalMs = 5_000
+    private readonly restartRetryIntervalMs = 5_000,
+    private readonly maxConsecutiveErrorRotations = 3
   ) {}
 
   async start(
@@ -61,18 +67,27 @@ export class StreamOrchestrator implements AudioConsumerPort {
       ) => {
         if (!text.trim()) return;
 
-        this.interimOrchestra.onSttResult({
-          transcript: text,
-          isFinal: isFinal,
-          resultEndTimeMs: endTimeMilliseconds,
-          confidence,
-          segmentId,
-          sessionId,
-        });
+        // Fire-and-forget: without the catch, a rejection here is unhandled
+        // and crashes the process (defense in depth — publishSpan also
+        // contains its own failures).
+        this.interimOrchestra
+          .onSttResult({
+            transcript: text,
+            isFinal: isFinal,
+            resultEndTimeMs: endTimeMilliseconds,
+            confidence,
+            segmentId,
+            sessionId,
+          })
+          .catch((err) => console.error("interim onSttResult error", err));
       }
     );
 
-    const firstHandle = this._createSttHandle(session, sessionId);
+    const firstHandle = this._createSttHandle(
+      session,
+      sessionId,
+      sessionSegmentId
+    );
 
     await this.switcher.handoff(firstHandle, sessionSegmentId);
     this._scheduleNextRestart(sessionId, session);
@@ -97,13 +112,19 @@ export class StreamOrchestrator implements AudioConsumerPort {
 
   private _createSttHandle(
     session: ReturnType<typeof createSentenceSession>,
-    sessionId: string
+    sessionId: string,
+    segmentId: number
   ): StreamHandle {
     const stt = this.sttPort.startStreaming({
       languageCodes: ["ko-KR"],
       model: "latest_long",
       onTranscript: (p) => {
-        const segmentId = this.switcher.currentSegmentId();
+        // A transcript proves audio is flowing → the client is alive.
+        this.consecutiveErrorRotations = 0;
+        // Attribute results to the stream that produced them: after a
+        // rotation the old stream still flushes its last results, and those
+        // must keep the OLD segmentId instead of adopting the switcher's
+        // current one.
         session.handleInterim({
           ...p,
           segmentId: segmentId,
@@ -112,6 +133,17 @@ export class StreamOrchestrator implements AudioConsumerPort {
       },
       onError: (e) => {
         console.log("Stt error :", e);
+        this.consecutiveErrorRotations += 1;
+        if (this.consecutiveErrorRotations > this.maxConsecutiveErrorRotations) {
+          // Client is gone: stop recreating streams so we stop billing. The
+          // session record is cleaned up by /mic/stop or ghost teardown.
+          console.warn(
+            `Stt giving up: ${this.consecutiveErrorRotations} consecutive errors with no audio — stopping rotation (session ${sessionId})`
+          );
+          this.stopFlag = true;
+          this._clearRestartTimer();
+          return;
+        }
         this._rotateStream(sessionId, session, "error").catch(
           () => undefined
         );
@@ -157,7 +189,11 @@ export class StreamOrchestrator implements AudioConsumerPort {
       this._clearRestartTimer();
       try {
         const nextSegmentId = this.segmentManager.next(sessionId);
-        const nextHandle = this._createSttHandle(session, sessionId);
+        const nextHandle = this._createSttHandle(
+          session,
+          sessionId,
+          nextSegmentId
+        );
         await this.switcher.handoff(nextHandle, nextSegmentId);
         this._scheduleNextRestart(sessionId, session);
       } catch (err) {

@@ -58,9 +58,10 @@ export class GoogleSttV2Adapter implements SpeechToTextPort {
           continue;
         }
 
-        // Interim 결과는 stability가 충분할 때만 처리
+        // Interim 결과는 stability가 충분할 때만 처리.
+        // `return`이 아니라 `continue`여야 같은 응답 배열 뒤쪽의 final이 살아남는다.
         if (result.stability < 0.85 && result.stability > 0) {
-          return;
+          continue;
         }
 
         const transcript = alternative.transcript ?? "";

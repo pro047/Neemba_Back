@@ -1,4 +1,6 @@
 import os
+from urllib.parse import quote_plus
+
 from dotenv import load_dotenv, find_dotenv
 
 
@@ -9,7 +11,10 @@ def load_env_optional() -> None:
         return
     loaded = load_dotenv(env_path, override=False)
     if not loaded:
-        raise RuntimeError(f'failed to load .env: {env_path}')
+        # An empty .env (zero bindings) is not an error: the process env may
+        # already carry everything. Raising here bricks startup and imports.
+        print(f'.env has no bindings, using process env: {env_path}')
+        return
     print(f'env loaded: {env_path}')
 
 
@@ -37,7 +42,9 @@ load_env_optional()
 
 def get_nats_config() -> dict[str, str]:
     return {
-        "nats_url": require_env("NATS_URL"),
+        # The URL embeds credentials (nats://user:pass@host) — mask it here;
+        # the consumer logs a credential-stripped URL on connect instead.
+        "nats_url": require_env("NATS_URL", mask=True),
         "nats_subject": require_env("NATS_SUBJECT"),
         "nats_stream_name": require_env("NATS_STREAM_NAME"),
         "nats_consumer_name": require_env("NATS_CONSUMER_NAME")
@@ -53,7 +60,7 @@ def get_ws_url() -> dict[str, str]:
 
 def get_deepl_config() -> dict[str, str]:
     return {
-        "deepl_api_key": require_env("DEEPL_API_KEY")
+        "deepl_api_key": require_env("DEEPL_API_KEY", mask=True)
     }
 
 
@@ -62,6 +69,24 @@ def get_postgres_config() -> dict[str, str]:
         "postgres_host": require_env("POSTGRES_HOST"),
         "postgres_port": require_env("POSTGRES_PORT"),
         "postgres_user": require_env("POSTGRES_USER"),
-        "postgres_password": require_env("POSTGRES_PASSWORD"),
+        "postgres_password": require_env("POSTGRES_PASSWORD", mask=True),
         "postgres_database": require_env("POSTGRES_DATABASE"),
     }
+
+
+def get_postgres_sync_url() -> str:
+    """Assemble a sync SQLAlchemy URL for Alembic from the POSTGRES_* env vars.
+
+    Runtime queries use asyncpg (see ``src/database/pool.py``); only Alembic
+    migrations use the sync psycopg (psycopg3) driver. We assemble the URL
+    from the existing ``POSTGRES_*`` secrets rather than introducing a new
+    ``DATABASE_URL`` env var, to keep the secret surface minimal. Credentials
+    are percent-encoded so special characters in the password are URL-safe.
+    """
+    cfg = get_postgres_config()
+    user = quote_plus(cfg["postgres_user"])
+    password = quote_plus(cfg["postgres_password"])
+    host = cfg["postgres_host"]
+    port = cfg["postgres_port"]
+    database = cfg["postgres_database"]
+    return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{database}"
