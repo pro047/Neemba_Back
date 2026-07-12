@@ -10,6 +10,10 @@ import { createMicSessionStopper } from "./router/mic.js";
 // its 285s rotation timer) running — and billing — forever. After this grace
 // window the session is torn down; a reconnect within it cancels teardown.
 const DEFAULT_TEARDOWN_GRACE_MS = 10_000;
+// A force-killed / network-dropped client leaves a half-open socket that never
+// emits "close", so teardown would never fire. Ping this often; if a full
+// interval passes with no pong the socket is declared dead and terminated.
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const defaultPendingTeardowns = new Map<string, NodeJS.Timeout>();
 
 type AttachMicSocketDependencies = {
@@ -17,6 +21,7 @@ type AttachMicSocketDependencies = {
   stopSession?: (sessionId: string) => Promise<void>;
   teardownGraceMs?: number;
   pendingTeardowns?: Map<string, NodeJS.Timeout>;
+  heartbeatIntervalMs?: number;
 };
 
 function toBuffer(message: RawData): Buffer {
@@ -53,6 +58,7 @@ export function attachMicSocketHandlers(
     stopSession,
     teardownGraceMs = DEFAULT_TEARDOWN_GRACE_MS,
     pendingTeardowns = defaultPendingTeardowns,
+    heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
   }: AttachMicSocketDependencies = {}
 ): void {
   const attachedSessionId = resolveSessionId(requestUrl);
@@ -69,7 +75,25 @@ export function attachMicSocketHandlers(
     }
   }
 
+  // Protocol-level heartbeat. The client's WS stack auto-replies pong (no app
+  // code needed); if a full interval elapses with no pong we terminate() to
+  // force a "close" event, which drives the ghost-teardown path below.
+  let isAlive = true;
+  socket.on("pong", () => {
+    isAlive = true;
+  });
+  const heartbeat = setInterval(() => {
+    if (!isAlive) {
+      socket.terminate();
+      return;
+    }
+    isAlive = false;
+    socket.ping();
+  }, heartbeatIntervalMs);
+  heartbeat.unref?.();
+
   socket.on("close", () => {
+    clearInterval(heartbeat);
     if (!attachedSessionId) return;
     if (!runtimeStore.get(attachedSessionId)) return;
     if (pendingTeardowns.has(attachedSessionId)) return;
