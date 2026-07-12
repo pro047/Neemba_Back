@@ -60,4 +60,18 @@ docker logs nats --since 5m  # 인증 실패(자격증명 회전 후 확인)
 - `.env.dev`의 NATS 비밀번호는 2026-07-08 회전됨 — nats.conf가 `$NATS_*` env를
   읽으므로 dev compose의 nats 서비스에 `env_file: [.env.dev]`가 있어야 한다
   (docker-compose.dev.yml은 gitignore된 로컬 파일 — 다른 머신에서는 직접 추가).
+- **NATS 비밀번호는 반드시 영문자로 시작해야 한다** (2026-07-12 재회전됨).
+  NATS는 conf의 unquoted `$VAR` 치환값을 config 토큰으로 파싱하므로 숫자로
+  시작하는 값(예: `624e35…`)은 숫자 리터럴로 오인되어 서버가 기동하지 못한다
+  (`variable reference … could not be parsed` 재시작 루프). `.env.prod`를 서버에
+  반영할 때도 동일한 제약이 적용된다.
+- dev compose에는 `postgres` 서비스가 필요하다 (python이 기동 시 DB 풀을 만든다).
+  볼륨 `pg-data`(초기화 당시 DB명 `neemba_monitor`) 재사용, `.env.dev`는
+  `POSTGRES_HOST=postgres`, `POSTGRES_DATABASE=neemba_monitor`여야 한다.
+  볼륨의 실제 계정 비밀번호와 env가 어긋나면 컨테이너 안에서
+  `ALTER USER neemba PASSWORD '<env 값>'`으로 맞춘다.
+- `/ws` keepalive: 서버가 `{"type":"ping"}`을 보내면 클라이언트는 60초 안에
+  `{"type":"pong"}`을 보내야 한다. 안 보내면 서버가 소켓을 닫고 재접속 대기
+  버퍼링으로 전환한다(라이브 수신만 끊기고 DB 기록은 계속됨) —
+  run-scenario.mjs는 자동으로 pong을 응답한다.
 - Google STT는 스트리밍 과금이 발생한다. long 시나리오(6분)는 필요할 때만.
