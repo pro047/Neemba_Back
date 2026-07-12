@@ -110,9 +110,25 @@ const resultWs = new WebSocket(resultUrl);
 let received = 0;
 resultWs.addEventListener("open", () => console.log(`${ts()} result WS connected: ${resultUrl}`));
 resultWs.addEventListener("message", (e) => {
+  // The hub keepalive expects an application-level pong within 60s of the
+  // first ping, otherwise it closes the socket and buffers for reconnect —
+  // the real app replies automatically, so the harness must too.
+  try {
+    const msg = JSON.parse(e.data);
+    if (msg?.type === "ping") {
+      resultWs.send(JSON.stringify({ type: "pong" }));
+      console.log(`${ts()} [PING] replied pong`);
+      return;
+    }
+  } catch {
+    // not JSON — plain translation text, fall through
+  }
   received += 1;
   console.log(`${ts()} [RECV #${received}] ${e.data}`);
 });
+resultWs.addEventListener("close", (e) =>
+  console.error(`${ts()} result WS closed by server (code=${e.code}) — translations after this point are lost`)
+);
 resultWs.addEventListener("error", () => console.error(`${ts()} result WS error (check --ws-url)`));
 
 // 3) stream PCM at real-time pace
