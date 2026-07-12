@@ -9,21 +9,15 @@ env:
   REMOTE_PATH: /srv/neemba
 
 jobs:
-  build-and-deploy:
+  # Gate: deploy must never run against a red suite. Kept as a SEPARATE job so a
+  # test failure stops `build-and-deploy` from ever starting — the deploy job
+  # opens the EC2 security group to the runner IP, so it must not run on a path
+  # where tests failed. Mirrors ci.yml but ci.yml doesn't run on push:main.
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Get runner public IP
-        run: echo "RUNNER_IP=$(curl -fsSL https://api.ipify.org)" >> "$GITHUB_ENV"
 
       - name: Use Node.js 20
         uses: actions/setup-node@v4
@@ -31,6 +25,18 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: services/node/package-lock.json
+
+      - name: Node install
+        run: npm ci
+        working-directory: services/node
+
+      - name: Node test
+        run: npm test
+        working-directory: services/node
+
+      - name: Node type check
+        run: npx tsc --noEmit
+        working-directory: services/node
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,6 +53,27 @@ jobs:
           key: ${{ runner.os }}-uv-${{ hashFiles('services/python/uv.lock') }}
           restore-keys: |
             ${{ runner.os }}-uv-
+
+      - name: Python test
+        run: uv run --extra dev pytest tests/ -q
+        working-directory: services/python
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get runner public IP
+        run: echo "RUNNER_IP=$(curl -fsSL https://api.ipify.org)" >> "$GITHUB_ENV"
 
       - name: Create deployment archive
         run: |
