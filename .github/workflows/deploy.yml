@@ -106,7 +106,10 @@ jobs:
               exit 1
             fi
             cd $REMOTE_PATH
-            docker compose -f docker-compose.prod.yml up -d --build
+            # --force-recreate: containers must pick up changed env/conf/mounts
+            # even when the image is unchanged (2026-07-12 cert-expiry incident:
+            # stale mounts survived deploys because containers were reused).
+            docker compose -f docker-compose.prod.yml up -d --build --force-recreate --remove-orphans
             rm -f /tmp/release.tar.gz
 
       - name: Revoke SSH from runner
