@@ -19,6 +19,17 @@ DEFAULT_MAX_DELIVER = 5
 MAX_TRACKED_SESSIONS = 1000
 
 
+def strip_credentials(url: str) -> str:
+    """Return the URL without its user:password@ part, safe for logging.
+
+    rsplit so a password containing '@' cannot partially survive.
+    """
+    if "@" not in url:
+        return url
+    proto, rest = url.split("://", 1) if "://" in url else ("nats", url)
+    return f"{proto}://{rest.rsplit('@', 1)[1]}"
+
+
 class Separator(Protocol):
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
@@ -33,6 +44,8 @@ class TranscriptConsumer:
         self.consumer_name = consumer_name
         self.worker_concurrency = worker_concurrency
         self.worker_semaphore = asyncio.Semaphore(worker_concurrency)
+        # Never log self.nats_url directly — it may embed credentials.
+        self.safe_url = strip_credentials(nats_url)
         self.client = None
         self.subscription = None
         self.separator = separator
@@ -48,16 +61,11 @@ class TranscriptConsumer:
             print("NATS disconnect")
 
         async def on_reconnect():
-            print("NATS reconnected to", self.nats_url)
+            print("NATS reconnected to", self.safe_url)
 
         async def on_close():
             print('NATS connection closed')
 
-        safe_url = self.nats_url
-        if "@" in safe_url:
-            proto, rest = safe_url.split(
-                "://", 1) if "://" in safe_url else ("nats", safe_url)
-            safe_url = f"{proto}://{rest.split('@', 1)[1]}"
         try:
             self.client = await nats.connect(
                 self.nats_url,
@@ -67,9 +75,9 @@ class TranscriptConsumer:
                 closed_cb=on_close
             )
         except Exception as exc:
-            print("NATS connect failed to", safe_url, "error:", repr(exc))
+            print("NATS connect failed to", self.safe_url, "error:", repr(exc))
             raise
-        print('NATS connected to', safe_url)
+        print('NATS connected to', self.safe_url)
 
         jetstream = self.client.jetstream()
 
