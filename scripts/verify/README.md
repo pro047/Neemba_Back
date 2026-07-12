@@ -74,4 +74,8 @@ docker logs nats --since 5m  # 인증 실패(자격증명 회전 후 확인)
   `{"type":"pong"}`을 보내야 한다. 안 보내면 서버가 소켓을 닫고 재접속 대기
   버퍼링으로 전환한다(라이브 수신만 끊기고 DB 기록은 계속됨) —
   run-scenario.mjs는 자동으로 pong을 응답한다.
+- python/node 컨테이너를 재생성(recreate)했으면 **nginx도 재시작**해야 한다 —
+  dev nginx는 upstream IP를 기동 시 한 번만 해석하므로 stale IP로 /ws 프록시가
+  조용히 실패한다 (증상: 서버는 정상 처리하는데 result WS 수신 0건,
+  python 로그에 `drop stale broadcast ... current= None`).
 - Google STT는 스트리밍 과금이 발생한다. long 시나리오(6분)는 필요할 때만.
