@@ -42,3 +42,9 @@ __pycache__/
 
 # runtime-verify generated audio (regenerate with scripts/verify/gen-audio.sh)
 scripts/verify/audio/
+
+# terraform (state is remote in S3; lock file IS committed)
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log

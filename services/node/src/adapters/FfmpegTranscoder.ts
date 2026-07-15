@@ -4,14 +4,37 @@ import type { AudioTranscoder } from "../ports/ports.js";
 import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 
+// "No publisher yet" (OBS not live) is a legitimate indefinite state, so
+// restarts never give up — they back off exponentially to stop the 10s
+// restart churn, and reset to the base delay once real progress arrives.
+const DEFAULT_RESTART_BASE_DELAY_MS = 10_000;
+const DEFAULT_RESTART_MAX_DELAY_MS = 60_000;
+const DEFAULT_RTMP_PULL_URL = "rtmp://neemba.app:1935/live/translation";
+
+type RestartBackoffOptions = {
+  restartBaseDelayMs?: number;
+  restartMaxDelayMs?: number;
+};
+
 export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
   private healthCheckTimer: NodeJS.Timeout | null = null;
-  private restarting = false;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private consecutiveRestarts = 0;
+  private readonly restartBaseDelayMs: number;
+  private readonly restartMaxDelayMs: number;
   private killedChildren = new WeakSet<ChildProcessWithoutNullStreams>();
   private killTimers = new WeakMap<ChildProcessWithoutNullStreams, NodeJS.Timeout>();
 
-  constructor(private readonly spawnProcess: typeof spawn = spawn) {}
+  constructor(
+    private readonly spawnProcess: typeof spawn = spawn,
+    options: RestartBackoffOptions = {}
+  ) {
+    this.restartBaseDelayMs =
+      options.restartBaseDelayMs ?? DEFAULT_RESTART_BASE_DELAY_MS;
+    this.restartMaxDelayMs =
+      options.restartMaxDelayMs ?? DEFAULT_RESTART_MAX_DELAY_MS;
+  }
 
   private spawnFfmpeg() {
     const ffmpegArguments = [
@@ -25,7 +48,10 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "-fflags",
       "nobuffer",
       "-i",
-      "rtmp://neemba.app:1935/live/translation",
+      // Read at spawn time (not import time) so tests and container env
+      // both take effect. Prod sets the internal hostname (rtmp:1935) to
+      // avoid hairpinning through the public internet.
+      process.env.RTMP_PULL_URL ?? DEFAULT_RTMP_PULL_URL,
       "-vn",
       "-ac",
       "1",
@@ -81,6 +107,9 @@ export class FfmpegTranscoder implements AudioTranscoder {
         const str = d.toString();
         if (str.includes("out_time_ms")) {
           lastProcessAt = Date.now();
+          // Real progress: the publisher is live, so the next failure is a
+          // fresh incident — return to the base restart delay.
+          this.consecutiveRestarts = 0;
         } else {
           const now = Date.now();
           if (now - lastStderrLogAt > 1000) {
@@ -134,6 +163,10 @@ export class FfmpegTranscoder implements AudioTranscoder {
       stop: () => {
         stopped = true;
         this.disposeChild("stop");
+        if (this.restartTimer) {
+          clearTimeout(this.restartTimer);
+          this.restartTimer = null;
+        }
         if (this.healthCheckTimer) {
           clearInterval(this.healthCheckTimer);
           this.healthCheckTimer = null;
@@ -148,17 +181,22 @@ export class FfmpegTranscoder implements AudioTranscoder {
     attachTranscoder: () => void,
     reason: "stalled" | "exit"
   ): void {
-    if (this.restarting) return;
-    this.restarting = true;
-    queueMicrotask(() => {
-      try {
-        console.warn("ffmpeg restart requested:", reason);
-        this.disposeChild("restart");
-        attachTranscoder();
-      } finally {
-        this.restarting = false;
-      }
-    });
+    if (this.restartTimer) return;
+    // Exponential backoff, no give-up: waiting for a publisher is a normal
+    // state (operator opens the session before OBS goes live), but immediate
+    // respawns every 10s spam logs and churn CPU until the session closes.
+    const delay = Math.min(
+      this.restartBaseDelayMs * 2 ** this.consecutiveRestarts,
+      this.restartMaxDelayMs
+    );
+    this.consecutiveRestarts += 1;
+    console.warn(`ffmpeg restart requested: ${reason} (in ${delay}ms)`);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      this.disposeChild("restart");
+      attachTranscoder();
+    }, delay);
+    this.restartTimer.unref?.();
   }
 
   private disposeChild(reason: "restart" | "stop") {
