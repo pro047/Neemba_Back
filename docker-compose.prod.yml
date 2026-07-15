@@ -190,6 +190,33 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  pg-backup:
+    build:
+      context: ./infra/postgres
+      dockerfile: backup.Dockerfile
+    container_name: pg-backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env.prod
+    environment:
+      # Not secrets — safe to pin here. Credentials come from the EC2
+      # instance profile (neemba-ec2-role) via IMDS, not from env.
+      BACKUP_BUCKET: neemba-db-backups-989785488374
+      AWS_DEFAULT_REGION: ap-northeast-2
+    volumes:
+      - ./infra/postgres/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+    networks:
+      - appnet
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   postgres:
     image: postgres:16-alpine
     container_name: postgres
