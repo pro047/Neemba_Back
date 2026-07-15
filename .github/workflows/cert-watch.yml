@@ -1,0 +1,41 @@
+name: Cert watch
+
+# Daily TLS-expiry watchdog for neemba.app. The 2026-07-12 outage was a cert
+# that had been silently failing to renew for a month (certbot/nginx mount
+# split, docs/incidents/2026-07-12-cert-expiry.md) — this fails the workflow
+# when fewer than 14 days remain, and GitHub emails the repo owner on failure.
+# Checked from outside the server on purpose: a server-side cron dies with the
+# server, and "what the client sees" is the ground truth for TLS.
+# NOTE: scheduled workflows only run from the default branch (main), so this
+# takes effect after the next release PR.
+
+on:
+  schedule:
+    - cron: "0 21 * * *" # 06:00 KST daily
+  workflow_dispatch: # manual run for testing
+
+env:
+  DOMAIN: neemba.app
+  MIN_DAYS: 14
+
+jobs:
+  check-cert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check certificate days remaining
+        run: |
+          set -euo pipefail
+          expiry=$(echo \
+            | openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" 2>/dev/null \
+            | openssl x509 -noout -enddate \
+            | cut -d= -f2)
+          # An unreachable host or handshake failure leaves $expiry empty and
+          # fails here — that is alert-worthy too, so let it fail loudly.
+          expiry_epoch=$(date -d "$expiry" +%s)
+          now_epoch=$(date +%s)
+          days=$(( (expiry_epoch - now_epoch) / 86400 ))
+          echo "Certificate for $DOMAIN expires in $days days ($expiry)"
+          if [ "$days" -lt "$MIN_DAYS" ]; then
+            echo "::error::TLS certificate for $DOMAIN expires in $days days (< $MIN_DAYS). Renewal is likely failing silently — check certbot on the server (see docs/incidents/2026-07-12-cert-expiry.md)."
+            exit 1
+          fi
