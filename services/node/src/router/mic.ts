@@ -92,7 +92,10 @@ function createMicTtsSynthesizer(): MicTtsSynthesizer {
   const auth = new GoogleAuth({
     scopes: "https://www.googleapis.com/auth/cloud-platform",
   });
-  const clientPromise = auth.getClient();
+  // Lazily obtain the auth client on first synthesize. Calling getClient()
+  // eagerly here leaves a floating promise that becomes an unhandled rejection
+  // when credentials are absent (e.g. CI) and no synthesize follows.
+  let clientPromise: ReturnType<typeof auth.getClient> | undefined;
   const responseCache = new Map<string, TtsSynthesisResult>();
 
   return {
@@ -105,7 +108,7 @@ function createMicTtsSynthesizer(): MicTtsSynthesizer {
         return cached;
       }
 
-      const client = await clientPromise;
+      const client = await (clientPromise ??= auth.getClient());
 
       try {
         const response = await client.request<{
