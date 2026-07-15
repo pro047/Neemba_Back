@@ -11,6 +11,32 @@ const PY_HOST = pythonHost;
 let stopPipeline: (() => Promise<void>) | null = null;
 let currentSessionId: string | null = null;
 
+// nginx-rtmp on_publish hook: called before a publisher (OBS) is accepted.
+// The stream key rides in the stream-name args (`translation?key=SECRET`)
+// which nginx-rtmp forwards as urlencoded form fields; 2xx allows, non-2xx
+// denies. With RTMP_PUBLISH_KEY unset the hook allows everything (auth off)
+// so this code can ship before the church OBS / ENV_PROD are updated.
+router.post(
+  "/rtmp/on-publish",
+  express.urlencoded({ extended: false }),
+  (req, res) => {
+    const configuredKey = process.env.RTMP_PUBLISH_KEY;
+    if (!configuredKey) {
+      console.warn(
+        "rtmp on_publish: RTMP_PUBLISH_KEY not set — allowing publish (auth disabled)"
+      );
+      return res.status(200).end();
+    }
+    if (req.body?.key === configuredKey) {
+      return res.status(200).end();
+    }
+    console.warn(
+      `rtmp on_publish: denied publish from ${req.body?.addr ?? "unknown"}`
+    );
+    return res.status(403).end();
+  }
+);
+
 router.post("/sessions/start", async (req, res) => {
   const sessionId = uuidv4();
   const sourceLang = req.body?.sourceLang ?? "ko-KR";
