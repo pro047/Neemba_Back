@@ -1,0 +1,48 @@
+name: Health watch
+
+# External liveness probe for https://neemba.app/health — the GHA-cron sibling
+# of cert-watch.yml. Checked from outside the server on purpose: a server-side
+# monitor dies with the server it is watching. On failure GitHub emails the
+# repo owner and, when DISCORD_WEBHOOK_URL is set, a Discord alert fires
+# (skipped with a warning when the secret is missing, so the email remains the
+# floor). GHA cron is best-effort: real firing can lag 5-30 min at busy times
+# and schedules pause after 60 days without repo activity — good for
+# "know within ~30 min", not for live-service paging.
+# NOTE: scheduled workflows only run from the default branch (main), so this
+# takes effect after the next release PR.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # manual run for testing
+
+env:
+  HEALTH_URL: https://neemba.app/health
+
+jobs:
+  check-health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe /health
+        run: |
+          set -euo pipefail
+          # -f: a non-2xx response exits non-zero — without it curl exits 0 on
+          # an HTTP 500 and the watch stays green forever. Retries absorb
+          # one-off network blips so a single flaky hop does not page Discord.
+          curl -fsS -m 10 --retry 3 --retry-delay 5 --retry-all-errors "$HEALTH_URL"
+          echo "healthy: $HEALTH_URL"
+
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL secret is not set — Discord alert skipped (GitHub failure email still goes out)"
+            exit 0
+          fi
+          jq -n --arg content "🚨 neemba /health down — $HEALTH_URL failed. Run: $RUN_URL" \
+            '{content: $content}' \
+            | curl -fsS -m 10 -H "Content-Type: application/json" -d @- "$WEBHOOK_URL"
