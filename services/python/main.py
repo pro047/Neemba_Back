@@ -460,8 +460,11 @@ async def websocket_endpoint(ws: WebSocket):
             # 실제 데이터 메시지는 여기서 처리됨
 
     except WebSocketDisconnect:
+        # §4-3(원인 1): hub 에 즉시 통지해 죽은 소켓을 슬롯에서 비운다.
+        # 그래야 이후 번역이 send 시도 대신 pending 으로 큐잉돼 유실되지 않는다.
+        # detach 는 pending 을 비우므로 여기서 쓰면 안 된다 — 재접속 flush 로 방류.
         print('main : websocket disconnected')
-        pass
+        await hub.handle_client_disconnect(session_id, ws)
     except Exception as e:
         print(f'main : websocket error: {e}')
         await hub.detach(session_id)

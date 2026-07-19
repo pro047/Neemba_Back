@@ -9,7 +9,10 @@ type PipelineLanguages = {
 
 export async function runPipelines(
   languages: PipelineLanguages = {}
-): Promise<{ stop: () => Promise<void> }> {
+): Promise<{
+  stop: () => Promise<void>;
+  notifyPublisherReturned: () => void;
+}> {
   const ffmpeg = new FfmpegTranscoder();
   const orchestrator = await createStreamOrchestrator(languages);
 
@@ -20,5 +23,10 @@ export async function runPipelines(
 
   console.log("translate Starting");
 
-  return { stop: serviceStop };
+  return {
+    stop: serviceStop,
+    // §4-4: on_publish 훅이 "publisher 복귀" 신호를 주면 ffmpeg 의 백오프
+    // 대기를 건너뛰고 즉시 재접속한다 (재송출 후 최대 60s 공백 제거).
+    notifyPublisherReturned: () => ffmpeg.restartNow(),
+  };
 }
