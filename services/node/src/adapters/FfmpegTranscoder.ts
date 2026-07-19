@@ -20,6 +20,8 @@ export class FfmpegTranscoder implements AudioTranscoder {
   private childProcess?: ChildProcessWithoutNullStreams | undefined;
   private healthCheckTimer: NodeJS.Timeout | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
+  // The pending restart's action, kept so restartNow() can fire it early.
+  private restartAction: (() => void) | null = null;
   private consecutiveRestarts = 0;
   private readonly restartBaseDelayMs: number;
   private readonly restartMaxDelayMs: number;
@@ -41,8 +43,12 @@ export class FfmpegTranscoder implements AudioTranscoder {
       "-hide_banner",
       "-loglevel",
       "info",
+      // §4-2: 0 is NOT "skip analysis" — it means "format default", and for
+      // live FLV the probe then effectively runs until -probesize fills,
+      // which at low audio bitrates delays first output by seconds. 0.5s
+      // bounds the probe explicitly regardless of input bitrate.
       "-analyzeduration",
-      "0",
+      "500000",
       "-probesize",
       "32k",
       "-fflags",
@@ -166,6 +172,7 @@ export class FfmpegTranscoder implements AudioTranscoder {
         if (this.restartTimer) {
           clearTimeout(this.restartTimer);
           this.restartTimer = null;
+          this.restartAction = null;
         }
         if (this.healthCheckTimer) {
           clearInterval(this.healthCheckTimer);
@@ -191,12 +198,30 @@ export class FfmpegTranscoder implements AudioTranscoder {
     );
     this.consecutiveRestarts += 1;
     console.warn(`ffmpeg restart requested: ${reason} (in ${delay}ms)`);
-    this.restartTimer = setTimeout(() => {
+    const fire = () => {
       this.restartTimer = null;
+      this.restartAction = null;
       this.disposeChild("restart");
       attachTranscoder();
-    }, delay);
+    };
+    this.restartAction = fire;
+    this.restartTimer = setTimeout(fire, delay);
     this.restartTimer.unref?.();
+  }
+
+  /** §4-4: nginx-rtmp on_publish 신호로 대기 중인 재시작을 즉시 실행한다.
+   *
+   * 백오프 폴링은 "publisher 가 언제 돌아올지 모른다"는 전제인데 on_publish
+   * 는 그 도착 신호 그 자체 — 최대 60s 를 기다릴 이유가 없다. 재시작이
+   * 예약돼 있지 않으면(정상 동작 중이거나 stop 이후) no-op.
+   */
+  restartNow(): void {
+    if (!this.restartTimer || !this.restartAction) return;
+    clearTimeout(this.restartTimer);
+    // New publisher = fresh incident: next failure backs off from the base.
+    this.consecutiveRestarts = 0;
+    console.log("ffmpeg restart: publisher returned (on_publish), restarting now");
+    this.restartAction();
   }
 
   private disposeChild(reason: "restart" | "stop") {

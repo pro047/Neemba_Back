@@ -36,6 +36,62 @@ function setup(options?: {
   return { children, spawnMock, transcoder };
 }
 
+describe("FfmpegTranscoder — on_publish 즉시 재시작 (§4-4)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("대기 중인 백오프 재시작은 restartNow로 즉시 실행되어야 한다", async () => {
+    // Arrange: child 사망 → 백오프 100ms 재시작 예약 상태
+    const { children, spawnMock, transcoder } = setup();
+    transcoder.startTranscoder();
+    children[0]!.emit("close", 1, null);
+
+    // Act: 타이머를 진행하지 않고 on_publish 신호만 준다
+    transcoder.restartNow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Assert: 백오프(100ms)를 기다리지 않고 즉시 새 ffmpeg spawn
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("정지(stop) 후에는 restartNow가 무시되어야 한다", async () => {
+    // Arrange: 재시작이 예약된 채로 세션이 정상 종료됨
+    const { children, spawnMock, transcoder } = setup();
+    const { stop } = transcoder.startTranscoder();
+    children[0]!.emit("close", 1, null);
+    stop();
+
+    // Act: 늦게 도착한 on_publish 신호
+    transcoder.restartNow();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // Assert: 새 spawn 없음
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("FfmpegTranscoder — ffmpeg 인자 (§4-2)", () => {
+  it("analyzeduration은 0이 아닌 명시적 상한이어야 한다", () => {
+    // Arrange & Act: ffmpeg 인자는 spawn 시점에 확정된다
+    const { spawnMock, transcoder } = setup();
+    transcoder.startTranscoder();
+
+    // Assert: 0은 "분석 생략"이 아니라 "포맷 기본값(FLV 라이브는 사실상
+    // probesize 종료 조건)"이라, 저비트레이트 음성에서 32KB가 찰 때까지
+    // 첫 출력이 지연된다(로컬 nginx-rtmp 실측 ~2s, 비트레이트에 비례).
+    // 0.5s(500000us)로 못박아 프로브를 즉시 끝낸다.
+    const args = spawnMock.mock.calls[0]?.[1] as unknown as string[];
+    const value = args[args.indexOf("-analyzeduration") + 1];
+    expect(value).toBe("500000");
+  });
+});
+
 describe("FfmpegTranscoder — 재시작 지수 백오프", () => {
   beforeEach(() => {
     vi.useFakeTimers();
