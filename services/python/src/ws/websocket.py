@@ -22,6 +22,17 @@ class WebSocketHub:
         self._pending: Deque[str] = deque()
         self._max_pending = 100
 
+    @staticmethod
+    def _is_connected(ws: WebSocket) -> bool:
+        # §4-3(원인 2): 클라 주도 끊김 시 starlette 는 client_state 만
+        # DISCONNECTED 로 바꾸고 application_state 는 CONNECTED 로 남긴다.
+        # application_state 만 보면 죽은 소켓에 send 를 반복 시도하게 되므로
+        # 연결 검사는 반드시 두 상태를 함께 본다.
+        return (
+            ws.client_state == WebSocketState.CONNECTED
+            and ws.application_state == WebSocketState.CONNECTED
+        )
+
     async def attach(self, ws: WebSocket, session_id: str) -> None:
         async with self._lock:
             if self.client and self.client is not ws:
@@ -87,30 +98,52 @@ class WebSocketHub:
             # 둘로 쪼개면 두 락 사이에 새 세션 attach(_pending.clear + _session_id 교체)가
             # 끼어들어, 이전 세션 텍스트가 pending 에 들어가 새 클라로 새는 교차전송(에러B)
             # 창이 남는다. 한 락으로 묶으면 attach 와 직렬화되어 그 창이 닫힌다.
-            if ws is None or ws.application_state != WebSocketState.CONNECTED:
+            if ws is None or not self._is_connected(ws):
                 if len(self._pending) >= self._max_pending:
                     self._pending.popleft()
                 self._pending.append(text)
-                state = ws.application_state if ws is not None else None
+                state = (ws.client_state, ws.application_state) if ws is not None else None
                 print("hub: queued send, ws not connected", state, f"pending={len(self._pending)}")
                 return
 
-        asyncio.create_task(self._send_text(ws, text))
+        asyncio.create_task(self._send_text(ws, text, session_id))
 
-    async def _send_text(self, ws: WebSocket, text: str) -> None:
+    async def _requeue(self, session_id: str, text: str) -> None:
+        # §4-3(원인 3): 전송하지 못한 문장은 버리지 않고 pending 앞쪽에 되돌려
+        # 재접속 _flush_pending 이 방류하게 한다. 슬롯 주인이 바뀌었거나
+        # 세션이 이미 끝났으면(detach 로 None) stale → drop.
+        async with self._lock:
+            if session_id is None or session_id != self._session_id:
+                return
+            if len(self._pending) >= self._max_pending:
+                self._pending.popleft()
+            self._pending.appendleft(text)
+            print('hub: re-queued unsent text', f"pending={len(self._pending)}")
+
+    async def _send_text(self, ws: WebSocket, text: str, session_id: str) -> None:
         try:
+            requeue = False
             async with self._send_gate:
                 # 에러A 수정: 게이트 획득 후 send 직전에 상태 재확인 (TOCTOU 해소).
-                # 게이트 대기 중 detach/close 가 일어났을 수 있으므로 닫혔으면 조용히 포기.
-                if ws.application_state != WebSocketState.CONNECTED:
-                    return
-                await ws.send_text(text)
+                # 게이트 대기 중 detach/close 가 일어났을 수 있으므로 닫혔으면
+                # §4-3 에 따라 버리지 않고 재적재.
+                # 락 순서 불변식('_lock→_send_gate'만 허용) 때문에 _requeue(_lock)는
+                # 반드시 게이트 블록 밖에서 호출한다 — 안에서 부르면 ABBA 데드락.
+                if not self._is_connected(ws):
+                    requeue = True
+                else:
+                    await ws.send_text(text)
+            if requeue:
+                await self._requeue(session_id, text)
+                return
             print('hub: broadcast:', text)
 
         except Exception as e:
             print('hub: send failed:', e)
+            # §4-3(원인 3): 실패 문장 재적재 (게이트는 이미 빠져나온 상태)
+            await self._requeue(session_id, text)
             # 연결이 끊어진 경우에만 클라이언트 초기화
-            if ws.application_state != WebSocketState.CONNECTED:
+            if not self._is_connected(ws):
                 await self._safe_close(ws)
                 async with self._lock:
                     # REV-2: send 실패와 락 획득 사이에 새 클라가 attach 됐을 수 있으므로
@@ -140,27 +173,54 @@ class WebSocketHub:
         async with self._lock:
             if not self._pending:
                 return
+            # flush 는 attach 직후 그 세션의 소켓으로만 실행되므로 이 시점의
+            # 슬롯 주인이 곧 이 flush 의 세션이다 (_send_text 재적재 판정용).
+            session_id = self._session_id
             pending = list(self._pending)
             self._pending.clear()
-        for text in pending:
-            if ws.application_state != WebSocketState.CONNECTED:
+        if session_id is None:
+            return
+        for i, text in enumerate(pending):
+            if not self._is_connected(ws):
                 async with self._lock:
-                    for item in pending[pending.index(text):]:
+                    for item in pending[i:]:
                         if len(self._pending) >= self._max_pending:
                             self._pending.popleft()
                         self._pending.append(item)
                 print("hub: flush interrupted, re-queued", f"pending={len(self._pending)}")
                 return
-            await self._send_text(ws, text)
+            await self._send_text(ws, text, session_id)
         print("hub: flushed pending", f"count={len(pending)}")
+
+    def _mark_waiting_for_reconnect_locked(self) -> None:
+        # 소켓만 비우고 _session_id·pending 은 보존한다 — 세션은 살아 있고
+        # 연결만 죽은 상태이므로, 이후 번역은 pending 에 쌓였다가 재접속
+        # attach 의 _flush_pending 으로 방류된다. (호출자가 _lock 보유 전제)
+        self.client = None
+        self._reconnect_waiting = True
+        self._reconnect_waiting_since = time.time()
+        self._first_pong_received = False
+        self._last_pong_time = 0
 
     async def _mark_waiting_for_reconnect(self) -> None:
         async with self._lock:
-            self.client = None
-            self._reconnect_waiting = True
-            self._reconnect_waiting_since = time.time()
-            self._first_pong_received = False
-            self._last_pong_time = 0
+            self._mark_waiting_for_reconnect_locked()
+
+    async def handle_client_disconnect(self, session_id: str, ws: WebSocket) -> None:
+        """/ws 엔드포인트가 WebSocketDisconnect 를 잡는 즉시 호출 (§4-3 원인 1).
+
+        detach 와 달리 pending 을 비우지 않는다 — 끊김~재접속 사이의 번역을
+        보존해 유실을 막기 위함. 주인 검사로 늦게 도착한 통지(이미 새 소켓으로
+        교체된 뒤)는 무시한다.
+        """
+        async with self._lock:
+            if session_id != self._session_id or self.client is not ws:
+                print('hub: disconnect notice ignored (stale)', session_id)
+                return
+            self._mark_waiting_for_reconnect_locked()
+            pending = len(self._pending)
+        print('hub: client disconnected, waiting for reconnect',
+              session_id, f'pending={pending}')
 
     async def _send_ping(self, ws: WebSocket) -> bool:
         """ping 전송 (클라이언트는 자동으로 pong 응답해야 함)"""
@@ -168,7 +228,7 @@ class WebSocketHub:
             # ping 메시지를 JSON으로 전송
             # 클라이언트는 이를 받으면 자동으로 {"type": "pong"}을 보내야 함
             async with self._send_gate:
-                if ws.application_state != WebSocketState.CONNECTED:
+                if not self._is_connected(ws):
                     return False
                 await ws.send_json({"type": "ping"})
             return True
@@ -195,7 +255,7 @@ class WebSocketHub:
                     reconnect_waiting = self._reconnect_waiting
                     reconnect_waiting_since = self._reconnect_waiting_since
 
-                if ws is None or ws.application_state != WebSocketState.CONNECTED:
+                if ws is None or not self._is_connected(ws):
                     if reconnect_waiting:
                         # 재연결 대기 시간 확인 (5분 제한)
                         wait_time = time.time() - reconnect_waiting_since

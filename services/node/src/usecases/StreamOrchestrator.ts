@@ -12,7 +12,7 @@ import type { StreamSwitcher } from "../stream/StreamSwitcher.js";
 import type { StreamHandle } from "../ports/streamSwitcher.js";
 import { createSentenceSession } from "../sessions/createSentenceSession.js";
 
-type RotationReason = "scheduled" | "error";
+type RotationReason = "scheduled" | "error" | "resume";
 
 function makeGoogleHandle(
   google: ReturnType<SpeechToTextPort["startStreaming"]>
@@ -26,6 +26,11 @@ function makeGoogleHandle(
 
 export class StreamOrchestrator implements AudioConsumerPort {
   private stopFlag = false;
+  // §4-4-2: paused halts rotation (stops billing) after too many no-audio
+  // errors, but unlike stopFlag it is recoverable — the pcm pump revives STT
+  // when audio flows again. The old permanent give-up left the session a
+  // zombie while ffmpeg kept retrying upstream (2026-07-19 incident).
+  private paused = false;
   private restartTimer: NodeJS.Timeout | undefined;
   private rotationInFlight: Promise<void> | null = null;
   // Consecutive STT errors with no transcript in between. A disconnected
@@ -95,6 +100,16 @@ export class StreamOrchestrator implements AudioConsumerPort {
     (async () => {
       for await (const chunk of pcmReadable as unknown as AsyncIterable<Buffer>) {
         if (this.stopFlag) return;
+        if (this.paused) {
+          // Audio is flowing again — arriving chunks are the same liveness
+          // proof as a transcript, so reset the counter and revive STT.
+          this.paused = false;
+          this.consecutiveErrorRotations = 0;
+          console.log(`Stt resuming: audio returned (session ${sessionId})`);
+          await this._rotateStream(sessionId, session, "resume").catch(
+            () => undefined
+          );
+        }
         await this.switcher.write(chunk);
       }
     })().catch((e) => console.error("pcm pump error", e));
@@ -133,14 +148,17 @@ export class StreamOrchestrator implements AudioConsumerPort {
       },
       onError: (e) => {
         console.log("Stt error :", e);
+        if (this.stopFlag || this.paused) return;
         this.consecutiveErrorRotations += 1;
         if (this.consecutiveErrorRotations > this.maxConsecutiveErrorRotations) {
-          // Client is gone: stop recreating streams so we stop billing. The
-          // session record is cleaned up by /mic/stop or ghost teardown.
+          // Client audio is gone: pause rotation so we stop recreating (and
+          // billing) streams. NOT a permanent give-up — the pcm pump resumes
+          // STT as soon as audio flows again (ffmpeg keeps retrying upstream,
+          // so audio can return without a new session).
           console.warn(
-            `Stt giving up: ${this.consecutiveErrorRotations} consecutive errors with no audio — stopping rotation (session ${sessionId})`
+            `Stt paused: ${this.consecutiveErrorRotations} consecutive errors with no audio — pausing rotation until audio returns (session ${sessionId})`
           );
-          this.stopFlag = true;
+          this.paused = true;
           this._clearRestartTimer();
           return;
         }
@@ -164,7 +182,9 @@ export class StreamOrchestrator implements AudioConsumerPort {
     delayMs = this.restartIntervalMs,
     reason: RotationReason = "scheduled"
   ) {
-    if (this.stopFlag) return;
+    // paused guard: a rotation that was already in flight when the pause hit
+    // must not re-arm the timer and recreate streams behind the pause.
+    if (this.stopFlag || this.paused) return;
     this._clearRestartTimer();
     this.restartTimer = setTimeout(() => {
       this._rotateStream(sessionId, session, reason).catch(() => undefined);

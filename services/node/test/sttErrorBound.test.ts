@@ -108,4 +108,47 @@ describe("StreamOrchestrator — STT 에러 회전 경계", () => {
     // Assert: without the reset it would have capped at 4 streams
     expect(streams.length).toBeGreaterThan(4);
   });
+
+  // §4-4-2 (2026-07-19 incident): the old bound was a PERMANENT give-up
+  // (stopFlag=true) while ffmpeg keeps retrying forever — once audio came
+  // back the session stayed a zombie until a manual stop/start. The bound
+  // must instead PAUSE rotation (billing still stops) and revive STT when
+  // audio flows again.
+
+  it("일시정지 후 오디오가 다시 유입되면 STT가 재개되어야 한다", async () => {
+    // Arrange: exceed the error bound → rotation paused at 4 streams
+    const { port, streams } = createFakeSttPort();
+    const orchestrator = makeOrchestrator(port, 3);
+    const pcm = new PassThrough();
+    await orchestrator.start(pcm, { sessionId: "s1" });
+    for (let i = 0; i < 4; i++) {
+      streams[streams.length - 1].onError(new Error("Stream timed out"));
+      await flush();
+    }
+
+    // Act: audio returns (ffmpeg reconnected upstream)
+    pcm.write(Buffer.alloc(3200));
+    await flush();
+    await flush();
+
+    // Assert: a fresh STT stream was created (4 paused + 1 resumed)
+    expect(streams).toHaveLength(5);
+  });
+
+  it("정지(stop) 후에는 오디오가 유입돼도 STT를 재개하지 않아야 한다", async () => {
+    // Arrange: a started session that is then stopped for real
+    const { port, streams } = createFakeSttPort();
+    const orchestrator = makeOrchestrator(port, 3);
+    const pcm = new PassThrough();
+    const stop = await orchestrator.start(pcm, { sessionId: "s1" });
+    await stop();
+
+    // Act: late audio after the session ended
+    pcm.write(Buffer.alloc(3200));
+    await flush();
+    await flush();
+
+    // Assert: no new stream beyond the initial one
+    expect(streams).toHaveLength(1);
+  });
 });
