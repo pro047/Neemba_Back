@@ -9,6 +9,9 @@ const router = express.Router();
 const PY_HOST = pythonHost;
 
 let stopPipeline: (() => Promise<void>) | null = null;
+// §4-4: on_publish 를 "publisher 복귀" 신호로도 사용 — 대기 중인 ffmpeg
+// 백오프를 즉시 발화시킨다. 세션이 없으면 null (신호 무시).
+let notifyPublisherReturned: (() => void) | null = null;
 let currentSessionId: string | null = null;
 
 // nginx-rtmp on_publish hook: called before a publisher (OBS) is accepted.
@@ -25,9 +28,11 @@ router.post(
       console.warn(
         "rtmp on_publish: RTMP_PUBLISH_KEY not set — allowing publish (auth disabled)"
       );
+      notifyPublisherReturned?.();
       return res.status(200).end();
     }
     if (req.body?.key === configuredKey) {
+      notifyPublisherReturned?.();
       return res.status(200).end();
     }
     console.warn(
@@ -56,6 +61,7 @@ router.post("/sessions/start", async (req, res) => {
       console.error("Error stopping previous session:", err);
     }
     stopPipeline = null;
+    notifyPublisherReturned = null;
     currentSessionId = null;
   }
 
@@ -84,17 +90,19 @@ router.post("/sessions/start", async (req, res) => {
     }
     console.log("python ok:", t);
 
-    const { stop } = await runPipelines({
+    const pipeline = await runPipelines({
       sourceLanguage: sourceLang,
       targetLanguage: targetLang,
     });
-    stopPipeline = stop;
+    stopPipeline = pipeline.stop;
+    notifyPublisherReturned = pipeline.notifyPublisherReturned;
 
     return res.status(202).json({ sessionId, webSocketUrl: t.webSocketUrl });
   } catch (err) {
     console.error("python fetch fail", err);
     currentSessionId = null;
     stopPipeline = null;
+    notifyPublisherReturned = null;
     return res.status(500).json({ error: err });
   }
 });
@@ -117,6 +125,7 @@ router.post("/sessions/stop", async (req, res) => {
     if (stopPipeline) {
       await stopPipeline();
       stopPipeline = null;
+      notifyPublisherReturned = null;
     }
 
     currentSessionId = null;
@@ -132,6 +141,7 @@ router.post("/sessions/stop", async (req, res) => {
     console.error("Error stopping session:", err);
     // 에러 발생 시에도 상태 정리
     stopPipeline = null;
+    notifyPublisherReturned = null;
     currentSessionId = null;
     return res.status(500).json({ error: err });
   }
