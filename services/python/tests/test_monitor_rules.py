@@ -114,14 +114,30 @@ def test_auth_disabled_alerts_on_daily_tick_only():
     assert len(alerts) == 1  # 다음 일일 틱
 
 
-def test_scrape_failure_fires_only_if_last_known_active():
+def test_daily_tick_not_burned_by_scrape_failure():
+    # 부팅 직후 앱 재시작 등으로 첫 틱이 scrape 실패면, 일일 틱을 소모하지
+    # 않고 다음 정상 틱에서 daily 규칙(auth)이 발화해야 한다.
+    state, alerts = evaluate({}, {'_scrape_ok': 0.0}, now=T0)
+    assert alerts == []
+
+    state, alerts = evaluate(
+        state, fresh(T0 + 60, neemba_rtmp_auth_enabled=0.0), now=T0 + 60)
+    assert any('인증' in a for a in alerts)
+
+
+def test_scrape_failure_fires_after_two_consecutive_misses():
     state, _ = evaluate({}, samples(), now=T0)  # active 기억됨
 
     down = {'_scrape_ok': 0.0}
+    # 1회 실패는 일시 타임아웃일 수 있음 → 침묵
     state, alerts = evaluate(state, down, now=T0 + 60)
+    assert alerts == []
+    # 2연속 실패 → 발화
+    state, alerts = evaluate(state, down, now=T0 + 120)
     assert any('metrics' in a for a in alerts)
 
     # 비활성 상태에서 스크레이프 실패 → GHA health-watch 몫, 침묵
     state2, _ = evaluate({}, samples(neemba_hub_active_session=0.0), now=T0)
     state2, alerts = evaluate(state2, down, now=T0 + 60)
+    state2, alerts = evaluate(state2, down, now=T0 + 120)
     assert alerts == []

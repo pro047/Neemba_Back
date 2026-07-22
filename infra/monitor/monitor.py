@@ -54,7 +54,9 @@ CONDITION_RULES = [
      'active',
      '🚨 NATS 연결 끊김 — consumer 가 브로커에 붙지 못함'),
     ('scrape_failed',
-     lambda s, now: s.get('_scrape_ok', 1.0) == 0.0,
+     # 일시 타임아웃 1회로도 울리는 과민 방지: 2연속 실패부터 발화
+     # (streak 은 evaluate 가 state 에 유지)
+     lambda s, now: s.get('_scrape_fail_streak', 0.0) >= 2,
      'last_known_active',
      '🚨 /metrics 응답 없음 — 앱 컨테이너 상태 확인 필요'),
     ('rtmp_auth_disabled',
@@ -89,8 +91,15 @@ def evaluate(state: dict, samples: dict, now: float) -> tuple[dict, list[str]]:
     scrape_ok = samples.get('_scrape_ok', 1.0) == 1.0
     if scrape_ok:
         state['_last_known_active'] = _is_active(samples)
+        state['_scrape_fail_streak'] = 0
+    else:
+        state['_scrape_fail_streak'] = state.get('_scrape_fail_streak', 0) + 1
+    samples = dict(samples)
+    samples['_scrape_fail_streak'] = state['_scrape_fail_streak']
 
-    daily_due = now - state.get('_last_daily', 0.0) >= DAILY_SECONDS
+    # scrape 실패 중엔 일일 틱을 소모하지 않는다 — 부팅 경합으로 첫 틱이
+    # 실패하면 daily 규칙(auth 등)이 24h 밀리는 버그 방지.
+    daily_due = scrape_ok and now - state.get('_last_daily', 0.0) >= DAILY_SECONDS
     if daily_due:
         state['_last_daily'] = now
 
