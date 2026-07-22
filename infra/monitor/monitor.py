@@ -188,7 +188,12 @@ def send_discord(webhook: str | None, text: str) -> None:
         return
     body = json.dumps({'content': f'[neemba] {text}'}).encode()
     req = urllib.request.Request(
-        webhook, data=body, headers={'Content-Type': 'application/json'})
+        webhook, data=body, headers={
+            'Content-Type': 'application/json',
+            # Cloudflare 가 기본 'Python-urllib/x' UA 의 POST 를 403 으로
+            # 차단한다 (dev 실측). GET 은 통과해서 URL 검증만으론 안 잡힘.
+            'User-Agent': 'neemba-monitor/1.0',
+        })
     try:
         urllib.request.urlopen(req, timeout=10).read()
         print(f'monitor: alerted: {text}', flush=True)
