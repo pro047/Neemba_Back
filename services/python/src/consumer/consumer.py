@@ -9,6 +9,7 @@ from nats.js.api import ConsumerConfig, StreamConfig
 from nats.js.errors import NotFoundError
 
 from src.dto.translationDto import TranslationRequestDto
+from src.monitoring import metrics
 
 # Defaults declared in code so a rebuilt NATS behaves the same as production.
 # Tune after observing develop: ack_wait must exceed worst-case offer latency,
@@ -62,12 +63,15 @@ class TranscriptConsumer:
             print('NATS error : ', repr(exception))
 
         async def on_disconnect():
+            metrics.set_nats_connected(False)
             print("NATS disconnect")
 
         async def on_reconnect():
+            metrics.set_nats_connected(True)
             print("NATS reconnected to", self.safe_url)
 
         async def on_close():
+            metrics.set_nats_connected(False)
             print('NATS connection closed')
 
         try:
@@ -81,6 +85,7 @@ class TranscriptConsumer:
         except Exception as exc:
             print("NATS connect failed to", self.safe_url, "error:", repr(exc))
             raise
+        metrics.set_nats_connected(True)
         print('NATS connected to', self.safe_url)
 
         jetstream = self.client.jetstream()
@@ -156,6 +161,7 @@ class TranscriptConsumer:
         except Exception as exc:
             # An unparseable message can never succeed — nak would redeliver
             # it forever (burning fetch slots), so terminate it instead.
+            metrics.record_unparseable()
             print('consumer: unparseable message, term:', repr(exc))
             try:
                 await message.term()

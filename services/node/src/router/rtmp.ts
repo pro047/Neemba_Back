@@ -3,6 +3,7 @@ import { pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
 import { runPipelines } from "../runPipeLines.js";
 import { removeSessionId, setSessionId } from "../ports/sessionStore.js";
+import { setRtmpAuthEnabled } from "../monitoring/metrics.js";
 
 const router = express.Router();
 
@@ -24,6 +25,7 @@ router.post(
   express.urlencoded({ extended: false }),
   (req, res) => {
     const configuredKey = process.env.RTMP_PUBLISH_KEY;
+    setRtmpAuthEnabled(Boolean(configuredKey));
     if (!configuredKey) {
       console.warn(
         "rtmp on_publish: RTMP_PUBLISH_KEY not set — allowing publish (auth disabled)"

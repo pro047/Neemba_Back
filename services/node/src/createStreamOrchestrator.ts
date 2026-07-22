@@ -5,6 +5,10 @@ import { GoogleSttV2Adapter } from "./adapters/googleSttV2.js";
 import { natsUrl } from "./config.js";
 import { JetStreamTranscriptPublisher } from "./js_pub.js";
 import { RetryingTranscriptPublisher } from "./retryingPublisher.js";
+import {
+  setPublishBufferDropped,
+  setPublishBufferSize,
+} from "./monitoring/metrics.js";
 import { SegmentManager } from "./stream/SegmentManager.js";
 import { StreamSwitcher } from "./stream/StreamSwitcher.js";
 import { InterimChunkOrchestrator } from "./usecases/InterimChunkOrchestratotr.js";
@@ -47,7 +51,14 @@ export async function createStreamOrchestrator(
   await googleRecognizer.getRecognizer();
 
   const transcriptPublisher = new RetryingTranscriptPublisher(
-    new JetStreamTranscriptPublisher(url)
+    new JetStreamTranscriptPublisher(url),
+    undefined,
+    undefined,
+    undefined,
+    {
+      onDropped: setPublishBufferDropped,
+      onQueueSize: setPublishBufferSize,
+    }
   );
   const segmentManager = new SegmentManager();
   const switcher = new StreamSwitcher((segmentId) => {

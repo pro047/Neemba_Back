@@ -3,6 +3,7 @@ import type { ChildProcessWithoutNullStreams } from "child_process";
 import type { AudioTranscoder } from "../ports/ports.js";
 import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
+import { incFfmpegStale } from "../monitoring/metrics.js";
 
 // "No publisher yet" (OBS not live) is a legitimate indefinite state, so
 // restarts never give up — they back off exponentially to stop the 10s
@@ -158,6 +159,7 @@ export class FfmpegTranscoder implements AudioTranscoder {
       const now = Date.now();
       if (now - childStartAt < 15000) return;
       if (now - lastProcessAt > 10000) {
+        incFfmpegStale();
         console.warn("ffmpeg process not updated for 10s");
         this.requestRestart(attachTranscoder, "stalled");
       }
