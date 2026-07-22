@@ -27,6 +27,13 @@ type BufferedSpan = {
   enqueuedAt: number;
 };
 
+// Observation hooks so the buffer stays free of metrics dependencies —
+// createStreamOrchestrator wires these to prom-client.
+export type RetryBufferHooks = {
+  onDropped?: (cumulativeTotal: number) => void;
+  onQueueSize?: (size: number) => void;
+};
+
 export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
   private readonly queue: BufferedSpan[] = [];
   private draining = false;
@@ -37,8 +44,14 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
     private readonly inner: TranscriptPublisherPort,
     private readonly ttlMs = DEFAULT_TTL_MS,
     private readonly retryDelayMs = DEFAULT_RETRY_DELAY_MS,
-    private readonly maxBuffered = DEFAULT_MAX_BUFFERED
+    private readonly maxBuffered = DEFAULT_MAX_BUFFERED,
+    private readonly hooks: RetryBufferHooks = {}
   ) {}
+
+  private notify(): void {
+    this.hooks.onQueueSize?.(this.queue.length);
+    this.hooks.onDropped?.(this.dropped);
+  }
 
   get droppedCount(): number {
     return this.dropped;
@@ -57,6 +70,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
       );
       this.queue.length = 0;
     }
+    this.notify();
     await this.inner.stop?.();
   }
 
@@ -66,6 +80,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
   async publish(message: PublishEvent): Promise<void> {
     if (this.stopped) {
       this.dropped += 1;
+      this.notify();
       console.warn(
         `publish buffer: span dropped after stop, total dropped=${this.dropped}`
       );
@@ -80,6 +95,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
         `publish buffer: capacity exceeded, oldest span dropped, total dropped=${this.dropped}`
       );
     }
+    this.notify();
 
     if (!this.draining) {
       this.draining = true;
@@ -100,6 +116,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
         // shift() only after success and only if stop() has not already
         // cleared the queue underneath us.
         if (this.queue[0] === head) this.queue.shift();
+        this.notify();
       } catch (err) {
         console.warn(
           `publish buffer: publish failed, retrying in ${this.retryDelayMs}ms ` +
@@ -124,6 +141,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
           `(session=${expired.event.sessionId} seq=${expired.event.sequence}), ` +
           `total dropped=${this.dropped}`
       );
+      this.notify();
     }
   }
 
