@@ -127,20 +127,36 @@ async def test_unparseable_message_is_terminated_not_naked():
     assert not poison.naked and not poison.acked
 
 
+class FakeStreamInfo:
+    def __init__(self, config) -> None:
+        self.config = config
+
+
 class FakeJetStream:
-    def __init__(self, stream_exists: bool, consumer_exists: bool) -> None:
+    def __init__(self, stream_exists: bool, consumer_exists: bool,
+                 existing_max_age: float | None = 600) -> None:
         self._stream_exists = stream_exists
         self._consumer_exists = consumer_exists
+        self._existing_max_age = existing_max_age
         self.added_streams: list = []
         self.added_consumers: list = []
+        self.updated_streams: list = []
 
     async def stream_info(self, name: str):
         if not self._stream_exists:
             raise NotFoundError
-        return object()
+        from nats.js.api import StreamConfig
+        return FakeStreamInfo(StreamConfig(
+            name=name,
+            subjects=['transcript.session.*'],
+            max_age=self._existing_max_age,
+        ))
 
     async def add_stream(self, config) -> None:
         self.added_streams.append(config)
+
+    async def update_stream(self, config) -> None:
+        self.updated_streams.append(config)
 
     async def consumer_info(self, stream: str, consumer: str):
         if not self._consumer_exists:
@@ -160,6 +176,9 @@ async def test_ensure_creates_missing_stream_and_consumer():
     assert len(jetstream.added_streams) == 1
     assert jetstream.added_streams[0].name == 'transcripts'
     assert jetstream.added_streams[0].subjects == ['transcript.session.*']
+    # §4-4 hygiene: without max_age the stream grows unbounded whenever the
+    # consumer is down while Node keeps publishing.
+    assert jetstream.added_streams[0].max_age == 600
     assert len(jetstream.added_consumers) == 1
     stream_name, config = jetstream.added_consumers[0]
     assert stream_name == 'transcripts'
@@ -172,8 +191,32 @@ async def test_ensure_skips_existing_stream_and_consumer():
     consumer = make_consumer()
     jetstream = FakeJetStream(stream_exists=True, consumer_exists=True)
 
-    # Manually created production streams must be left untouched.
+    # Existing objects whose config already matches must be left untouched.
     await consumer._ensure_stream_and_consumer(jetstream)
 
     assert jetstream.added_streams == []
+    assert jetstream.updated_streams == []
+    assert jetstream.added_consumers == []
+
+
+async def test_ensure_reconciles_missing_max_age_on_existing_stream():
+    """max_age is the one field code is allowed to reconcile on live streams.
+
+    The prod stream predates the max_age hygiene fix; add_stream-only would
+    leave it unbounded forever. Only max_age may be touched — everything
+    else on a manually created stream stays as-is.
+    """
+    consumer = make_consumer()
+    jetstream = FakeJetStream(stream_exists=True, consumer_exists=True,
+                              existing_max_age=None)
+
+    await consumer._ensure_stream_and_consumer(jetstream)
+
+    assert jetstream.added_streams == []
+    assert len(jetstream.updated_streams) == 1
+    updated = jetstream.updated_streams[0]
+    assert updated.max_age == 600
+    # The rest of the live config must ride along unchanged.
+    assert updated.name == 'transcripts'
+    assert updated.subjects == ['transcript.session.*']
     assert jetstream.added_consumers == []

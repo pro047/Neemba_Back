@@ -1,6 +1,11 @@
 import express, { type Router } from "express";
 import http from "http";
-import { collectDefaultMetrics, Counter, Registry } from "prom-client";
+import {
+  collectDefaultMetrics,
+  Counter,
+  register as domainRegister,
+  Registry,
+} from "prom-client";
 import micRouter from "./router/mic.js";
 import rtmpRouter from "./router/rtmp.js";
 import { createMicWebSocketServer } from "./micWebSocket.js";
@@ -54,8 +59,12 @@ export function createApp({
   app.get("/health", (_req, res) => res.json({ ok: true }));
 
   app.get("/metrics", async (_req, res) => {
-    res.setHeader("Content-Type", registry.contentType);
-    res.end(await registry.metrics());
+    // Domain metrics (src/monitoring/metrics.ts) live on prom-client's
+    // default register so instrumented modules never need this app instance;
+    // merge exposes both without double-registration.
+    const merged = Registry.merge([registry, domainRegister]);
+    res.setHeader("Content-Type", merged.contentType);
+    res.end(await merged.metrics());
   });
 
   app.get("/api/ping", (_req, res) => {

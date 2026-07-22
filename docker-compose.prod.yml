@@ -6,8 +6,34 @@ networks:
 volumes:
   nats-data:
   pg-data:
+  monitor-state:
 
 services:
+  # 알림 사이드카: 앱 /metrics 폴링 → 규칙 판정(상태 전이 dedup) → 디스코드.
+  # docker.sock 미사용(저장소 보안 결정) — pg-retention 과 같은
+  # 'stock 이미지 + ro 스크립트 마운트' 관례. DISCORD_WEBHOOK_URL 은
+  # .env.prod(ENV_PROD 시크릿)에서 오며, 없으면 로그 전용으로 동작.
+  monitor:
+    image: python:3.12-alpine
+    container_name: monitor
+    entrypoint: ["python", "/usr/local/bin/monitor.py"]
+    volumes:
+      - ./infra/monitor/monitor.py:/usr/local/bin/monitor.py:ro
+      - monitor-state:/var/lib/monitor
+    env_file:
+      - .env.prod
+    depends_on:
+      - python
+      - node
+    networks:
+      - appnet
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   nginx:
     image: nginx:1.27-alpine
     container_name: nginx

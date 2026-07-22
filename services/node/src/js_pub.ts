@@ -52,6 +52,13 @@ export class JetStreamTranscriptPublisher implements TranscriptPublisherPort {
         servers: server,
         user: decodeURIComponent(url.username),
         pass: decodeURIComponent(url.password),
+        // §4-4: the default budget (10 attempts * 2s ≈ 20s) permanently
+        // closes the connection on any outage longer than that, making the
+        // retry buffer's 60s TTL unreachable. NATS lives in the same compose
+        // stack, so "never comes back" means a deploy incident — keep
+        // retrying and let the logs be the signal.
+        maxReconnectAttempts: -1,
+        reconnectTimeWait: 2000,
       });
     } catch (err) {
       console.error("NATS connection failed:", err);

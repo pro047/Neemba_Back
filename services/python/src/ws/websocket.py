@@ -5,6 +5,8 @@ from typing import Deque, Dict, Any, Optional
 from collections import deque
 import time
 
+from src.monitoring import metrics
+
 
 class WebSocketHub:
     def __init__(self) -> None:
@@ -41,6 +43,7 @@ class WebSocketHub:
             if self._session_id is not None and self._session_id != session_id:
                 self._pending.clear()
             self._session_id = session_id
+            metrics.set_active_session(True)
         await ws.accept()
         was_reconnecting = self._reconnect_waiting
         self.client = ws
@@ -76,6 +79,7 @@ class WebSocketHub:
                 self.client = None
             self._session_id = None
             self._pending.clear()
+            metrics.set_active_session(False)
             print('hub: detached', session_id)
 
     async def broadcast_to_session(self, session_id: str, payload: Dict[str, Any]) -> None:
@@ -136,9 +140,11 @@ class WebSocketHub:
             if requeue:
                 await self._requeue(session_id, text)
                 return
+            metrics.record_broadcast(time.time())
             print('hub: broadcast:', text)
 
         except Exception as e:
+            metrics.record_send_failed()
             print('hub: send failed:', e)
             # §4-3(원인 3): 실패 문장 재적재 (게이트는 이미 빠져나온 상태)
             await self._requeue(session_id, text)

@@ -6,6 +6,7 @@ import type {
   StopStreaming,
 } from "../ports/audioConsumerPort.js";
 import { getSessionId } from "../ports/sessionStore.js";
+import { setSttPaused } from "../monitoring/metrics.js";
 import type { ISegmentManager } from "../ports/segment.js";
 import type { IInterfaceOrchestra } from "../ports/interimOrchestra.js";
 import type { StreamSwitcher } from "../stream/StreamSwitcher.js";
@@ -105,6 +106,7 @@ export class StreamOrchestrator implements AudioConsumerPort {
           // proof as a transcript, so reset the counter and revive STT.
           this.paused = false;
           this.consecutiveErrorRotations = 0;
+          setSttPaused(false);
           console.log(`Stt resuming: audio returned (session ${sessionId})`);
           await this._rotateStream(sessionId, session, "resume").catch(
             () => undefined
@@ -159,6 +161,7 @@ export class StreamOrchestrator implements AudioConsumerPort {
             `Stt paused: ${this.consecutiveErrorRotations} consecutive errors with no audio — pausing rotation until audio returns (session ${sessionId})`
           );
           this.paused = true;
+          setSttPaused(true);
           this._clearRestartTimer();
           return;
         }

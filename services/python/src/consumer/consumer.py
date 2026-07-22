@@ -9,12 +9,17 @@ from nats.js.api import ConsumerConfig, StreamConfig
 from nats.js.errors import NotFoundError
 
 from src.dto.translationDto import TranslationRequestDto
+from src.monitoring import metrics
 
 # Defaults declared in code so a rebuilt NATS behaves the same as production.
 # Tune after observing develop: ack_wait must exceed worst-case offer latency,
 # max_deliver bounds poison-message redelivery.
 DEFAULT_ACK_WAIT_SECONDS = 30
 DEFAULT_MAX_DELIVER = 5
+# §4-4 hygiene: without max_age the stream grows unbounded whenever the
+# consumer is down while Node keeps publishing. 10 minutes is far beyond any
+# useful subtitle latency. nats-py takes seconds (converts to ns itself).
+DEFAULT_MAX_AGE_SECONDS = 600
 # Watermark map safety cap — one int per session, evicted FIFO.
 MAX_TRACKED_SESSIONS = 1000
 
@@ -58,12 +63,15 @@ class TranscriptConsumer:
             print('NATS error : ', repr(exception))
 
         async def on_disconnect():
+            metrics.set_nats_connected(False)
             print("NATS disconnect")
 
         async def on_reconnect():
+            metrics.set_nats_connected(True)
             print("NATS reconnected to", self.safe_url)
 
         async def on_close():
+            metrics.set_nats_connected(False)
             print('NATS connection closed')
 
         try:
@@ -77,6 +85,7 @@ class TranscriptConsumer:
         except Exception as exc:
             print("NATS connect failed to", self.safe_url, "error:", repr(exc))
             raise
+        metrics.set_nats_connected(True)
         print('NATS connected to', self.safe_url)
 
         jetstream = self.client.jetstream()
@@ -97,15 +106,30 @@ class TranscriptConsumer:
         documented behavior instead of nats-py defaults.
         """
         try:
-            await jetstream.stream_info(self.stream_name)
-            print(f'consumer: stream "{self.stream_name}" exists, leaving as-is')
+            info = await jetstream.stream_info(self.stream_name)
+            # Deliberate exception to the "leave existing objects as-is"
+            # rule, limited to this one field: the prod stream predates the
+            # max_age hygiene fix, and add_stream-only would leave it
+            # unbounded forever. The live config rides along unchanged.
+            if info.config.max_age != DEFAULT_MAX_AGE_SECONDS:
+                old_max_age = info.config.max_age
+                info.config.max_age = DEFAULT_MAX_AGE_SECONDS
+                await jetstream.update_stream(info.config)
+                print(f'consumer: stream "{self.stream_name}" max_age '
+                      f'RECONCILED {old_max_age} -> {DEFAULT_MAX_AGE_SECONDS}s '
+                      f'(only max_age was changed)')
+            else:
+                print(f'consumer: stream "{self.stream_name}" exists, '
+                      f'leaving as-is')
         except NotFoundError:
             await jetstream.add_stream(StreamConfig(
                 name=self.stream_name,
                 subjects=[self.nats_subject],
+                max_age=DEFAULT_MAX_AGE_SECONDS,
             ))
             print(f'consumer: stream "{self.stream_name}" created '
-                  f'(subjects=[{self.nats_subject}])')
+                  f'(subjects=[{self.nats_subject}], '
+                  f'max_age={DEFAULT_MAX_AGE_SECONDS}s)')
 
         try:
             await jetstream.consumer_info(self.stream_name, self.consumer_name)
@@ -137,6 +161,7 @@ class TranscriptConsumer:
         except Exception as exc:
             # An unparseable message can never succeed — nak would redeliver
             # it forever (burning fetch slots), so terminate it instead.
+            metrics.record_unparseable()
             print('consumer: unparseable message, term:', repr(exc))
             try:
                 await message.term()
