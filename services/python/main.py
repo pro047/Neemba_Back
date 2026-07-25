@@ -4,7 +4,7 @@ import json
 import logging
 import traceback
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import (
     Depends,
@@ -360,6 +360,22 @@ async def start_session(req: StartRequest, request: Request):
         except Exception as e:
             print("start_session: ensure_session failed (ignored):", repr(e))
 
+    # Global monitor event (WU1). Emitted regardless of the DB outcome above —
+    # live visibility must not be hostage to a DB hiccup (D3 principle).
+    # startedAt is server time by decision Q2-a, not the DB-recorded value.
+    monitor_hub: MonitorHub | None = getattr(request.app.state, "monitor_hub", None)
+    if monitor_hub is not None:
+        try:
+            await monitor_hub.broadcast_global({
+                "type": "session_started",
+                "sessionId": req.session_id,
+                "sourceLang": req.source_lang,
+                "targetLang": req.target_lang,
+                "startedAt": datetime.now(UTC).isoformat(),
+            })
+        except Exception as e:
+            print("start_session: event broadcast failed (ignored):", repr(e))
+
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
 
@@ -394,14 +410,24 @@ async def stop_session(req: StopRequest, request: Request):
     # socket owned by the currently live session.
     await hub.detach(req.session_id)
 
-    # Only the first (transitioning) stop emits the monitor close event.
-    monitor_hub: MonitorHub = getattr(request.app.state, "monitor_hub", None)
+    # Only the first (transitioning) stop emits the monitor close event and
+    # the global session_ended event (WU1) — a duplicate stop emits nothing.
+    monitor_hub: MonitorHub | None = getattr(request.app.state, "monitor_hub", None)
     if ended and monitor_hub is not None:
         await monitor_hub.close_session(req.session_id, {
             "type": "session_closed",
             "sessionId": req.session_id,
             "translationCount": translation_count,
         })
+        try:
+            await monitor_hub.broadcast_global({
+                "type": "session_ended",
+                "sessionId": req.session_id,
+                "translationCount": translation_count,
+                "endedAt": datetime.now(UTC).isoformat(),
+            })
+        except Exception as e:
+            print("stop_session: event broadcast failed (ignored):", repr(e))
 
     return {"ok": True, "ended": ended, "translationCount": translation_count}
 
@@ -496,3 +522,25 @@ async def monitor_endpoint(ws: WebSocket):
         print(f'monitor : websocket error: {e}')
     finally:
         await monitor_hub.detach(session_id, ws)
+
+
+@app.websocket("/ws/monitor/events")
+async def monitor_events_endpoint(ws: WebSocket):
+    """Global monitor event stream (WU1): session lifecycle fan-out.
+
+    Session-agnostic: every subscriber receives ``session_started`` /
+    ``session_ended`` events for all sessions. No backlog — events emitted
+    while disconnected are lost (history comes from ``/api/monitor/sessions``).
+    Read-only: inbound frames are ignored.
+    """
+    monitor_hub: MonitorHub = ws.app.state.monitor_hub
+    await monitor_hub.attach_global(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        print('monitor-events : websocket disconnected')
+    except Exception as e:
+        print(f'monitor-events : websocket error: {e}')
+    finally:
+        await monitor_hub.detach_global(ws)
