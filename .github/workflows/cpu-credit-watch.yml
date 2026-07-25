@@ -26,12 +26,16 @@ env:
 jobs:
   check-credits:
     runs-on: ubuntu-latest
+    # OIDC federation — no stored AWS keys. The watch role trusts main AND
+    # develop so a workflow_dispatch run from develop can verify the plumbing
+    # pre-release (role: infra/terraform/gha-oidc.tf).
+    permissions:
+      id-token: write
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::989785488374:role/neemba-gha-watch
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Check surplus CPU credits (last 24h)
