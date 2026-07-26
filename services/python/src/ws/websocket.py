@@ -6,10 +6,11 @@ from collections import deque
 import time
 
 from src.monitoring import metrics
+from src.ws.blip_recorder import WsBlipRecorder
 
 
 class WebSocketHub:
-    def __init__(self) -> None:
+    def __init__(self, blip_recorder: WsBlipRecorder | None = None) -> None:
         self._lock = asyncio.Lock()
         self.client: Optional[WebSocket] = None
         # 동시 1세션 전제: 풀 dict 맵 대신 '지금 슬롯의 주인' sessionId 1개만 추적
@@ -23,6 +24,11 @@ class WebSocketHub:
         self._reconnect_waiting_since = 0
         self._pending: Deque[str] = deque()
         self._max_pending = 100
+        # §4-7 순단 계측: 끊김 시 ws_blips insert(fire-and-forget task 가 id 로
+        # resolve) → 같은 세션 재접속 시 종결. 미주입(None)이면 전부 no-op.
+        self._blip_recorder = blip_recorder
+        self._blip_start_task: asyncio.Task | None = None
+        self._blip_lost = 0  # 열린 blip 동안 pending 캡 초과로 버린 건수
 
     @staticmethod
     def _is_connected(ws: WebSocket) -> bool:
@@ -35,15 +41,40 @@ class WebSocketHub:
             and ws.application_state == WebSocketState.CONNECTED
         )
 
+    def _drop_oldest_pending_locked(self) -> None:
+        # 캡 초과로 가장 오래된 문장을 버린다. §4-7: 열린 blip(순단) 동안의
+        # 드롭은 실제 자막 유실이므로 lost_count 로 집계한다. (호출자가 _lock 보유 전제)
+        self._pending.popleft()
+        if self._blip_start_task is not None:
+            self._blip_lost += 1
+
     async def attach(self, ws: WebSocket, session_id: str) -> None:
         async with self._lock:
             if self.client and self.client is not ws:
                 await self._safe_close(self.client)
+            same_session = self._session_id == session_id
             # 세션 주인이 바뀌면 이전 세션의 미전송 큐를 비운다 (에러B: 교차 전송 방지)
-            if self._session_id is not None and self._session_id != session_id:
+            if self._session_id is not None and not same_session:
                 self._pending.clear()
+                # 이전 세션의 열린 blip 은 종결하지 않는다 — reconnected_at NULL
+                # 잔존 = 미복귀 (§4-7 결정 2). 추적 상태만 리셋.
+                self._blip_start_task = None
+                self._blip_lost = 0
             self._session_id = session_id
             metrics.set_active_session(True)
+            # §4-7: 같은 세션의 재접속이면 열린 blip 을 종결한다. flushed 는
+            # 이 시점의 방류 예정 pending 건수. _reconnect_waiting 리셋(아래)
+            # 전, 같은 락 안에서 판정해야 attach 경쟁과 직렬화된다.
+            if (
+                self._reconnect_waiting
+                and same_session
+                and self._blip_start_task is not None
+            ):
+                start_task = self._blip_start_task
+                self._blip_start_task = None
+                flushed, lost = len(self._pending), self._blip_lost
+                self._blip_lost = 0
+                asyncio.create_task(self._finish_blip(start_task, flushed, lost))
         await ws.accept()
         was_reconnecting = self._reconnect_waiting
         self.client = ws
@@ -104,7 +135,7 @@ class WebSocketHub:
             # 창이 남는다. 한 락으로 묶으면 attach 와 직렬화되어 그 창이 닫힌다.
             if ws is None or not self._is_connected(ws):
                 if len(self._pending) >= self._max_pending:
-                    self._pending.popleft()
+                    self._drop_oldest_pending_locked()
                 self._pending.append(text)
                 state = (ws.client_state, ws.application_state) if ws is not None else None
                 print("hub: queued send, ws not connected", state, f"pending={len(self._pending)}")
@@ -120,7 +151,7 @@ class WebSocketHub:
             if session_id is None or session_id != self._session_id:
                 return
             if len(self._pending) >= self._max_pending:
-                self._pending.popleft()
+                self._drop_oldest_pending_locked()
             self._pending.appendleft(text)
             print('hub: re-queued unsent text', f"pending={len(self._pending)}")
 
@@ -191,39 +222,93 @@ class WebSocketHub:
                 async with self._lock:
                     for item in pending[i:]:
                         if len(self._pending) >= self._max_pending:
-                            self._pending.popleft()
+                            self._drop_oldest_pending_locked()
                         self._pending.append(item)
                 print("hub: flush interrupted, re-queued", f"pending={len(self._pending)}")
                 return
             await self._send_text(ws, text, session_id)
         print("hub: flushed pending", f"count={len(pending)}")
 
-    def _mark_waiting_for_reconnect_locked(self) -> None:
+    def _mark_waiting_for_reconnect_locked(
+        self,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        detected_by: str = "keepalive_timeout",
+    ) -> None:
         # 소켓만 비우고 _session_id·pending 은 보존한다 — 세션은 살아 있고
         # 연결만 죽은 상태이므로, 이후 번역은 pending 에 쌓였다가 재접속
         # attach 의 _flush_pending 으로 방류된다. (호출자가 _lock 보유 전제)
+        # §4-7: 모든 '연결만 죽음' 전이는 이 함수를 지나므로 blip 기록도
+        # 여기서 연다. 기본 detected_by 는 서버발(keepalive) — 클라발은
+        # handle_client_disconnect 가 close frame 정보와 함께 넘긴다.
         self.client = None
         self._reconnect_waiting = True
         self._reconnect_waiting_since = time.time()
         self._first_pong_received = False
         self._last_pong_time = 0
+        self._open_blip_locked(close_code, close_reason, detected_by)
 
     async def _mark_waiting_for_reconnect(self) -> None:
         async with self._lock:
             self._mark_waiting_for_reconnect_locked()
 
-    async def handle_client_disconnect(self, session_id: str, ws: WebSocket) -> None:
+    def _open_blip_locked(
+        self,
+        close_code: int | None,
+        close_reason: str | None,
+        detected_by: str,
+    ) -> None:
+        # fire-and-forget insert — DB 가 죽어도 /ws 경로를 막지 않는다
+        # (recorder 가 예외를 삼킴). 이미 열린 blip 이 있으면(연속 전이) 유지.
+        if self._blip_recorder is None or self._blip_start_task is not None:
+            return
+        if self._session_id is None:
+            return
+        self._blip_lost = 0
+        self._blip_start_task = asyncio.create_task(
+            self._blip_recorder.record_disconnect(
+                self._session_id,
+                close_code=close_code,
+                close_reason=close_reason,
+                detected_by=detected_by,
+            )
+        )
+
+    async def _finish_blip(
+        self, start_task: "asyncio.Task[int | None]", flushed: int, lost: int
+    ) -> None:
+        # 빠른 재접속이 insert 완료보다 먼저 올 수 있으므로 start 태스크의
+        # id 를 await 로 기다렸다가 종결한다 (레이스를 대기로 직렬화).
+        try:
+            blip_id = await start_task
+            if blip_id is not None and self._blip_recorder is not None:
+                await self._blip_recorder.record_reconnect(
+                    blip_id, flushed_count=flushed, lost_count=lost
+                )
+        except Exception as e:
+            print('hub: blip close failed (ignored):', repr(e))
+
+    async def handle_client_disconnect(
+        self,
+        session_id: str,
+        ws: WebSocket,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+    ) -> None:
         """/ws 엔드포인트가 WebSocketDisconnect 를 잡는 즉시 호출 (§4-3 원인 1).
 
         detach 와 달리 pending 을 비우지 않는다 — 끊김~재접속 사이의 번역을
         보존해 유실을 막기 위함. 주인 검사로 늦게 도착한 통지(이미 새 소켓으로
-        교체된 뒤)는 무시한다.
+        교체된 뒤)는 무시한다. close_code/reason 은 클라 close frame 값
+        (1001=정상 종료, 1006=비정상 단절)으로 ws_blips 에 기록된다 (§4-7).
         """
         async with self._lock:
             if session_id != self._session_id or self.client is not ws:
                 print('hub: disconnect notice ignored (stale)', session_id)
                 return
-            self._mark_waiting_for_reconnect_locked()
+            self._mark_waiting_for_reconnect_locked(
+                close_code, close_reason, detected_by="client_disconnect"
+            )
             pending = len(self._pending)
         print('hub: client disconnected, waiting for reconnect',
               session_id, f'pending={pending}')

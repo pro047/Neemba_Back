@@ -4,7 +4,7 @@ import json
 import logging
 import traceback
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import (
     Depends,
@@ -29,7 +29,9 @@ from src.repository.implementation.translation_repository import (
     ensure_session,
     end_session,
 )
+from src.repository.implementation import ws_blip_repository as wb
 from src.separator.kss_separator import SentenceSeparator
+from src.ws.blip_recorder import WsBlipRecorder
 from src.ws.monitor import MonitorHub
 from src.ws.websocket import WebSocketHub
 
@@ -63,7 +65,8 @@ async def lifespan(app: FastAPI):
 
         deepl_api = app.state.deepl_config['deepl_api_key']
 
-        hub = WebSocketHub()
+        # §4-7 순단 계측: /ws 끊김·재접속을 ws_blips 에 기록 (DB 실패는 recorder 가 격리)
+        hub = WebSocketHub(blip_recorder=WsBlipRecorder(app.state.db_pool))
         monitor_hub = MonitorHub()
         translator = DeeplTranslationService(deepl_api)
         pusher = Pusher(hub, monitor_hub=monitor_hub, db_pool=app.state.db_pool)
@@ -211,6 +214,32 @@ class TranslationSearchResponse(BaseModel):
     next_cursor: str | None = Field(default=None, alias="nextCursor")
 
 
+class WsBlip(BaseModel):
+    # §4-7 순단 계측. reconnected_at NULL = 미복귀. close_code/close_reason 은
+    # 클라 close frame 값(서버발 감지면 NULL), detected_by 로 감지 주체 구분.
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int
+    session_id: str = Field(alias="sessionId")
+    disconnected_at: datetime = Field(alias="disconnectedAt")
+    reconnected_at: datetime | None = Field(default=None, alias="reconnectedAt")
+    duration_ms: int | None = Field(default=None, alias="durationMs")
+    flushed_count: int | None = Field(default=None, alias="flushedCount")
+    lost_count: int | None = Field(default=None, alias="lostCount")
+    close_code: int | None = Field(default=None, alias="closeCode")
+    close_reason: str | None = Field(default=None, alias="closeReason")
+    detected_by: str = Field(alias="detectedBy")
+
+
+class WsBlipListResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[WsBlip]
+    limit: int
+    offset: int
+    next_offset: int | None = Field(default=None, alias="nextOffset")
+
+
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
@@ -344,6 +373,27 @@ async def monitor_translations_search(
     )
 
 
+@app.get('/api/monitor/ws-blips', response_model=WsBlipListResponse)
+async def monitor_ws_blips(
+    session_id: str | None = Query(default=None, alias="sessionId"),
+    limit: int | None = Query(default=None),
+    offset: int | None = Query(default=None),
+    pool=Depends(get_db_pool),
+):
+    """/ws 순단(blip) 이력, disconnected_at 최신순, OFFSET 페이지네이션 (§4-7)."""
+    limit = mq.clamp_limit(
+        limit, default=wb.BLIPS_LIMIT_DEFAULT, maximum=wb.BLIPS_LIMIT_MAX
+    )
+    offset = mq.clamp_offset(offset)
+    rows, next_offset = await wb.list_blips(
+        pool, session_id=session_id, limit=limit, offset=offset
+    )
+    items = [WsBlip(**dict(r)) for r in rows]
+    return WsBlipListResponse(
+        items=items, limit=limit, offset=offset, nextOffset=next_offset
+    )
+
+
 @app.post('/internal/sessions/start', response_model=StartResponse)
 async def start_session(req: StartRequest, request: Request):
     base_ws_url = request.app.state.get_ws_config['ws_url']
@@ -359,6 +409,22 @@ async def start_session(req: StartRequest, request: Request):
             await ensure_session(pool, req.session_id, req.source_lang, req.target_lang)
         except Exception as e:
             print("start_session: ensure_session failed (ignored):", repr(e))
+
+    # Global monitor event (WU1). Emitted regardless of the DB outcome above —
+    # live visibility must not be hostage to a DB hiccup (D3 principle).
+    # startedAt is server time by decision Q2-a, not the DB-recorded value.
+    monitor_hub: MonitorHub | None = getattr(request.app.state, "monitor_hub", None)
+    if monitor_hub is not None:
+        try:
+            await monitor_hub.broadcast_global({
+                "type": "session_started",
+                "sessionId": req.session_id,
+                "sourceLang": req.source_lang,
+                "targetLang": req.target_lang,
+                "startedAt": datetime.now(UTC).isoformat(),
+            })
+        except Exception as e:
+            print("start_session: event broadcast failed (ignored):", repr(e))
 
     return StartResponse(**{"sessionId": req.session_id, "webSocketUrl": webSocket_url})
 
@@ -394,14 +460,24 @@ async def stop_session(req: StopRequest, request: Request):
     # socket owned by the currently live session.
     await hub.detach(req.session_id)
 
-    # Only the first (transitioning) stop emits the monitor close event.
-    monitor_hub: MonitorHub = getattr(request.app.state, "monitor_hub", None)
+    # Only the first (transitioning) stop emits the monitor close event and
+    # the global session_ended event (WU1) — a duplicate stop emits nothing.
+    monitor_hub: MonitorHub | None = getattr(request.app.state, "monitor_hub", None)
     if ended and monitor_hub is not None:
         await monitor_hub.close_session(req.session_id, {
             "type": "session_closed",
             "sessionId": req.session_id,
             "translationCount": translation_count,
         })
+        try:
+            await monitor_hub.broadcast_global({
+                "type": "session_ended",
+                "sessionId": req.session_id,
+                "translationCount": translation_count,
+                "endedAt": datetime.now(UTC).isoformat(),
+            })
+        except Exception as e:
+            print("stop_session: event broadcast failed (ignored):", repr(e))
 
     return {"ok": True, "ended": ended, "translationCount": translation_count}
 
@@ -459,12 +535,16 @@ async def websocket_endpoint(ws: WebSocket):
             # 다른 메시지 타입은 여기서 처리 (현재는 없음)
             # 실제 데이터 메시지는 여기서 처리됨
 
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as e:
         # §4-3(원인 1): hub 에 즉시 통지해 죽은 소켓을 슬롯에서 비운다.
         # 그래야 이후 번역이 send 시도 대신 pending 으로 큐잉돼 유실되지 않는다.
         # detach 는 pending 을 비우므로 여기서 쓰면 안 된다 — 재접속 flush 로 방류.
-        print('main : websocket disconnected')
-        await hub.handle_client_disconnect(session_id, ws)
+        # §4-7: close code 가 원인 판별의 핵심 — 1001(클라 정상 종료: 절전/
+        # 백그라운드) vs 1006(비정상 단절: 네트워크). ws_blips 로도 기록된다.
+        print(f'main : websocket disconnected code={e.code} reason={e.reason!r}')
+        await hub.handle_client_disconnect(
+            session_id, ws, close_code=e.code, close_reason=e.reason or None
+        )
     except Exception as e:
         print(f'main : websocket error: {e}')
         await hub.detach(session_id)
@@ -496,3 +576,25 @@ async def monitor_endpoint(ws: WebSocket):
         print(f'monitor : websocket error: {e}')
     finally:
         await monitor_hub.detach(session_id, ws)
+
+
+@app.websocket("/ws/monitor/events")
+async def monitor_events_endpoint(ws: WebSocket):
+    """Global monitor event stream (WU1): session lifecycle fan-out.
+
+    Session-agnostic: every subscriber receives ``session_started`` /
+    ``session_ended`` events for all sessions. No backlog — events emitted
+    while disconnected are lost (history comes from ``/api/monitor/sessions``).
+    Read-only: inbound frames are ignored.
+    """
+    monitor_hub: MonitorHub = ws.app.state.monitor_hub
+    await monitor_hub.attach_global(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        print('monitor-events : websocket disconnected')
+    except Exception as e:
+        print(f'monitor-events : websocket error: {e}')
+    finally:
+        await monitor_hub.detach_global(ws)

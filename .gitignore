@@ -40,6 +40,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# Claude Code session state (handoff notes)
+.claude/
+
 # runtime-verify generated audio (regenerate with scripts/verify/gen-audio.sh)
 scripts/verify/audio/
 

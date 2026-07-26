@@ -22,6 +22,10 @@ class MonitorHub:
         self._lock = asyncio.Lock()
         # sessionId -> set of live monitor sockets
         self._subscribers: dict[str, set[WebSocket]] = {}
+        # global event channel (/ws/monitor/events): session-agnostic
+        # subscribers receiving session_started / session_ended events.
+        # Fully isolated from the per-session sets above.
+        self._global_subscribers: set[WebSocket] = set()
 
     async def attach(self, session_id: str, ws: WebSocket) -> None:
         await ws.accept()
@@ -63,6 +67,40 @@ class MonitorHub:
                 dead.append(ws)
         for ws in dead:
             await self.detach(session_id, ws)
+
+    async def attach_global(self, ws: WebSocket) -> None:
+        await ws.accept()
+        async with self._lock:
+            self._global_subscribers.add(ws)
+        print(f"monitor: attached global subs={len(self._global_subscribers)}")
+
+    async def detach_global(self, ws: WebSocket) -> None:
+        async with self._lock:
+            self._global_subscribers.discard(ws)
+
+    async def broadcast_global(self, payload: dict[str, Any]) -> None:
+        """Send ``payload`` to every global event subscriber.
+
+        Same policy as :meth:`broadcast`: dead/closed sockets are dropped
+        silently and never block the others or the caller. No backlog —
+        events emitted while nobody is connected are simply lost.
+        """
+        async with self._lock:
+            subs = list(self._global_subscribers)
+        if not subs:
+            return
+        dead: list[WebSocket] = []
+        for ws in subs:
+            try:
+                if ws.application_state == WebSocketState.CONNECTED:
+                    await ws.send_json(payload)
+                else:
+                    dead.append(ws)
+            except Exception as e:
+                print("monitor: global send failed (dropping subscriber):", repr(e))
+                dead.append(ws)
+        for ws in dead:
+            await self.detach_global(ws)
 
     async def close_session(
         self, session_id: str, payload: dict[str, Any] | None = None
