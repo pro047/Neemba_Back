@@ -1,0 +1,12 @@
+{
+  "name": "neemba-monitor-frontend",
+  "private": true,
+  "description": "번역 모니터 페이지 — tsc 단일 출력, 번들러 없음, 산출물(app.js) 커밋 (D7)",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

@@ -122,7 +122,7 @@
 |----|------|----------|------|
 | WU1 | 완료 | 2026-07-25 | pytest 111 통과 + dev compose 이벤트 수신 검증. PR #55 머지, 2026-07-26 release #57로 prod 배포 완료 |
 | WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
-| WU3 | 대기 | — | |
+| WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
 | WU4 | 대기 | — | |
 | WU5 | 대기 | — | |
 
@@ -162,3 +162,20 @@
   재사용 세션은 live로 안 보이고 stop도 no-op(`ended:false`). WU4 LIVE
   배지·WU5에서 영향 검토 필요. 다음 세션:
   `neemba/docs/monitor-page-v2-plan.md 읽고 WU3 진행해`
+- 2026-07-26 (WU3 세션): TS 마이그레이션 (관용적 TS 스타일, 동작 불변).
+  변경: `infra/nginx/html/monitor/src/app.ts` 신규(계약 타입 포함 — WU2의
+  id/createdAt/lastTranslationAt도 타입에 선언, 사용은 WU4),
+  `tsconfig.json`(ES2022·strict·`types:[]`·outDir `.`), `package.json`+lock
+  (typescript ^5.9.2만), `app.js`는 이제 빌드 산출물(직접 수정 금지,
+  `npm run build`). 세션 시작 시 브랜치 정리: WU2 브랜치를 develop에
+  ff-merge·push 후 피처 브랜치 삭제(사용자 지시), WU3 브랜치는 develop에서
+  분기. 검증: `tsc --noEmit` 무오류, 헤드리스 Chrome(puppeteer-core)으로
+  ① 세션 목록 27개 렌더 ② 이력 8행 ③ 라이브 WS 연결·`session_closed` 전이
+  ④ 검색 6행 + 콘솔 오류 없음(favicon 404는 기존과 동일) 확인.
+  다음 세션 주의: dev nginx 컨테이너에는 html 마운트·htpasswd가 없어
+  `/monitor` 페이지를 nginx 경유로 못 봄 → 검증은 socat 브리지
+  (`docker run --rm -d --name wu3-py-bridge --network neemba_appnet -p
+  18000:8000 alpine/socat tcp-listen:8000,fork,reuseaddr tcp:python:8000`)
+  + 로컬 정적/프록시 서버로 수행했음(WU4도 동일 방법 권장). 검증용 세션
+  `wu3-verify-live-01`(종료됨)이 dev DB에 남아 있음. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU4 진행해`
