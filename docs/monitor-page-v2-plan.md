@@ -92,7 +92,12 @@
   last_broadcast 경과) 직접 + node `/metrics` 내부 HTTP로 수집(stt_paused,
   rtmp_auth_enabled, buffer_size) → 통합 JSON. node 수집 실패는 `nodeUp:false`로 표시.
 - 프런트 상단 상태 칩 바 (10s 폴링). 세션 상세에 분당 번역 건수·마지막 수신 경과 표시.
-- 완료 기준: dev compose에서 상태 칩 정상 표시, node 컨테이너 중지 시 nodeUp:false 확인.
+- **순단 이력 섹션 (2026-07-26 추가 확정)**: `ws_blips` 테이블 조회로 /ws 순단 이력
+  (끊긴 시각·지속 초·flush/유실 건수·close code) 표시. 데이터 기록+조회 API는
+  handover §4-7 소PR(이 계획 밖, monitor-v2보다 먼저)에서 선행 — WU5는 화면 노출만.
+  라이브 `ws_blip` 이벤트의 전역 채널(WU1) 발행 여부는 WU5 세션에서 결정.
+- 완료 기준: dev compose에서 상태 칩 정상 표시, node 컨테이너 중지 시 nodeUp:false 확인,
+  ws_probe 강제 절단으로 순단 이력 행 등장 확인.
 
 의존 관계: WU1 → WU2 → WU3 → WU4 → WU5 (WU3은 WU1·2와 병행 가능하나
 세션 분리 원칙상 순차 진행).

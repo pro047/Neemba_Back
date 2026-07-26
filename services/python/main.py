@@ -29,7 +29,9 @@ from src.repository.implementation.translation_repository import (
     ensure_session,
     end_session,
 )
+from src.repository.implementation import ws_blip_repository as wb
 from src.separator.kss_separator import SentenceSeparator
+from src.ws.blip_recorder import WsBlipRecorder
 from src.ws.monitor import MonitorHub
 from src.ws.websocket import WebSocketHub
 
@@ -63,7 +65,8 @@ async def lifespan(app: FastAPI):
 
         deepl_api = app.state.deepl_config['deepl_api_key']
 
-        hub = WebSocketHub()
+        # §4-7 순단 계측: /ws 끊김·재접속을 ws_blips 에 기록 (DB 실패는 recorder 가 격리)
+        hub = WebSocketHub(blip_recorder=WsBlipRecorder(app.state.db_pool))
         monitor_hub = MonitorHub()
         translator = DeeplTranslationService(deepl_api)
         pusher = Pusher(hub, monitor_hub=monitor_hub, db_pool=app.state.db_pool)
@@ -211,6 +214,32 @@ class TranslationSearchResponse(BaseModel):
     next_cursor: str | None = Field(default=None, alias="nextCursor")
 
 
+class WsBlip(BaseModel):
+    # §4-7 순단 계측. reconnected_at NULL = 미복귀. close_code/close_reason 은
+    # 클라 close frame 값(서버발 감지면 NULL), detected_by 로 감지 주체 구분.
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int
+    session_id: str = Field(alias="sessionId")
+    disconnected_at: datetime = Field(alias="disconnectedAt")
+    reconnected_at: datetime | None = Field(default=None, alias="reconnectedAt")
+    duration_ms: int | None = Field(default=None, alias="durationMs")
+    flushed_count: int | None = Field(default=None, alias="flushedCount")
+    lost_count: int | None = Field(default=None, alias="lostCount")
+    close_code: int | None = Field(default=None, alias="closeCode")
+    close_reason: str | None = Field(default=None, alias="closeReason")
+    detected_by: str = Field(alias="detectedBy")
+
+
+class WsBlipListResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[WsBlip]
+    limit: int
+    offset: int
+    next_offset: int | None = Field(default=None, alias="nextOffset")
+
+
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
@@ -341,6 +370,27 @@ async def monitor_translations_search(
     items = [TranslationSearchItem(**dict(r)) for r in rows]
     return TranslationSearchResponse(
         items=items, limit=limit, next_cursor=next_cursor
+    )
+
+
+@app.get('/api/monitor/ws-blips', response_model=WsBlipListResponse)
+async def monitor_ws_blips(
+    session_id: str | None = Query(default=None, alias="sessionId"),
+    limit: int | None = Query(default=None),
+    offset: int | None = Query(default=None),
+    pool=Depends(get_db_pool),
+):
+    """/ws 순단(blip) 이력, disconnected_at 최신순, OFFSET 페이지네이션 (§4-7)."""
+    limit = mq.clamp_limit(
+        limit, default=wb.BLIPS_LIMIT_DEFAULT, maximum=wb.BLIPS_LIMIT_MAX
+    )
+    offset = mq.clamp_offset(offset)
+    rows, next_offset = await wb.list_blips(
+        pool, session_id=session_id, limit=limit, offset=offset
+    )
+    items = [WsBlip(**dict(r)) for r in rows]
+    return WsBlipListResponse(
+        items=items, limit=limit, offset=offset, nextOffset=next_offset
     )
 
 
@@ -485,12 +535,16 @@ async def websocket_endpoint(ws: WebSocket):
             # 다른 메시지 타입은 여기서 처리 (현재는 없음)
             # 실제 데이터 메시지는 여기서 처리됨
 
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as e:
         # §4-3(원인 1): hub 에 즉시 통지해 죽은 소켓을 슬롯에서 비운다.
         # 그래야 이후 번역이 send 시도 대신 pending 으로 큐잉돼 유실되지 않는다.
         # detach 는 pending 을 비우므로 여기서 쓰면 안 된다 — 재접속 flush 로 방류.
-        print('main : websocket disconnected')
-        await hub.handle_client_disconnect(session_id, ws)
+        # §4-7: close code 가 원인 판별의 핵심 — 1001(클라 정상 종료: 절전/
+        # 백그라운드) vs 1006(비정상 단절: 네트워크). ws_blips 로도 기록된다.
+        print(f'main : websocket disconnected code={e.code} reason={e.reason!r}')
+        await hub.handle_client_disconnect(
+            session_id, ws, close_code=e.code, close_reason=e.reason or None
+        )
     except Exception as e:
         print(f'main : websocket error: {e}')
         await hub.detach(session_id)
