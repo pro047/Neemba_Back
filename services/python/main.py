@@ -26,8 +26,9 @@ from src.deepL.deepL import DeeplTranslationService
 from src.pushClient.pusher import Pusher
 from src.repository.implementation import monitor_query_repository as mq
 from src.repository.implementation.translation_repository import (
-    ensure_session,
+    close_stale_sessions,
     end_session,
+    ensure_session_with_retry,
 )
 from src.repository.implementation import ws_blip_repository as wb
 from src.separator.kss_separator import SentenceSeparator
@@ -62,6 +63,17 @@ async def lifespan(app: FastAPI):
         app.state.db = db
         app.state.db_pool = await db.create_pool()
         print(">>> lifespan : db pool created")
+
+        # D4-a (monitor-page-v2): sessions left ended_at IS NULL are ghosts of
+        # the previous process (lost stop / crash) — stamp them ended so the
+        # monitor list shows no phantom LIVE badge. Isolated: a DB hiccup here
+        # must not block startup.
+        try:
+            stale = await close_stale_sessions(app.state.db_pool)
+            if stale:
+                print(f">>> lifespan : closed {len(stale)} stale session(s): {stale}")
+        except Exception as e:
+            print("lifespan: close_stale_sessions failed (ignored):", repr(e))
 
         deepl_api = app.state.deepl_config['deepl_api_key']
 
@@ -166,6 +178,10 @@ class MonitorSession(BaseModel):
     source_lang: str | None = Field(default=None, alias="sourceLang")
     target_lang: str | None = Field(default=None, alias="targetLang")
     translation_count: int = Field(alias="translationCount")
+    # MAX(translations.created_at) — WU2: STALE 배지·미니 통계용. 번역 0건이면 NULL.
+    last_translation_at: datetime | None = Field(
+        default=None, alias="lastTranslationAt"
+    )
     # ended_at IS NULL ⇒ still running (docs §7 Phase 5: 라이브/종료 구분).
     live: bool
 
@@ -402,11 +418,15 @@ async def start_session(req: StartRequest, request: Request):
     print('ws url', webSocket_url)
 
     # Create the session row up front so ended_at always has a target on stop.
-    # Isolated: a DB hiccup must not fail the session start signal.
+    # Retried (WU2) because a lost row here means the session may never appear
+    # in the monitor list; still isolated — a DB outage must not fail the
+    # session start signal (failures land on the ensure_session_failed metric).
     pool = getattr(request.app.state, "db_pool", None)
     if pool is not None:
         try:
-            await ensure_session(pool, req.session_id, req.source_lang, req.target_lang)
+            await ensure_session_with_retry(
+                pool, req.session_id, req.source_lang, req.target_lang
+            )
         except Exception as e:
             print("start_session: ensure_session failed (ignored):", repr(e))
 

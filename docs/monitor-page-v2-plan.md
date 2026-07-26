@@ -121,7 +121,7 @@
 | WU | 상태 | 세션 일자 | 비고 |
 |----|------|----------|------|
 | WU1 | 완료 | 2026-07-25 | pytest 111 통과 + dev compose 이벤트 수신 검증. PR #55 머지, 2026-07-26 release #57로 prod 배포 완료 |
-| WU2 | 대기 | — | |
+| WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
 | WU3 | 대기 | — | |
 | WU4 | 대기 | — | |
 | WU5 | 대기 | — | |
@@ -140,3 +140,25 @@
   컨테이너의 `docker logs`가 2026-07-18에서 멈춰 있음(프로세스는 정상,
   uvicorn reload도 동작) — 로그 드라이버 이상 의심, WU 범위 밖이라 미조치.
   다음 세션: `neemba/docs/monitor-page-v2-plan.md 읽고 WU2 진행해`
+- 2026-07-26 (WU2 세션): 캡처 경로 개편 + 세션 정합성. 변경:
+  `translation_repository.py`(insert `RETURNING id, created_at` 반환,
+  `ensure_session_with_retry`(2회 재시도·백오프 0.1s→0.2s),
+  `close_stale_sessions`(D4-a, translation_count 재계산 포함)),
+  `pusher.py`(`_capture` 순서 역전: insert→broadcast, payload에 id/createdAt
+  — insert 실패·pool 부재 시 null로 항상 포함(안정 shape)),
+  `metrics.py`(`neemba_ensure_session_failed_total`, 실패 시도당 1 증가),
+  `main.py`(lifespan 기동 시 stale 세션 일괄 종료, start 핸들러 재시도 적용,
+  `MonitorSession.lastTranslationAt`),
+  `monitor_query_repository.py`(세션 목록에 `last_translation_at` 상관 서브쿼리).
+  테스트: **테스트 DB 도입**(사용자 결정) — `tests/conftest.py`가 일회용
+  `postgres:16-alpine` 컨테이너(호스트 54329) 기동 + alembic upgrade head,
+  테스트마다 TRUNCATE. 장애 주입만 실 pool 래퍼, 성공 경로는 실 DB.
+  `tests/test_capture_db.py` 신규(11개). 검증: pytest 135 통과, ruff 클린
+  (main.py I001·F841 2건, pusher.py I001은 기존 위반으로 미조치), dev
+  compose에서 `/ws/monitor` payload에 id=222/createdAt 수신,
+  `lastTranslationAt` 일치, reload 기동 시 유령 세션 4건 일괄 종료 확인.
+  범위 밖 발견: 동일 sessionId 재사용(start) 시 `ensure_session`이
+  DO NOTHING이라 이미 종료된 세션의 `ended_at`이 NULL로 리셋되지 않음 →
+  재사용 세션은 live로 안 보이고 stop도 no-op(`ended:false`). WU4 LIVE
+  배지·WU5에서 영향 검토 필요. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU3 진행해`

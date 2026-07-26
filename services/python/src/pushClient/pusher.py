@@ -5,7 +5,7 @@ from deepl import TextResult
 
 from src.masking import mask_text
 from src.repository.implementation.translation_repository import (
-    ensure_session,
+    ensure_session_with_retry,
     insert_translation,
 )
 from src.ws.monitor import MonitorHub
@@ -103,6 +103,39 @@ class Pusher:
             masked_source = mask_text(source_text)
             masked_translated = mask_text(translated_text)
 
+            # Persist the masked pair first (mask-at-write) so the monitor
+            # payload can carry the DB-assigned id/created_at (D3: the frontend
+            # needs them for history↔live dedup and gap fill). An insert
+            # failure falls through to an id-less broadcast — live monitoring
+            # is never hostage to a DB outage.
+            persisted: tuple[int, Any] | None = None
+            pool = self._db_pool
+            if pool is not None:
+                if session_id not in self._ensured_sessions:
+                    try:
+                        await ensure_session_with_retry(
+                            pool, session_id, source_lang, target_lang
+                        )
+                        self._ensured_sessions.add(session_id)
+                    except Exception as e:
+                        # Still try the insert: the session row may already
+                        # exist from the start handler's upsert.
+                        print("pusher: ensure_session failed (ignored):", repr(e))
+                try:
+                    persisted = await insert_translation(
+                        pool,
+                        session_id=session_id,
+                        source_text=masked_source or "",
+                        translated_text=masked_translated or "",
+                        segment_id=segment_id,
+                        sequence=sequence,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        confidence=confidence,
+                    )
+                except Exception as e:
+                    print("pusher: insert failed (id-less broadcast):", repr(e))
+
             payload = {
                 "type": "translation",
                 "sessionId": session_id,
@@ -113,29 +146,13 @@ class Pusher:
                 "sourceLang": source_lang,
                 "targetLang": target_lang,
                 "confidence": confidence,
+                # Stable shape: null when the insert failed or no DB pool.
+                "id": persisted[0] if persisted else None,
+                "createdAt": persisted[1].isoformat() if persisted else None,
             }
 
-            # Live monitor fan-out (masked) before the DB write.
             if self.monitor_hub is not None:
                 await self.monitor_hub.broadcast(session_id, payload)
-
-            # Persist the masked pair (mask-at-write).
-            pool = self._db_pool
-            if pool is not None:
-                if session_id not in self._ensured_sessions:
-                    await ensure_session(pool, session_id, source_lang, target_lang)
-                    self._ensured_sessions.add(session_id)
-                await insert_translation(
-                    pool,
-                    session_id=session_id,
-                    source_text=masked_source or "",
-                    translated_text=masked_translated or "",
-                    segment_id=segment_id,
-                    sequence=sequence,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    confidence=confidence,
-                )
         except Exception as e:
             # Capture failures never touch the translation/broadcast path.
             print("pusher: capture failed (ignored):", repr(e))
