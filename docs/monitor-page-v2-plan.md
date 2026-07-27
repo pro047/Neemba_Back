@@ -123,7 +123,7 @@
 | WU1 | 완료 | 2026-07-25 | pytest 111 통과 + dev compose 이벤트 수신 검증. PR #55 머지, 2026-07-26 release #57로 prod 배포 완료 |
 | WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
 | WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
-| WU4 | 대기 | — | |
+| WU4 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome 15개 시나리오 검증 (start 자동 등장·자동 라이브·재연결 gap fill·STALE·이벤트 채널 복구) |
 | WU5 | 대기 | — | |
 
 ## 7. 세션 로그
@@ -179,3 +179,30 @@
   + 로컬 정적/프록시 서버로 수행했음(WU4도 동일 방법 권장). 검증용 세션
   `wu3-verify-live-01`(종료됨)이 dev DB에 남아 있음. 다음 세션:
   `neemba/docs/monitor-page-v2-plan.md 읽고 WU4 진행해`
+- 2026-07-26 (WU4 세션): 프런트 실시간 기능 (백엔드 무변경). 변경:
+  `infra/nginx/html/monitor/src/app.ts`(세션 목록 `Map<sessionId, 행>` 리팩터,
+  공용 재연결 WS 헬퍼(백오프 1s→2s→…→30s, open 시 리셋), `/ws/monitor/events`
+  상시 구독 — started→상단 삽입+LIVE(기존 행이면 LIVE 전환+상단 이동),
+  ended→배지·건수·상세 메타 갱신, 재연결 성공 시 목록 REST 1회 재조회,
+  D5 자동 라이브(선택 시 `startLive`, 이력도 syncLive가 처음부터 로드),
+  세션 WS 재연결+gap fill(`cursor=마지막 수신 id`로 nextCursor 소진까지,
+  `seenIds` dedup, fill 중 라이브 수신은 버퍼링 후 flush), STALE 배지
+  (목록 행+상세 헤더, 10s 타이머 재평가, 선택 세션은 라이브 수신 즉시 갱신)),
+  `style.css`(`--stale`·`.badge.stale`), `app.js` 재빌드. 검증: `tsc --noEmit`
+  무오류, socat 브리지+로컬 WS 프록시(강제 절단/차단 스위치 포함)+헤드리스
+  Chrome으로 15개 시나리오 전부 통과 — start→목록 자동 등장, 선택→자동
+  라이브·수신, WS 차단 중 2건 주입→재연결 후 gap fill 정확 행수(중복 없음),
+  stop→배지·건수 전환, 이벤트 채널 차단 중 start→복구 시 재조회로 등장·선택
+  하이라이트 유지, STALE(목록·상세). NATS 직접 주입(`transcript.session.*`)으로
+  실 번역 파이프라인 사용. 범위 밖 발견: 없음(WU2의 sessionId 재사용 이슈는
+  결정 2대로 이벤트 신뢰로 처리, 백엔드 미조치 그대로). 검증용 세션
+  `wu4-live-*`(모두 종료)가 dev DB에 잔존, STALE 검증용 세션은 삭제함.
+  커밋 전 코드 리뷰(워크플로)에서 실버그 6건 발견·수정: ① 전역 session_ended가
+  라이브 재연결 루프 미중단(끊긴 사이 종료 시 무한 재연결) → 전역 이벤트·재조회
+  경로에서 stopLive ② 재조회가 loading 중이면 복구 재조회 소실 → reloadQueued
+  ③ 재조회 병합으로 종료 판명 시 상세 헤더 "진행중" 고착 → 헤더 재렌더
+  ④ sessionId 재시작 시 이전 런 lastTranslationAt로 STALE 오탐 → null 리셋
+  ⑤ gap fill 행이 lastTranslationAt 미갱신 → fill에서 갱신 ⑥ 같은 세션 빠른
+  재선택 시 이전 fill 루프 늦은 fetch 개입 → epoch 가드. 수정 후 회귀 시나리오
+  (WS 절단 중 stop→전역 이벤트로 라이브 중단) 추가해 15/15 재통과. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해`
