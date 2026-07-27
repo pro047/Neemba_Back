@@ -12,6 +12,7 @@
 //   GET /api/monitor/sessions/{id}/translations?cursor= -> HistoryResponse
 //   GET /api/monitor/translations?lang=&from=&to=&q=    -> SearchResponse
 //   WS  /ws/monitor?sessionId=<id>                      -> WsMessage
+//   WS  /ws/monitor/events                              -> EventsMessage
 // ====================================================================
 
 interface SessionItem {
@@ -82,6 +83,24 @@ interface WsSessionClosed {
 
 type WsMessage = WsTranslation | WsSessionClosed;
 
+/** WU1 전역 이벤트 채널. read-only, 백로그 없음(끊긴 동안 이벤트 유실). */
+interface EventSessionStarted {
+  type: "session_started";
+  sessionId: string;
+  sourceLang: string | null;
+  targetLang: string | null;
+  startedAt: string;
+}
+
+interface EventSessionEnded {
+  type: "session_ended";
+  sessionId: string;
+  translationCount: number | null;
+  endedAt: string;
+}
+
+type EventsMessage = EventSessionStarted | EventSessionEnded;
+
 /** pairRow가 렌더에 실제로 쓰는 필드 (이력 행·라이브 메시지 공용). */
 interface PairLike {
   sequence: number | null;
@@ -141,6 +160,94 @@ interface PairLike {
     return res.json() as Promise<T>;
   }
 
+  // ---- 자동 재연결 WebSocket 헬퍼 --------------------------------------
+  const RECONNECT_BASE_MS = 1_000;
+  const RECONNECT_MAX_MS = 30_000;
+  /** D4-b: live인데 마지막 번역 후 180s 무활동이면 STALE (사이드카 GAP 기준과 정렬). */
+  const STALE_THRESHOLD_MS = 180_000;
+  const STALE_TICK_MS = 10_000;
+
+  function wsUrl(path: string): string {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${location.host}${path}`;
+  }
+
+  interface ReconnectingWs {
+    /** 재연결 타이머까지 취소하고 완전히 닫는다 (이후 재시도 없음). */
+    close(): void;
+  }
+
+  /** 지수 백오프(1s→2s→4s…최대 30s, open 성공 시 리셋) 재연결 WebSocket. */
+  function connectReconnecting(opts: {
+    url: () => string;
+    /** resumed=true면 끊김(또는 실패한 시도) 후의 회복 open. */
+    onOpen: (resumed: boolean) => void;
+    /** JSON 파싱까지 끝난 메시지. 파싱 불가 프레임은 무시된다. */
+    onMessage: (msg: unknown) => void;
+    onDown: (retryDelayMs: number) => void;
+  }): ReconnectingWs {
+    let ws: WebSocket | null = null;
+    let timer: number | null = null;
+    let attempt = 0;
+    let resumed = false;
+    let closed = false;
+
+    function scheduleRetry(): void {
+      const delayMs = Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_MAX_MS);
+      attempt += 1;
+      resumed = true;
+      opts.onDown(delayMs);
+      timer = window.setTimeout(connect, delayMs);
+    }
+
+    function connect(): void {
+      if (closed) return;
+      timer = null;
+      let sock: WebSocket;
+      try {
+        sock = new WebSocket(opts.url());
+      } catch {
+        scheduleRetry();
+        return;
+      }
+      ws = sock;
+      sock.onopen = () => {
+        if (closed) return;
+        attempt = 0; // 백오프 리셋
+        const wasResumed = resumed;
+        resumed = true; // 다음 open부터는 항상 회복으로 취급
+        opts.onOpen(wasResumed);
+      };
+      sock.onmessage = (ev: MessageEvent) => {
+        if (closed) return;
+        let msg: unknown;
+        try { msg = JSON.parse(String(ev.data)); } catch { return; }
+        opts.onMessage(msg);
+      };
+      sock.onerror = () => { /* onclose가 뒤따르므로 여기선 무시 */ };
+      sock.onclose = () => {
+        ws = null;
+        if (closed) return;
+        scheduleRetry();
+      };
+    }
+
+    connect();
+    return {
+      close(): void {
+        closed = true;
+        if (timer != null) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        if (ws) {
+          try { ws.close(); } catch { /* noop */ }
+          ws = null;
+        }
+      },
+    };
+  }
+
   // ====================================================================
   // 탭 전환
   // ====================================================================
@@ -157,25 +264,41 @@ interface PairLike {
   // ====================================================================
   // 세션 목록
   // ====================================================================
+  interface SessionRowEntry {
+    li: HTMLLIElement;
+    btn: HTMLButtonElement;
+    /** 이벤트·재조회 시 이 객체를 제자리 병합(mutate)해 참조 공유를 유지한다. */
+    session: SessionItem;
+  }
+
   const sessionsState = {
     offset: 0,
     nextOffset: null as number | null,
     loading: false,
+    reloadQueued: false, // 로딩 중 들어온 복구 재조회를 잃지 않고 이어서 실행
     selectedId: null as string | null,
+    rows: new Map<string, SessionRowEntry>(), // sessionId → 행 (이벤트로 개별 갱신)
   };
 
-  function sessionRow(s: SessionItem): HTMLLIElement {
-    const li = el("li");
-    const btn = el("button", { className: "session-item" });
-    btn.type = "button";
-    btn.dataset.sessionId = s.sessionId;
+  function isStale(s: SessionItem): boolean {
+    if (!s.live || !s.lastTranslationAt) return false;
+    const t = new Date(s.lastTranslationAt).getTime();
+    if (isNaN(t)) return false;
+    return Date.now() - t > STALE_THRESHOLD_MS;
+  }
+
+  function sessionBadge(s: SessionItem): HTMLSpanElement {
+    if (s.live && isStale(s)) return el("span", { className: "badge stale", text: "STALE" });
+    if (s.live) return el("span", { className: "badge live", text: "LIVE" });
+    return el("span", { className: "badge ended", text: "종료" });
+  }
+
+  function renderSessionRow(entry: SessionRowEntry): void {
+    const s = entry.session;
+    clear(entry.btn);
 
     const sid = el("div", { className: "sid", text: s.sessionId });
-    const badge = el("span", {
-      className: "badge " + (s.live ? "live" : "ended"),
-      text: s.live ? "LIVE" : "종료",
-    });
-    sid.appendChild(badge);
+    sid.appendChild(sessionBadge(s));
 
     const sub = el("div", { className: "sub" });
     sub.textContent =
@@ -183,18 +306,49 @@ interface PairLike {
       "  ·  " + langPair(s.sourceLang, s.targetLang) +
       "  ·  " + (s.translationCount != null ? s.translationCount : 0) + "건";
 
-    btn.appendChild(sid);
-    btn.appendChild(sub);
-    btn.addEventListener("click", () => selectSession(s, btn));
+    entry.btn.appendChild(sid);
+    entry.btn.appendChild(sub);
+    entry.btn.classList.toggle("selected", s.sessionId === sessionsState.selectedId);
+  }
+
+  function makeSessionRow(s: SessionItem): SessionRowEntry {
+    const li = el("li");
+    const btn = el("button", { className: "session-item" });
+    btn.type = "button";
+    btn.dataset.sessionId = s.sessionId;
     li.appendChild(btn);
-    return li;
+    const entry: SessionRowEntry = { li, btn, session: s };
+    // entry.session은 제자리 병합되므로 클릭 시점의 최신 데이터로 선택된다.
+    btn.addEventListener("click", () => selectSession(entry.session, btn));
+    renderSessionRow(entry);
+    return entry;
+  }
+
+  /** 선택 중 세션과 같은 id면 기존 객체에 병합 — 목록 행·상세 뷰가 같은 객체를 보게 유지. */
+  function adoptSession(s: SessionItem): SessionItem {
+    if (detail.session && detail.session.sessionId === s.sessionId) {
+      Object.assign(detail.session, s);
+      return detail.session;
+    }
+    return s;
+  }
+
+  function renderSessionsCount(): void {
+    $("sessions-status").textContent =
+      $("session-list").children.length + "개 세션" +
+      (sessionsState.nextOffset != null ? " (더 있음)" : "");
   }
 
   function loadSessions(reset: boolean): void {
-    if (sessionsState.loading) return;
+    if (sessionsState.loading) {
+      // 재조회(reset)는 놓친 이벤트 복구용이라 버리면 안 됨 — 끝나고 이어서 실행.
+      if (reset) sessionsState.reloadQueued = true;
+      return;
+    }
     sessionsState.loading = true;
     if (reset) {
       sessionsState.offset = 0;
+      sessionsState.rows.clear();
       clear($("session-list"));
     }
     $("sessions-status").textContent = "불러오는 중…";
@@ -202,20 +356,42 @@ interface PairLike {
     fetchJson<SessionsResponse>(url)
       .then((data) => {
         const list = $("session-list");
-        (data.items ?? []).forEach((s) => {
-          list.appendChild(sessionRow(s));
+        (data.items ?? []).forEach((raw) => {
+          const existing = sessionsState.rows.get(raw.sessionId);
+          if (existing) {
+            // 이벤트로 먼저 삽입된 행 — 자리는 유지하고 데이터만 갱신 (offset 중복 방지).
+            Object.assign(existing.session, raw);
+            renderSessionRow(existing);
+            return;
+          }
+          const entry = makeSessionRow(adoptSession(raw));
+          sessionsState.rows.set(raw.sessionId, entry);
+          list.appendChild(entry.li);
         });
         sessionsState.nextOffset = data.nextOffset != null ? data.nextOffset : null;
         $("sessions-more").hidden = sessionsState.nextOffset == null;
-        $("sessions-status").textContent =
-          list.children.length + "개 세션" +
-          (sessionsState.nextOffset != null ? " (더 있음)" : "");
+        renderSessionsCount();
+        // 재조회로 선택 세션이 종료로 판명되면(놓친 session_ended) 라이브 중단.
+        if (detail.session && !detail.session.live && (detail.liveOn || detail.live)) {
+          $("detail-status").textContent =
+            "세션 종료됨 (" +
+            (detail.session.translationCount != null
+              ? detail.session.translationCount
+              : "?") +
+            "건)";
+          stopLive();
+        }
+        renderDetailHeader(); // 병합된 최신 데이터로 상세 헤더 동기화
       })
       .catch((err: Error) => {
         $("sessions-status").textContent = "오류: " + err.message;
       })
       .finally(() => {
         sessionsState.loading = false;
+        if (sessionsState.reloadQueued) {
+          sessionsState.reloadQueued = false;
+          loadSessions(true);
+        }
       });
   }
 
@@ -234,17 +410,28 @@ interface PairLike {
     session: null as SessionItem | null,
     cursor: null as number | null, // 이력 페이지네이션 (정수 id)
     loading: false,
-    ws: null as WebSocket | null, // 라이브 WebSocket
+    live: null as ReconnectingWs | null, // 라이브 WebSocket (자동 재연결)
     liveOn: false,
-    seenIds: new Set<number>(), // 이력 행 중복 방지
+    seenIds: new Set<number>(), // 이력·라이브 행 중복 방지 (id 기반)
+    lastId: null as number | null, // 마지막 수신 id — gap fill 기준
+    filling: false, // gap fill 진행 중이면 라이브 수신은 버퍼링
+    refillQueued: false, // fill 도중 재연결 → 종료 후 한 번 더
+    fillBuffer: [] as WsTranslation[],
+    // 세션 전환·라이브 중지마다 증가 — 같은 세션을 빠르게 재선택해도
+    // 이전 fill 루프의 늦은 fetch가 새 뷰에 끼어들지 못하게 무효화한다.
+    epoch: 0,
   };
 
   function closeLive(): void {
-    if (detail.ws) {
-      try { detail.ws.close(); } catch { /* noop */ }
-      detail.ws = null;
+    if (detail.live) {
+      detail.live.close();
+      detail.live = null;
     }
     detail.liveOn = false;
+    detail.filling = false;
+    detail.refillQueued = false;
+    detail.fillBuffer = [];
+    detail.epoch += 1;
   }
 
   function pairRow(p: PairLike, opts?: { flash?: boolean }): HTMLTableRowElement {
@@ -262,34 +449,48 @@ interface PairLike {
     return tr;
   }
 
+  /** 상세 헤더(제목+STALE 배지·메타·라이브 토글 노출)를 detail.session 기준으로 재렌더. */
+  function renderDetailHeader(): void {
+    const s = detail.session;
+    if (!s) return;
+    const title = $("detail-title");
+    title.textContent = s.sessionId;
+    if (s.live && isStale(s)) {
+      title.appendChild(el("span", { className: "badge stale", text: "STALE" }));
+    }
+    $("detail-meta").textContent =
+      langPair(s.sourceLang, s.targetLang) +
+      "  ·  시작 " + fmtTime(s.startedAt) +
+      (s.endedAt ? "  ·  종료 " + fmtTime(s.endedAt) : "  ·  진행중") +
+      "  ·  " + (s.translationCount != null ? s.translationCount : 0) + "건";
+    // live(ended_at IS NULL) 세션이면 라이브 토글 노출. 수신 중(liveOn)엔 중지용으로 유지.
+    $("live-toggle").hidden = !s.live && !detail.liveOn;
+  }
+
   function selectSession(s: SessionItem, btnEl: HTMLButtonElement): void {
+    closeLive(); // 이전 세션의 라이브·재연결 중단
     detail.session = s;
     detail.cursor = null;
     detail.seenIds = new Set();
-    closeLive();
+    detail.lastId = null;
 
     sessionsState.selectedId = s.sessionId;
     document.querySelectorAll<HTMLButtonElement>(".session-item").forEach((b) => {
       b.classList.toggle("selected", b === btnEl);
     });
 
-    $("detail-title").textContent = s.sessionId;
     $("detail-controls").hidden = false;
-    $("detail-meta").textContent =
-      langPair(s.sourceLang, s.targetLang) +
-      "  ·  시작 " + fmtTime(s.startedAt) +
-      (s.endedAt ? "  ·  종료 " + fmtTime(s.endedAt) : "  ·  진행중") +
-      "  ·  " + (s.translationCount != null ? s.translationCount : 0) + "건";
-
-    // live(ended_at IS NULL) 세션이면 라이브 토글 노출, 종료 세션이면 이력만.
-    const liveBtn = $("live-toggle");
-    liveBtn.hidden = !s.live;
-    liveBtn.textContent = "라이브 시작";
+    $("live-toggle").textContent = "라이브 시작";
     $("detail-mode-label").textContent = "이력";
     $("detail-mode-label").className = "mode-label";
+    renderDetailHeader();
 
     clear($("detail-rows"));
-    loadHistory(true);
+    if (s.live) {
+      startLive(); // D5: live 세션은 자동 구독 — 이력도 syncLive가 처음부터 채운다
+    } else {
+      loadHistory(true);
+    }
   }
 
   function loadHistory(reset: boolean): void {
@@ -311,6 +512,7 @@ interface PairLike {
         (data.items ?? []).forEach((p) => {
           if (detail.seenIds.has(p.id)) return;
           detail.seenIds.add(p.id);
+          if (detail.lastId == null || p.id > detail.lastId) detail.lastId = p.id;
           body.appendChild(pairRow(p));
         });
         detail.cursor = data.nextCursor != null ? data.nextCursor : null;
@@ -331,22 +533,10 @@ interface PairLike {
     if (detail.cursor != null) loadHistory(false);
   });
 
-  // ---- 라이브 (WebSocket) --------------------------------------------
+  // ---- 라이브 (WebSocket, 자동 재연결 + gap fill) -----------------------
   function startLive(): void {
-    if (!detail.session || detail.ws) return;
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url =
-      `${proto}//${location.host}` +
-      `/ws/monitor?sessionId=${encodeURIComponent(detail.session.sessionId)}`;
-
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(url);
-    } catch (e) {
-      $("detail-status").textContent = "라이브 연결 실패: " + (e as Error).message;
-      return;
-    }
-    detail.ws = ws;
+    if (!detail.session || detail.live) return;
+    const sess = detail.session;
     detail.liveOn = true;
     $("detail-more").hidden = true;
     $("live-toggle").textContent = "라이브 중지";
@@ -354,55 +544,152 @@ interface PairLike {
     $("detail-mode-label").className = "mode-label live";
     $("detail-status").textContent = "라이브 연결 중…";
 
-    ws.onopen = () => {
-      $("detail-status").textContent = "라이브 수신 중";
-    };
-    ws.onmessage = (ev: MessageEvent) => {
-      let msg: unknown;
-      try { msg = JSON.parse(String(ev.data)); } catch { return; }
-      if (!msg || typeof msg !== "object") return;
-      const m = msg as WsMessage;
-      if (m.type === "session_closed") {
+    detail.live = connectReconnecting({
+      url: () => wsUrl(`/ws/monitor?sessionId=${encodeURIComponent(sess.sessionId)}`),
+      onOpen: () => {
+        if (detail.session !== sess || !detail.liveOn) return;
+        $("detail-status").textContent = "라이브 수신 중";
+        void syncLive(); // 최초 연결·재연결 공통 — lastId 이후 이력으로 gap fill
+      },
+      onMessage: (msg) => handleLiveMessage(sess, msg),
+      onDown: (retryDelayMs) => {
+        if (detail.session !== sess || !detail.liveOn) return;
         $("detail-status").textContent =
-          "세션 종료됨 (" + (m.translationCount != null ? m.translationCount : "?") + "건)";
-        stopLive();
+          "라이브 연결 끊김 — " + Math.round(retryDelayMs / 1000) + "초 후 재연결…";
+      },
+    });
+  }
+
+  function handleLiveMessage(sess: SessionItem, msg: unknown): void {
+    if (detail.session !== sess || !detail.liveOn) return;
+    if (!msg || typeof msg !== "object") return;
+    const m = msg as WsMessage;
+    if (m.type === "session_closed") {
+      $("detail-status").textContent =
+        "세션 종료됨 (" + (m.translationCount != null ? m.translationCount : "?") + "건)";
+      stopLive(); // 목록 배지·건수는 전역 session_ended 이벤트가 갱신
+      return;
+    }
+    if (m.type === "translation") {
+      if (detail.filling) {
+        detail.fillBuffer.push(m); // 순서 꼬임 방지 — fill 완료 후 flush
         return;
       }
-      if (m.type === "translation") {
-        const body = $("detail-rows");
-        // createdAt이 없는 payload(WU2 이전·insert 실패 폴백)는 수신 시각으로 표기.
-        const createdAt = m.createdAt != null ? m.createdAt : new Date().toISOString();
-        body.appendChild(pairRow({ ...m, createdAt }, { flash: true }));
-        const wrap = body.parentElement;
-        if (wrap) wrap.scrollTop = wrap.scrollHeight;
+      appendLiveRow(m);
+    }
+  }
+
+  function appendLiveRow(m: WsTranslation): void {
+    if (m.id != null) {
+      if (detail.seenIds.has(m.id)) return; // 이력·gap fill과 id 기반 dedup
+      detail.seenIds.add(m.id);
+      if (detail.lastId == null || m.id > detail.lastId) detail.lastId = m.id;
+    }
+    // id:null(insert 실패 폴백)은 dedup 불가 — 그대로 append (D3 수용 범위).
+    // createdAt이 없는 payload는 수신 시각으로 표기.
+    const createdAt = m.createdAt != null ? m.createdAt : new Date().toISOString();
+    const body = $("detail-rows");
+    body.appendChild(pairRow({ ...m, createdAt }, { flash: true }));
+    const wrap = body.parentElement;
+    if (wrap) wrap.scrollTop = wrap.scrollHeight;
+    if (detail.session) {
+      // 결정 3: 선택 세션은 라이브 수신으로 lastTranslationAt 즉시 갱신 → STALE 즉시 해제
+      detail.session.lastTranslationAt = createdAt;
+      const entry = sessionsState.rows.get(detail.session.sessionId);
+      if (entry) renderSessionRow(entry);
+      renderDetailHeader();
+    }
+  }
+
+  function flushLiveBuffer(): void {
+    const buffered = detail.fillBuffer;
+    detail.fillBuffer = [];
+    buffered.forEach((m) => appendLiveRow(m));
+  }
+
+  /** lastId 이후 이력을 nextCursor 소진까지 전부 당겨와 append (결정 4: 상한 없음). */
+  async function fillFrom(sess: SessionItem, myEpoch: number): Promise<void> {
+    let cursor = detail.lastId;
+    for (;;) {
+      let url =
+        `${API}/sessions/${encodeURIComponent(sess.sessionId)}` +
+        "/translations?limit=100";
+      if (cursor != null) url += "&cursor=" + encodeURIComponent(String(cursor));
+      const data = await fetchJson<HistoryResponse>(url);
+      if (detail.epoch !== myEpoch) return; // 세션 전환·중지·재선택 시 중단
+      const body = $("detail-rows");
+      const items = data.items ?? [];
+      items.forEach((p) => {
+        if (detail.seenIds.has(p.id)) return;
+        detail.seenIds.add(p.id);
+        if (detail.lastId == null || p.id > detail.lastId) detail.lastId = p.id;
+        body.appendChild(pairRow(p));
+      });
+      // gap fill로 받은 행도 활동으로 반영 — 복구 직후 STALE 오탐 방지 (items는 id ASC).
+      const lastItem = items[items.length - 1];
+      if (lastItem) {
+        const prevT = sess.lastTranslationAt
+          ? new Date(sess.lastTranslationAt).getTime()
+          : NaN;
+        const curT = new Date(lastItem.createdAt).getTime();
+        if (!isNaN(curT) && (isNaN(prevT) || curT > prevT)) {
+          sess.lastTranslationAt = lastItem.createdAt;
+        }
       }
-    };
-    ws.onerror = () => {
-      $("detail-status").textContent = "라이브 오류 (연결 끊김)";
-    };
-    ws.onclose = () => {
-      if (detail.liveOn) {
-        $("detail-status").textContent = "라이브 연결 종료됨";
-      }
-      detail.ws = null;
-      detail.liveOn = false;
-      $("live-toggle").textContent = "라이브 시작";
-      $("detail-mode-label").textContent = "이력";
-      $("detail-mode-label").className = "mode-label";
-      $("detail-more").hidden = detail.cursor == null;
-    };
+      $("detail-status").textContent = "이력 동기화 중… " + body.children.length + "행";
+      const wrap = body.parentElement;
+      if (wrap) wrap.scrollTop = wrap.scrollHeight;
+      if (data.nextCursor == null) return;
+      cursor = data.nextCursor;
+    }
+  }
+
+  /** 라이브 시작·재연결 시 이력 동기화. 진행 중 수신분은 버퍼링했다가 끝나고 flush. */
+  async function syncLive(): Promise<void> {
+    if (!detail.session || !detail.liveOn) return;
+    if (detail.filling) {
+      detail.refillQueued = true; // fill 도중 재연결 — 끝나고 한 번 더 돈다
+      return;
+    }
+    const sess = detail.session;
+    const myEpoch = detail.epoch;
+    detail.filling = true;
+    try {
+      do {
+        detail.refillQueued = false;
+        await fillFrom(sess, myEpoch);
+        if (detail.epoch !== myEpoch) return;
+      } while (detail.refillQueued);
+      detail.filling = false;
+      flushLiveBuffer();
+      $("detail-status").textContent = "라이브 수신 중";
+      const entry = sessionsState.rows.get(sess.sessionId);
+      if (entry) renderSessionRow(entry); // 동기화로 갱신된 lastTranslationAt 반영
+      renderDetailHeader();
+    } catch (err) {
+      if (detail.epoch !== myEpoch) return;
+      // 동기화 실패해도 라이브는 유지 — 갭은 남을 수 있지만 수신분은 표시.
+      detail.filling = false;
+      flushLiveBuffer();
+      $("detail-status").textContent =
+        "이력 동기화 실패 (라이브는 유지): " + (err as Error).message;
+    } finally {
+      if (detail.epoch === myEpoch) detail.filling = false;
+    }
   }
 
   function stopLive(): void {
+    flushLiveBuffer(); // fill 중이던 버퍼도 화면에 남긴다
     closeLive();
     $("live-toggle").textContent = "라이브 시작";
     $("detail-mode-label").textContent = "이력";
     $("detail-mode-label").className = "mode-label";
     $("detail-more").hidden = detail.cursor == null;
+    renderDetailHeader();
   }
 
   $("live-toggle").addEventListener("click", () => {
-    if (detail.liveOn || detail.ws) {
+    if (detail.liveOn || detail.live) {
       stopLive();
     } else {
       startLive();
@@ -487,6 +774,90 @@ interface PairLike {
   $("search-more").addEventListener("click", () => {
     if (searchState.cursor != null) runSearch(false);
   });
+
+  // ====================================================================
+  // 전역 이벤트 채널 (/ws/monitor/events) — 세션 목록 실시간화
+  // ====================================================================
+  function handleGlobalEvent(msg: unknown): void {
+    if (!msg || typeof msg !== "object") return;
+    const m = msg as EventsMessage;
+    const list = $("session-list");
+
+    if (m.type === "session_started") {
+      const existing = sessionsState.rows.get(m.sessionId);
+      if (existing) {
+        // 결정 2: 이벤트 신뢰 — 기존 행 LIVE 전환 + 상단 이동 (sessionId 재사용.
+        // DB는 종료 상태일 수 있어 새로고침 시 되돌아감 — §7 메모 대상).
+        const s = existing.session;
+        s.startedAt = m.startedAt;
+        s.endedAt = null;
+        s.sourceLang = m.sourceLang;
+        s.targetLang = m.targetLang;
+        s.live = true;
+        s.lastTranslationAt = null; // 이전 런 기준의 즉시 STALE 오탐 방지
+        renderSessionRow(existing);
+        list.insertBefore(existing.li, list.firstChild);
+        if (detail.session === s) renderDetailHeader();
+        return;
+      }
+      const entry = makeSessionRow(adoptSession({
+        sessionId: m.sessionId,
+        startedAt: m.startedAt,
+        endedAt: null,
+        sourceLang: m.sourceLang,
+        targetLang: m.targetLang,
+        translationCount: 0,
+        lastTranslationAt: null,
+        live: true,
+      }));
+      sessionsState.rows.set(m.sessionId, entry);
+      list.insertBefore(entry.li, list.firstChild);
+      renderSessionsCount();
+      return;
+    }
+
+    if (m.type === "session_ended") {
+      const entry = sessionsState.rows.get(m.sessionId);
+      if (!entry) return; // 목록 밖(다음 페이지) 세션 — 재조회 때 반영
+      const s = entry.session;
+      s.live = false;
+      s.endedAt = m.endedAt;
+      if (m.translationCount != null) s.translationCount = m.translationCount;
+      renderSessionRow(entry);
+      if (detail.session === s) {
+        // 세션 WS가 끊긴 사이 종료됐으면 session_closed를 영영 못 받는다 —
+        // 전역 이벤트가 라이브(재연결 루프 포함)를 대신 끝낸다.
+        if (detail.liveOn || detail.live) {
+          $("detail-status").textContent =
+            "세션 종료됨 (" +
+            (m.translationCount != null ? m.translationCount : "?") +
+            "건)";
+          stopLive();
+        }
+        renderDetailHeader();
+      }
+    }
+  }
+
+  connectReconnecting({
+    url: () => wsUrl("/ws/monitor/events"),
+    onOpen: (resumed) => {
+      // 결정 1: 끊긴 동안 놓친 이벤트는 REST 재조회 1회로 복구 (선택·상세 뷰는 유지).
+      if (resumed) loadSessions(true);
+    },
+    onMessage: handleGlobalEvent,
+    onDown: () => {
+      $("sessions-status").textContent = "실시간 연결 끊김 — 재연결 중…";
+    },
+  });
+
+  // D4-b: STALE 배지는 10초 주기 재평가 (결정 3 — 목록 폴링은 추가하지 않음)
+  window.setInterval(() => {
+    sessionsState.rows.forEach((entry) => {
+      if (entry.session.live) renderSessionRow(entry);
+    });
+    if (detail.session && detail.session.live) renderDetailHeader();
+  }, STALE_TICK_MS);
 
   // ====================================================================
   // 초기 로드

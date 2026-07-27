@@ -11,6 +11,7 @@
   --accent: #4c8bf5;
   --live: #2ecc71;
   --ended: #6b7280;
+  --stale: #f5a623;
 }
 
 html, body {
@@ -111,6 +112,7 @@ main { padding: 14px; }
 }
 .badge.live { background: rgba(46, 204, 113, 0.18); color: var(--live); }
 .badge.ended { background: rgba(107, 114, 128, 0.2); color: var(--ended); }
+.badge.stale { background: rgba(245, 166, 35, 0.18); color: var(--stale); }
 
 .detail-controls { display: flex; align-items: center; gap: 10px; }
 .mode-label { font-size: 12px; color: var(--muted); }
