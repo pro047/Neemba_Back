@@ -85,18 +85,29 @@ class TranscriptConsumer:
         except Exception as exc:
             print("NATS connect failed to", self.safe_url, "error:", repr(exc))
             raise
-        metrics.set_nats_connected(True)
         print('NATS connected to', self.safe_url)
 
         jetstream = self.client.jetstream()
 
-        await self._ensure_stream_and_consumer(jetstream)
+        try:
+            await self._ensure_stream_and_consumer(jetstream)
 
-        self.subscription = await jetstream.pull_subscribe(
-            subject=self.nats_subject,
-            durable=self.consumer_name,
-            stream=self.stream_name,
-        )
+            self.subscription = await jetstream.pull_subscribe(
+                subject=self.nats_subject,
+                durable=self.consumer_name,
+                stream=self.stream_name,
+            )
+        except Exception:
+            # The TCP connection is healthy here, so no nats-py callback ever
+            # fires — without this the flag would stay True while nothing is
+            # being consumed, and /api/monitor/status would paint a green
+            # "NATS 연결" chip through a total translation outage.
+            metrics.set_nats_connected(False)
+            raise
+
+        # Set only once the consumer can actually pull: a live TCP connection
+        # with no usable stream/subscription is not a working consumer.
+        metrics.set_nats_connected(True)
 
     async def _ensure_stream_and_consumer(self, jetstream) -> None:
         """Declare the stream/consumer idempotently (config-as-code).

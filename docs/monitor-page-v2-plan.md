@@ -95,7 +95,8 @@
 - **순단 이력 섹션 (2026-07-26 추가 확정)**: `ws_blips` 테이블 조회로 /ws 순단 이력
   (끊긴 시각·지속 초·flush/유실 건수·close code) 표시. 데이터 기록+조회 API는
   handover §4-7 소PR(이 계획 밖, monitor-v2보다 먼저)에서 선행 — WU5는 화면 노출만.
-  라이브 `ws_blip` 이벤트의 전역 채널(WU1) 발행 여부는 WU5 세션에서 결정.
+  라이브 `ws_blip` 이벤트의 전역 채널(WU1) 발행 여부는 WU5 세션에서 결정
+  → **발행 안 함 확정(2026-07-27)**, REST 조회만. **구현 완료(2026-07-27)**.
 - 완료 기준: dev compose에서 상태 칩 정상 표시, node 컨테이너 중지 시 nodeUp:false 확인,
   ws_probe 강제 절단으로 순단 이력 행 등장 확인.
 
@@ -124,7 +125,7 @@
 | WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
 | WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
 | WU4 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome 15개 시나리오 검증 (start 자동 등장·자동 라이브·재연결 gap fill·STALE·이벤트 채널 복구) |
-| WU5 | 대기 | — | |
+| WU5 | 완료 | 2026-07-27 | pytest 145 통과 + dev compose 검증: 칩 표시·node 중지→nodeUp:false·/ws 절단→순단 이력 행·라이브 분당 건수 (헤드리스 Chrome 23개 체크). 2026-07-29 코드 리뷰 지적 2건 반영 후 커밋 |
 
 ## 7. 세션 로그
 
@@ -206,3 +207,48 @@
   재선택 시 이전 fill 루프 늦은 fetch 개입 → epoch 가드. 수정 후 회귀 시나리오
   (WS 절단 중 stop→전역 이벤트로 라이브 중단) 추가해 15/15 재통과. 다음 세션:
   `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해`
+- 2026-07-27 (WU5 계획 세션): 코드 변경 없음. 탐색 결과 §4-7 소PR(ws_blips
+  기록+`GET /api/monitor/ws-blips`)은 PR #56으로 선행 완료 확인. 사용자 결정
+  4건: ① `ws_blip` 라이브 이벤트 전역 채널 발행 안 함(REST 조회만) ② 활성 칩은
+  live 세션 수 + 자막기기 `/ws` 연결 여부 둘 다 ③ 순단 이력은 별도 탭(진입 시
+  로드, 상시 폴링 없음) ④ 분당 번역 건수는 프런트 파생(최근 60s 수신 행
+  카운트). 승인된 상세 계획은 `.claude/handoff.md`. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해` (구현은 /implement)
+- 2026-07-27 (WU5 구현 세션): 시스템 상태 개요. 변경 — python:
+  `src/monitoring/metrics.py`(setter가 Prometheus 게이지와 함께 모듈 스냅샷
+  dict에도 기록 + `get_snapshot()`, 시그니처 불변),
+  `src/monitor/node_metrics.py` 신규(httpx 2s 타임아웃, 사이드카 방식 라인
+  파싱으로 stt_paused·rtmp_auth_enabled·publish_buffer_size 추출, 모든 실패
+  None, env `NODE_METRICS_URL`), `monitor_query_repository.py`
+  (`count_active_sessions`), `src/ws/websocket.py`(`is_client_connected()`
+  읽기 전용 접근자 — 계획 변경 목록 밖 3줄 추가, wsClientConnected용),
+  `main.py`(`GET /api/monitor/status` + NodeStatus/MonitorStatusResponse,
+  node 실패 시 nodeUp:false·node:null·나머지 정상), `tests/test_monitor_status.py`
+  신규(8개 — 스냅샷·파서·count는 실 DB). 프런트: `index.html`(칩 바 +
+  순단 이력 탭), `src/app.ts`(StatusResponse/WsBlip 타입, 10s 폴링 칩 렌더,
+  상세 미니 통계 — 분당 건수는 detail.recentTimes(수신 행 createdAt) 60s 필터,
+  종료 세션 "분당 —", 순단 이력 탭 offset 페이지네이션), `style.css`(.chip),
+  `app.js` 재빌드. 검증: pytest 143 통과, ruff·mypy 신규 유입 0,
+  `tsc --noEmit` 무오류. dev compose(socat 브리지+헤드리스 Chrome):
+  칩 7종 표시, node 중지→"node 응답 없음" 칩(나머지 칩 유지), /ws 1001 절단→
+  재접속으로 순단 행(1.0s·flush 0·유실 0·1001·client_disconnect) 탭 표시,
+  NATS 주입 라이브에서 자막기기 연결 칩·live 세션 1개·분당 2건·마지막 수신
+  경과 표시. 참고: dev DB에 마이그레이션 0002 미적용 상태였음(컨테이너가
+  머지 전 기동) → `docker exec python alembic upgrade head`로 적용. 검증용
+  세션 wu5-verify-blip-01·wu5-live-01·wu5-live-02(모두 종료)와 ws_blips 1행
+  dev DB 잔존. 커밋·release PR은 사용자 확인 대기.
+- 2026-07-29 (WU5 리뷰·커밋 세션): 커밋 전 코드 리뷰(에이전트 27개, 후보 33건
+  → 반증 5건 → 확정 10건). 표시 계층 결함뿐이라 배포를 막을 건 없다고 판단,
+  "상태가 거짓말하는" 2건만 반영하고 나머지 8건은 후속 과제로 넘김.
+  ① `natsConnected` 거짓 초록 — `consumer.py`가 `nats.connect()` 직후 플래그를
+  세워, JetStream 준비가 실패해도 True로 남았다(연결 자체는 살아 있어 nats-py
+  콜백이 안 뜬다). 스트림·구독 준비 성공 후로 옮기고 실패 시 False. **§4-2
+  범위 규칙의 의도적 예외** — 근인이 WU5 밖 파일이라 거기서만 고칠 수 있었다.
+  ② `main.py`의 맨 `int(buffer_raw)`·로컬 `_gauge_bool` 제거하고 이미 있던
+  `node_metrics.gauge_int`/`gauge_bool`(math.isfinite 가드) 사용 — node가
+  NaN/+Inf를 내면 라우트가 500이 되어 nodeUp:false 열화 설계가 무너졌다.
+  테스트 2개 추가(145 통과), ruff 53 = develop 기준선 동일. 리뷰 잔여 8건:
+  순단 탭 새로고침 실패 시 nextOffset 미초기화·OFFSET 페이지네이션 중복 행,
+  activeSessions가 버려진 세션 포함, 10s 폴링 in-flight 가드·teardown 부재,
+  캐시 스큐 시 init 예외로 페이지 백지화, nodeUp이 임의 2xx를 healthy로 판정,
+  폴링 1회 실패에 칩 전체 소거, 스크레이프 실패 무로깅.

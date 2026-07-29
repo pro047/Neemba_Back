@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import traceback
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -23,6 +24,8 @@ from src.compose import build
 from src.config import get_nats_config, get_deepl_config, get_ws_url
 from src.database.pool import Db
 from src.deepL.deepL import DeeplTranslationService
+from src.monitor.node_metrics import fetch_node_gauges, gauge_bool, gauge_int
+from src.monitoring import metrics
 from src.pushClient.pusher import Pusher
 from src.repository.implementation import monitor_query_repository as mq
 from src.repository.implementation.translation_repository import (
@@ -256,6 +259,31 @@ class WsBlipListResponse(BaseModel):
     next_offset: int | None = Field(default=None, alias="nextOffset")
 
 
+class NodeStatus(BaseModel):
+    # WU5: node /metrics 게이지 스냅샷. 게이지가 응답에 없으면 None
+    # (node 는 떠 있으나 해당 게이지 미노출).
+    model_config = ConfigDict(populate_by_name=True)
+
+    stt_paused: bool | None = Field(default=None, alias="sttPaused")
+    rtmp_auth_enabled: bool | None = Field(default=None, alias="rtmpAuthEnabled")
+    publish_buffer_size: int | None = Field(default=None, alias="publishBufferSize")
+
+
+class MonitorStatusResponse(BaseModel):
+    # WU5 시스템 상태 개요. 판정(경보) 없이 현재값 표시만 — 판정은 사이드카 책임.
+    model_config = ConfigDict(populate_by_name=True)
+
+    active_sessions: int = Field(alias="activeSessions")
+    ws_client_connected: bool = Field(alias="wsClientConnected")
+    nats_connected: bool = Field(alias="natsConnected")
+    # None = 이 프로세스에서 브로드캐스트 이력 없음 (기동 직후 등).
+    last_broadcast_ago_sec: float | None = Field(
+        default=None, alias="lastBroadcastAgoSec"
+    )
+    node_up: bool = Field(alias="nodeUp")
+    node: NodeStatus | None = None
+
+
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
@@ -407,6 +435,45 @@ async def monitor_ws_blips(
     items = [WsBlip(**dict(r)) for r in rows]
     return WsBlipListResponse(
         items=items, limit=limit, offset=offset, nextOffset=next_offset
+    )
+
+
+@app.get('/api/monitor/status', response_model=MonitorStatusResponse)
+async def monitor_status(request: Request, pool=Depends(get_db_pool)):
+    """시스템 상태 개요 (WU5): python 게이지 + DB 집계 + node /metrics 통합.
+
+    node 수집 실패는 ``nodeUp:false, node:null`` 로 표시하고 나머지 필드는
+    정상 응답한다 — node 장애가 상태 개요 전체를 막지 않는다 (D 결정).
+    """
+    active = await mq.count_active_sessions(pool)
+
+    hub: WebSocketHub | None = getattr(request.app.state, "hub", None)
+    ws_connected = hub.is_client_connected() if hub is not None else False
+
+    snap = metrics.get_snapshot()
+    last_ts = snap["last_broadcast_ts"]
+    ago = max(0.0, time.time() - last_ts) if last_ts else None
+
+    # gauge_bool/gauge_int 를 쓰는 이유: Prometheus 텍스트 형식은 NaN/+Inf 를
+    # 허용하고 prom-client 도 그대로 내보낸다. 맨 int() 는 거기서 예외를 던져
+    # node 게이지 하나 때문에 라우트 전체가 500 이 된다 — nodeUp:false 로
+    # 열화시키려는 이 라우트의 설계와 정반대다.
+    gauges = await fetch_node_gauges()
+    node = None
+    if gauges is not None:
+        node = NodeStatus(
+            sttPaused=gauge_bool(gauges.get('neemba_stt_paused')),
+            rtmpAuthEnabled=gauge_bool(gauges.get('neemba_rtmp_auth_enabled')),
+            publishBufferSize=gauge_int(gauges.get('neemba_publish_buffer_size')),
+        )
+
+    return MonitorStatusResponse(
+        activeSessions=active,
+        wsClientConnected=ws_connected,
+        natsConnected=bool(snap["nats_connected"]),
+        lastBroadcastAgoSec=ago,
+        nodeUp=gauges is not None,
+        node=node,
     )
 
 

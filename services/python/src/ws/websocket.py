@@ -41,6 +41,12 @@ class WebSocketHub:
             and ws.application_state == WebSocketState.CONNECTED
         )
 
+    def is_client_connected(self) -> bool:
+        # WU5 상태 개요(GET /api/monitor/status): 자막 기기 소켓이 지금 붙어
+        # 있는지. 읽기 전용 — 락 없이 스냅샷만 본다 (표시용, 정합성 요구 없음).
+        ws = self.client
+        return ws is not None and self._is_connected(ws)
+
     def _drop_oldest_pending_locked(self) -> None:
         # 캡 초과로 가장 오래된 문장을 버린다. §4-7: 열린 blip(순단) 동안의
         # 드롭은 실제 자막 유실이므로 lost_count 로 집계한다. (호출자가 _lock 보유 전제)
