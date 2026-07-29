@@ -25,14 +25,29 @@ DAILY_SECONDS = 86400
 
 ACTIVE = 'neemba_hub_active_session'
 LAST_BROADCAST = 'neemba_hub_last_broadcast_timestamp_seconds'
+STT_PAUSED = 'neemba_stt_paused'
 
 
 def _is_active(samples: dict) -> bool:
     return samples.get(ACTIVE, 0.0) == 1.0
 
 
+def _stt_paused(samples: dict, now: float = 0.0) -> bool:
+    """node 가 '4연속 무오디오'를 판정해 STT 로테이션을 멈춘 상태.
+
+    송출이 끊겼다는 확정 신호라 '방송 종료(정상)'와 '수신 장애'를 가르는
+    유일한 관측값이다. 세션은 stop 호출 전까지 active 로 남으므로, 이 신호
+    없이는 예배가 끝난 것과 RTMP 가 막힌 것을 구분할 수 없다.
+    """
+    return samples.get(STT_PAUSED, 0.0) == 1.0
+
+
 def _heartbeat_stale(samples: dict, now: float) -> bool:
     if not _is_active(samples):
+        return False
+    # 오디오가 끊겨 STT 가 멈춘 상태면 번역이 없는 게 당연하다 — 장애가 아니라
+    # 송출 종료다. 여기서 걸러야 예배 종료 3분 뒤 심장박동 오탐이 안 뜬다.
+    if _stt_paused(samples):
         return False
     # last_broadcast==0(부팅 후 broadcast 없음)이면 gap 무한대로 간주 —
     # 세션이 열렸는데 첫 번역이 영영 안 오는 경우를 놓치지 않는다.
@@ -45,10 +60,14 @@ CONDITION_RULES = [
      _heartbeat_stale,
      'always',
      '🚨 번역 심장박동 끊김 — 세션 활성 중 {gap:.0f}초째 번역 없음'),
+    # 장애가 아니라 상태 전환 보고다 — 방송 종료면 정상, 방송 중이면 송출
+    # 사고다. 어느 쪽인지는 사람이 시간대를 보고 판단하는 게 맞아 정보성으로
+    # 낮췄다. 오디오가 돌아오면 아래 공통 경로가 ✅ 복구를 보낸다.
     ('stt_paused',
-     lambda s, now: _is_active(s) and s.get('neemba_stt_paused', 0.0) == 1.0,
+     lambda s, now: _is_active(s) and _stt_paused(s),
      'always',
-     '🚨 STT 일시정지 상태 — 오디오 유입 없음 (Stt paused)'),
+     'ℹ️ 송출 중단 — 오디오 유입이 끊겨 STT 일시정지 (방송 종료면 정상, '
+     '방송 중이면 OBS·RTMP 확인). 오디오 복귀 시 자동 재개'),
     ('nats_down',
      lambda s, now: s.get('neemba_nats_connected', 1.0) == 0.0,
      'active',
@@ -76,6 +95,26 @@ COUNTER_RULES = [
     ('ffmpeg_stale', 'neemba_ffmpeg_stale_total',
      '🚨 ffmpeg 10초 무진행 {delta:.0f}회 — RTMP 수신 정체 의심'),
 ]
+
+# 카운터 규칙별 예외 옵션. 기본(미등재)은 '억제 없음 + 즉시 보고'라 규칙
+# 목록 자체는 단순하게 유지된다.
+#   suppress: 참이면 쌓인 delta 를 폐기하고 보고하지 않는다
+#   grace   : 첫 증가분을 이 초만큼 붙들어 둔다 — 억제 신호가 늦게 도착하는
+#             경합을 흡수하기 위한 유예
+#
+# ffmpeg_stale 이 유일한 대상인 이유: 송출이 끊기면 ffmpeg 무진행이 먼저
+# 관측되고 node 의 stt_paused 판정(4연속 무오디오)은 그보다 몇 초 늦게 선다.
+# 유예 없이 억제만 걸면 '방송 종료'인데도 첫 1회는 그대로 발화한다(2026-07-29
+# 실측: stale 11:21:39 → paused 11:21:45 → 알림 11:21:46).
+COUNTER_STALE_GRACE_SECONDS = 90
+
+COUNTER_OPTIONS = {
+    'ffmpeg_stale': {'suppress': _stt_paused,
+                     'grace': COUNTER_STALE_GRACE_SECONDS},
+}
+
+# 규칙 이름이 바뀌면 옵션이 조용히 무력화되는 걸 막는다.
+assert set(COUNTER_OPTIONS) <= {name for name, _, _ in COUNTER_RULES}
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -138,23 +177,40 @@ def evaluate(state: dict, samples: dict, now: float) -> tuple[dict, list[str]]:
     for name, metric, message in COUNTER_RULES:
         rule = state.setdefault(name, {'last_value': None, 'last_alert': 0.0,
                                        'unreported': 0.0})
+        # 디스크에 영속된 옛 상태에는 pending_since 가 없다 (state.json).
+        rule.setdefault('pending_since', 0.0)
         if not scrape_ok:
             continue
+        opts = COUNTER_OPTIONS.get(name, {})
+        suppress = opts.get('suppress')
         value = samples.get(metric, 0.0)
         prev = rule['last_value']
         rule['last_value'] = value
+        # 정상 종료로 판명 — 유예 중 쌓인 delta 는 보고하지 않고 버린다.
+        # last_value 갱신 뒤에 둬야 재개 시점에 옛 값과의 차이로 오탐하지 않는다.
+        if suppress and suppress(samples, now):
+            rule['unreported'] = 0.0
+            rule['pending_since'] = 0.0
+            continue
         if prev is None:
             continue  # 첫 관측은 기준점만 잡는다 (재시작 후 오탐 방지)
         delta = value - prev
-        if delta <= 0:
+        # 이원화: 카운터류는 세션 활성 중에만 의미
+        if delta > 0 and _is_active(samples):
+            rule['unreported'] += delta
+            if not rule['pending_since']:
+                rule['pending_since'] = now
+        if rule['unreported'] <= 0:
             continue
-        if not _is_active(samples):
-            continue  # 이원화: 카운터류는 세션 활성 중에만 의미
-        rule['unreported'] += delta
+        # 유예 중엔 증가가 멈춰도 계속 붙들고 있는다 — 다음 틱에 억제 신호가
+        # 서면 위에서 폐기되고, 안 서면 진짜 정체로 보고된다.
+        if now - rule['pending_since'] < opts.get('grace', 0):
+            continue
         if now - rule['last_alert'] >= COUNTER_COOLDOWN_SECONDS:
             alerts.append(message.format(delta=rule['unreported'], total=value))
             rule['last_alert'] = now
             rule['unreported'] = 0.0
+            rule['pending_since'] = 0.0
 
     return state, alerts
 
