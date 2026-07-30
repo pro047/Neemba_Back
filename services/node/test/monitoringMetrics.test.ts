@@ -6,6 +6,7 @@ import {
   setPublishBufferDropped,
   setPublishBufferSize,
   setRtmpAuthEnabled,
+  incSessionStopped,
 } from "../src/monitoring/metrics.js";
 import { RetryingTranscriptPublisher } from "../src/retryingPublisher.js";
 import type { PublishEvent } from "../src/ports/transcriptPublisher.js";
@@ -45,6 +46,26 @@ describe("monitoring metrics module", () => {
     expect(await metricValue("neemba_rtmp_auth_enabled")).toBe(0);
     setRtmpAuthEnabled(true);
     expect(await metricValue("neemba_rtmp_auth_enabled")).toBe(1);
+  });
+
+  // The monitor sidecar keys metrics by the whole exposition line, so its rule
+  // string embeds the rendered label. Pin the exact text here: renaming the
+  // metric or the label would otherwise silence the alert with no test failing.
+  it("session stop counter exposes every reason label from boot", async () => {
+    const exposition = await register.metrics();
+
+    expect(exposition).toContain('neemba_session_stopped_total{reason="manual"} 0');
+    expect(exposition).toContain(
+      'neemba_session_stopped_total{reason="publisher_done"} 0'
+    );
+    expect(exposition).toContain(
+      'neemba_session_stopped_total{reason="superseded"} 0'
+    );
+
+    incSessionStopped("publisher_done");
+    expect(await register.metrics()).toContain(
+      'neemba_session_stopped_total{reason="publisher_done"} 1'
+    );
   });
 });
 

@@ -115,6 +115,16 @@ COUNTER_OPTIONS = {
 
 # 규칙 이름이 바뀌면 옵션이 조용히 무력화되는 걸 막는다.
 assert set(COUNTER_OPTIONS) <= {name for name, _, _ in COUNTER_RULES}
+# info(카운터) 규칙: 장애가 아니라 운영 사실. COUNTER_RULES 와 달리 세션 활성
+# 게이트도 쿨다운도 없다 — 자동 종료는 세션이 닫힌 *뒤* 관측되므로 활성 게이트를
+# 통과할 수 없고, 방송당 많아야 1회라 쿨다운이 침묵시킬 이유가 없다.
+# 메트릭 키에 라벨이 붙어 있는 건 fetch_metrics 가 exposition 라인을 통째로
+# 키로 쓰기 때문이다 (node metrics.ts 가 이 문자열을 고정한다).
+INFO_COUNTER_RULES = [
+    ('session_auto_stopped',
+     'neemba_session_stopped_total{reason="publisher_done"}',
+     'ℹ️ 방송 종료 감지 — 세션 자동 종료 {delta:.0f}회 (운영자 stop 미호출)'),
+]
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -211,6 +221,18 @@ def evaluate(state: dict, samples: dict, now: float) -> tuple[dict, list[str]]:
             rule['last_alert'] = now
             rule['unreported'] = 0.0
             rule['pending_since'] = 0.0
+
+    for name, metric, message in INFO_COUNTER_RULES:
+        rule = state.setdefault(name, {'last_value': None})
+        if not scrape_ok:
+            continue
+        value = samples.get(metric, 0.0)
+        prev = rule['last_value']
+        rule['last_value'] = value
+        # 첫 관측은 기준점만 잡고, 감소는 node 재시작에 의한 리셋이므로 무시.
+        if prev is None or value <= prev:
+            continue
+        alerts.append(message.format(delta=value - prev, total=value))
 
     return state, alerts
 
