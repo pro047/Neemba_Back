@@ -36,6 +36,31 @@ const rtmpAuthEnabled = new Gauge({
   registers: [register],
 });
 
+export type SessionStopReason = "manual" | "publisher_done" | "superseded";
+
+const SESSION_STOP_REASONS: SessionStopReason[] = [
+  "manual",
+  "publisher_done",
+  "superseded",
+];
+
+// One labelled counter instead of three names: the point is the ratio between
+// the reasons ("how often does the operator forget to press stop?"), which is
+// only readable if they share a series.
+const sessionStopped = new Counter({
+  name: "neemba_session_stopped_total",
+  help: "Sessions torn down, labelled by what triggered the teardown",
+  labelNames: ["reason"] as const,
+  registers: [register],
+});
+
+// Seed every label at 0. prom-client omits a label combination until its first
+// inc(), and the monitor sidecar keys off the exact exposition line — an absent
+// series and a zero one would be indistinguishable on its first scrape.
+for (const reason of SESSION_STOP_REASONS) {
+  sessionStopped.inc({ reason }, 0);
+}
+
 export const setSttPaused = (paused: boolean): void => {
   sttPaused.set(paused ? 1 : 0);
 };
@@ -54,4 +79,8 @@ export const setPublishBufferSize = (size: number): void => {
 
 export const setRtmpAuthEnabled = (enabled: boolean): void => {
   rtmpAuthEnabled.set(enabled ? 1 : 0);
+};
+
+export const incSessionStopped = (reason: SessionStopReason): void => {
+  sessionStopped.inc({ reason });
 };

@@ -194,3 +194,30 @@ def test_STT가_정상인데_ffmpeg_정체가_유예를_넘기면_보고해야_�
     stale_alert = next((a for a in alerts if 'ffmpeg' in a), None)
     assert stale_alert is not None
     assert '4' in stale_alert
+AUTO_STOP = 'neemba_session_stopped_total{reason="publisher_done"}'
+
+
+def test_auto_stop_alerts_even_after_session_went_inactive():
+    # 자동 종료는 세션이 닫힌 뒤에 관측된다 — COUNTER_RULES 의 활성 게이트를
+    # 통과할 수 없으므로 info 규칙이 따로 있어야 한다.
+    state, alerts = evaluate({}, samples(**{AUTO_STOP: 0.0}), now=T0)
+    assert alerts == []
+
+    stopped = samples(neemba_hub_active_session=0.0, **{AUTO_STOP: 1.0})
+    state, alerts = evaluate(state, stopped, now=T0 + 60)
+    assert any('자동 종료' in a for a in alerts)
+
+
+def test_auto_stop_does_not_repeat_without_a_new_increase():
+    state, _ = evaluate({}, samples(**{AUTO_STOP: 0.0}), now=T0)
+    state, alerts = evaluate(state, samples(**{AUTO_STOP: 1.0}), now=T0 + 60)
+    assert len(alerts) == 1
+
+    state, alerts = evaluate(state, samples(**{AUTO_STOP: 1.0}), now=T0 + 120)
+    assert alerts == []
+
+
+def test_auto_stop_ignores_counter_reset_from_node_restart():
+    state, _ = evaluate({}, samples(**{AUTO_STOP: 3.0}), now=T0)
+    state, alerts = evaluate(state, samples(**{AUTO_STOP: 0.0}), now=T0 + 60)
+    assert alerts == []
