@@ -141,3 +141,56 @@ def test_scrape_failure_fires_after_two_consecutive_misses():
     state2, alerts = evaluate(state2, down, now=T0 + 60)
     state2, alerts = evaluate(state2, down, now=T0 + 120)
     assert alerts == []
+
+
+def test_STT가_일시정지_상태면_심장박동_경보가_뜨지_않아야_한다():
+    # 세션은 stop 호출 전까지 active 로 남는다 — 방송이 끝나 오디오가 끊긴
+    # 상태를 번역 끊김으로 오인하면 안 된다.
+    paused = samples(neemba_hub_last_broadcast_timestamp_seconds=T0 - 300,
+                     neemba_stt_paused=1.0)
+
+    _, alerts = evaluate({}, paused, now=T0)
+
+    assert not any('심장박동' in a for a in alerts)
+    assert any('송출 중단' in a for a in alerts)
+
+
+def test_ffmpeg_정체는_유예_안에서는_보고하지_않아야_한다():
+    state, _ = evaluate({}, fresh(T0), now=T0)
+
+    state, alerts = evaluate(
+        state, fresh(T0 + 60, neemba_ffmpeg_stale_total=4.0), now=T0 + 60)
+
+    assert not any('ffmpeg' in a for a in alerts)
+
+
+def test_유예_중_STT가_멈추면_ffmpeg_정체를_폐기해야_한다():
+    state, _ = evaluate({}, fresh(T0), now=T0)
+    state, _ = evaluate(
+        state, fresh(T0 + 60, neemba_ffmpeg_stale_total=4.0), now=T0 + 60)
+
+    state, alerts = evaluate(
+        state,
+        fresh(T0 + 120, neemba_ffmpeg_stale_total=4.0, neemba_stt_paused=1.0),
+        now=T0 + 120)
+
+    assert not any('ffmpeg' in a for a in alerts)
+
+    # 오디오가 돌아와도 폐기된 delta 가 되살아나면 안 된다
+    state, alerts = evaluate(
+        state, fresh(T0 + 300, neemba_ffmpeg_stale_total=4.0), now=T0 + 300)
+    assert not any('ffmpeg' in a for a in alerts)
+
+
+def test_STT가_정상인데_ffmpeg_정체가_유예를_넘기면_보고해야_한다():
+    state, _ = evaluate({}, fresh(T0), now=T0)
+    state, _ = evaluate(
+        state, fresh(T0 + 60, neemba_ffmpeg_stale_total=4.0), now=T0 + 60)
+
+    # 증가가 멈춰도 유예가 지나면 붙들고 있던 delta 를 보고한다
+    state, alerts = evaluate(
+        state, fresh(T0 + 180, neemba_ffmpeg_stale_total=4.0), now=T0 + 180)
+
+    stale_alert = next((a for a in alerts if 'ffmpeg' in a), None)
+    assert stale_alert is not None
+    assert '4' in stale_alert
