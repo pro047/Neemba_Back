@@ -124,7 +124,7 @@
 | WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
 | WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
 | WU4 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome 15개 시나리오 검증 (start 자동 등장·자동 라이브·재연결 gap fill·STALE·이벤트 채널 복구) |
-| WU5 | 대기 | — | |
+| WU5 | **구현·검증 완료 · 머지 대기** | 2026-07-27 | PR **#61** `feature/monitor-v2-wu5` (`076690c`). pytest 143 통과(신규 8), ruff·mypy 신규 유입 0, `tsc --noEmit` 무오류, dev compose 검증 완료. 2026-08-02 기준 develop 미머지 |
 
 ## 7. 세션 로그
 
@@ -206,3 +206,12 @@
   재선택 시 이전 fill 루프 늦은 fetch 개입 → epoch 가드. 수정 후 회귀 시나리오
   (WS 절단 중 stop→전역 이벤트로 라이브 중단) 추가해 15/15 재통과. 다음 세션:
   `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해`
+- 2026-08-02 (주일예배 prod 모니터링 세션): 코드 변경 없음. §6 의 WU5 상태를
+  "대기" → "구현·검증 완료·머지 대기(PR #61)" 로 정정. 2026-07-27 WU5 세션이
+  구현·검증을 마치고 PR 까지 열었는데 §6 갱신이 누락돼 있었다.
+  **prod 는 release #57(WU1까지)에 멈춰 있다** — WU2·3·4 는 develop 에만 있고
+  prod 화면은 TS 마이그레이션 이전의 `app.js` 다. prod 화면으로 WU2~4 기능의
+  동작 여부를 판단하면 안 된다(2026-08-02 실측: prod `app.js` 14,597 bytes,
+  7/26 15:53 빌드).
+  이 계획 범위 밖 신규 항목 2건(자막 자동 스크롤 UX, 모니터 도메인 분리)은
+  `docs/monitor-page-v3-plan.md` 로 분리했다. 다음 세션: WU1~WU5 통합 리뷰.
