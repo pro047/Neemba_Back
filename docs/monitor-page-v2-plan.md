@@ -334,3 +334,27 @@
   필요 없었다(`deploy.yml`이 `--force-recreate`).
   배포 후 확인: `/health` 200, `/monitor`·`/api/monitor/` 401(Basic Auth 정상).
   다음 세션 주의: prod `/monitor`가 이제 TS 산출물이다 — 열어둔 탭은 새로고침 필요.
+- 2026-08-02 (정적 자산 서빙 수정): WU5 배포 후 prod 화면에서 드러난 nginx 결함 2건.
+  둘 다 계획 범위 밖이지만 모니터 페이지를 못 쓰게 만드는 문제라 바로 고쳤다.
+  ① **슬래시 없는 `/monitor` 진입 시 페이지가 통째로 먹통** — Phase 6(`7373a82`)
+  이래 있던 버그다. `index.html`이 자산을 상대 경로로 참조하는데(`style.css`,
+  `app.js`) URL이 `/monitor`면 브라우저가 이를 파일로 봐 base가 `/`가 된다 →
+  요청이 `/style.css`·`/app.js`로 새고 → catch-all(`location /`)이 **404가 아니라
+  200 `neemba\n`** 을 돌려준다 → CSS는 무시되고 JS는 첫 줄 ReferenceError로 죽어
+  세션 목록·칩·탭이 전부 안 뜬다. 200이라 콘솔 오류조차 안 난 게 오래 안 잡힌 이유.
+  `location = /monitor { absolute_redirect off; return 301 /monitor/; }` 로 정규화.
+  **`=`(정확 일치)가 필수** — prefix로 쓰면 `/monitor/style.css`까지 잡아 무한
+  리다이렉트다. `absolute_redirect off`는 비표준 포트 유실 방지(dev 8080 → 80 튕김).
+  상대 경로를 유지한 이유는 v3의 "모니터 도메인 분리" 때 index.html을 다시 안 고치려고.
+  ② **배포해도 화면이 안 바뀜** — `location /monitor`에 캐시 지시가 없어 Chrome이
+  Last-Modified 휴리스틱 캐싱을 했다. WU5 배포 후에도 탭에 옛 `app.js`가 떠서 상태
+  칩 바·순단 이력 탭이 안 보였다(하드 리프레시로 확인). 코드 리뷰가 "캐시된 옛
+  app.js"로 지적했다가 자산 캐시 전략이라 보류한 항목이 실제로 터진 것.
+  `add_header Cache-Control "no-cache" always;` — no-store가 아닌 이유는 ETag
+  재검증으로 304를 받아 본문 전송이 0이기 때문(실측 확인). 파일명 해시는 번들러가
+  필요해 D7과 충돌한다.
+  검증: prod·dev conf `nginx -t` 통과(prod는 자체서명 인증서 물려 완전 검증),
+  실제 nginx 컨테이너로 301 1회·루프 없음·포트 유지·`Cache-Control: no-cache`·
+  조건부 요청 304(0 bytes)·서빙 index.html에 WU5 마크업 존재 확인.
+  부수 확인: 하드 리프레시 후 칩이 `RTMP 인증 켜짐`·`STT 동작`·`live 세션 0개`로
+  떠, 아침 경보 3종의 원인(WU-D 게이지 고착·stop 미호출)이 해소된 것도 화면으로 확인됐다.
