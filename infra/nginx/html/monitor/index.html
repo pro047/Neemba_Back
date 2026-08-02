@@ -14,8 +14,12 @@
     <nav class="tabs">
       <button id="tab-sessions" class="tab active" type="button">세션</button>
       <button id="tab-search" class="tab" type="button">검색</button>
+      <button id="tab-blips" class="tab" type="button">순단 이력</button>
     </nav>
   </header>
+
+  <!-- WU5: 시스템 상태 칩 바 (10s 폴링, 현재값 표시 전용 — 판정은 사이드카) -->
+  <div id="status-bar" class="status-bar"></div>
 
   <main>
     <!-- ===== 세션 뷰 ===== -->
@@ -99,6 +103,37 @@
       <div class="pane-foot">
         <button id="search-more" class="btn btn-block" type="button" hidden>더 보기</button>
         <p id="search-status" class="status"></p>
+      </div>
+    </section>
+
+    <!-- ===== 순단 이력 뷰 (WU5 — ws_blips, 탭 진입 시 로드) ===== -->
+    <section id="view-blips" class="view" hidden>
+      <div class="pane">
+        <div class="pane-head">
+          <h2>/ws 순단 이력</h2>
+          <button id="blips-refresh" class="btn" type="button">새로고침</button>
+        </div>
+        <div class="table-wrap">
+          <table class="pairs">
+            <thead>
+              <tr>
+                <th class="col-sess">세션</th>
+                <th class="col-time">끊긴 시각</th>
+                <th class="col-time">복구 시각</th>
+                <th class="col-num">지속</th>
+                <th class="col-num">flush</th>
+                <th class="col-num">유실</th>
+                <th class="col-code">close</th>
+                <th class="col-det">감지</th>
+              </tr>
+            </thead>
+            <tbody id="blips-rows"></tbody>
+          </table>
+        </div>
+        <div class="pane-foot">
+          <button id="blips-more" class="btn btn-block" type="button" hidden>더 보기</button>
+          <p id="blips-status" class="status"></p>
+        </div>
       </div>
     </section>
   </main>

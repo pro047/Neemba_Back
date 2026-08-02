@@ -115,8 +115,20 @@ _TRANSLATION_COLS = (
     "source_lang, target_lang, confidence, created_at"
 )
 
+# WU5 status overview: ended_at IS NULL = still running. Same definition as
+# the list's ``live`` flag, so the chip agrees with the LIVE badges.
+_COUNT_ACTIVE_SESSIONS_SQL = (
+    "SELECT count(*) FROM app.sessions WHERE ended_at IS NULL"
+)
+
 
 # --- queries ---------------------------------------------------------------
+
+async def count_active_sessions(pool) -> int:
+    """Count sessions still running (``ended_at IS NULL``) for the status chip."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(_COUNT_ACTIVE_SESSIONS_SQL)
+
 
 async def list_sessions(
     pool,

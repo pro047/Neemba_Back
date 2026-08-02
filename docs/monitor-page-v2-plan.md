@@ -95,7 +95,8 @@
 - **순단 이력 섹션 (2026-07-26 추가 확정)**: `ws_blips` 테이블 조회로 /ws 순단 이력
   (끊긴 시각·지속 초·flush/유실 건수·close code) 표시. 데이터 기록+조회 API는
   handover §4-7 소PR(이 계획 밖, monitor-v2보다 먼저)에서 선행 — WU5는 화면 노출만.
-  라이브 `ws_blip` 이벤트의 전역 채널(WU1) 발행 여부는 WU5 세션에서 결정.
+  라이브 `ws_blip` 이벤트의 전역 채널(WU1) 발행 여부는 WU5 세션에서 결정
+  → **발행 안 함 확정(2026-07-27)**, REST 조회만. **구현 완료(2026-07-27)**.
 - 완료 기준: dev compose에서 상태 칩 정상 표시, node 컨테이너 중지 시 nodeUp:false 확인,
   ws_probe 강제 절단으로 순단 이력 행 등장 확인.
 
@@ -124,7 +125,8 @@
 | WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
 | WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
 | WU4 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome 15개 시나리오 검증 (start 자동 등장·자동 라이브·재연결 gap fill·STALE·이벤트 채널 복구) |
-| WU5 | **구현·검증 완료 · 머지 대기** | 2026-07-27 | PR **#61** `feature/monitor-v2-wu5` (`076690c`). pytest 143 통과(신규 8), ruff·mypy 신규 유입 0, `tsc --noEmit` 무오류, dev compose 검증 완료. 2026-08-02 기준 develop 미머지 |
+| WU5 | 완료 | 2026-07-27 | PR **#61** `feature/monitor-v2-wu5`. pytest 145 통과 + dev compose 검증: 칩 표시·node 중지→nodeUp:false·/ws 절단→순단 이력 행·라이브 분당 건수 (헤드리스 Chrome 23개 체크). 2026-07-29 코드 리뷰 지적 2건 반영 후 커밋 |
+| 통합 리뷰 | **완료 · PR #61 갱신 대기** | 2026-08-02 | WU1~WU5 전 범위 재검증(주장 전부 재현) + 확정 3건 반영, pytest 146 통과. **머지 순서: PR #63(WU-D) → PR #61** — WU5 칩이 읽는 node 게이지 2건이 #63에서 고쳐진다 |
 
 ## 7. 세션 로그
 
@@ -206,6 +208,51 @@
   재선택 시 이전 fill 루프 늦은 fetch 개입 → epoch 가드. 수정 후 회귀 시나리오
   (WS 절단 중 stop→전역 이벤트로 라이브 중단) 추가해 15/15 재통과. 다음 세션:
   `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해`
+- 2026-07-27 (WU5 계획 세션): 코드 변경 없음. 탐색 결과 §4-7 소PR(ws_blips
+  기록+`GET /api/monitor/ws-blips`)은 PR #56으로 선행 완료 확인. 사용자 결정
+  4건: ① `ws_blip` 라이브 이벤트 전역 채널 발행 안 함(REST 조회만) ② 활성 칩은
+  live 세션 수 + 자막기기 `/ws` 연결 여부 둘 다 ③ 순단 이력은 별도 탭(진입 시
+  로드, 상시 폴링 없음) ④ 분당 번역 건수는 프런트 파생(최근 60s 수신 행
+  카운트). 승인된 상세 계획은 `.claude/handoff.md`. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해` (구현은 /implement)
+- 2026-07-27 (WU5 구현 세션): 시스템 상태 개요. 변경 — python:
+  `src/monitoring/metrics.py`(setter가 Prometheus 게이지와 함께 모듈 스냅샷
+  dict에도 기록 + `get_snapshot()`, 시그니처 불변),
+  `src/monitor/node_metrics.py` 신규(httpx 2s 타임아웃, 사이드카 방식 라인
+  파싱으로 stt_paused·rtmp_auth_enabled·publish_buffer_size 추출, 모든 실패
+  None, env `NODE_METRICS_URL`), `monitor_query_repository.py`
+  (`count_active_sessions`), `src/ws/websocket.py`(`is_client_connected()`
+  읽기 전용 접근자 — 계획 변경 목록 밖 3줄 추가, wsClientConnected용),
+  `main.py`(`GET /api/monitor/status` + NodeStatus/MonitorStatusResponse,
+  node 실패 시 nodeUp:false·node:null·나머지 정상), `tests/test_monitor_status.py`
+  신규(8개 — 스냅샷·파서·count는 실 DB). 프런트: `index.html`(칩 바 +
+  순단 이력 탭), `src/app.ts`(StatusResponse/WsBlip 타입, 10s 폴링 칩 렌더,
+  상세 미니 통계 — 분당 건수는 detail.recentTimes(수신 행 createdAt) 60s 필터,
+  종료 세션 "분당 —", 순단 이력 탭 offset 페이지네이션), `style.css`(.chip),
+  `app.js` 재빌드. 검증: pytest 143 통과, ruff·mypy 신규 유입 0,
+  `tsc --noEmit` 무오류. dev compose(socat 브리지+헤드리스 Chrome):
+  칩 7종 표시, node 중지→"node 응답 없음" 칩(나머지 칩 유지), /ws 1001 절단→
+  재접속으로 순단 행(1.0s·flush 0·유실 0·1001·client_disconnect) 탭 표시,
+  NATS 주입 라이브에서 자막기기 연결 칩·live 세션 1개·분당 2건·마지막 수신
+  경과 표시. 참고: dev DB에 마이그레이션 0002 미적용 상태였음(컨테이너가
+  머지 전 기동) → `docker exec python alembic upgrade head`로 적용. 검증용
+  세션 wu5-verify-blip-01·wu5-live-01·wu5-live-02(모두 종료)와 ws_blips 1행
+  dev DB 잔존. 커밋·release PR은 사용자 확인 대기.
+- 2026-07-29 (WU5 리뷰·커밋 세션): 커밋 전 코드 리뷰(에이전트 27개, 후보 33건
+  → 반증 5건 → 확정 10건). 표시 계층 결함뿐이라 배포를 막을 건 없다고 판단,
+  "상태가 거짓말하는" 2건만 반영하고 나머지 8건은 후속 과제로 넘김.
+  ① `natsConnected` 거짓 초록 — `consumer.py`가 `nats.connect()` 직후 플래그를
+  세워, JetStream 준비가 실패해도 True로 남았다(연결 자체는 살아 있어 nats-py
+  콜백이 안 뜬다). 스트림·구독 준비 성공 후로 옮기고 실패 시 False. **§4-2
+  범위 규칙의 의도적 예외** — 근인이 WU5 밖 파일이라 거기서만 고칠 수 있었다.
+  ② `main.py`의 맨 `int(buffer_raw)`·로컬 `_gauge_bool` 제거하고 이미 있던
+  `node_metrics.gauge_int`/`gauge_bool`(math.isfinite 가드) 사용 — node가
+  NaN/+Inf를 내면 라우트가 500이 되어 nodeUp:false 열화 설계가 무너졌다.
+  테스트 2개 추가(145 통과), ruff 53 = develop 기준선 동일. 리뷰 잔여 8건:
+  순단 탭 새로고침 실패 시 nextOffset 미초기화·OFFSET 페이지네이션 중복 행,
+  activeSessions가 버려진 세션 포함, 10s 폴링 in-flight 가드·teardown 부재,
+  캐시 스큐 시 init 예외로 페이지 백지화, nodeUp이 임의 2xx를 healthy로 판정,
+  폴링 1회 실패에 칩 전체 소거, 스크레이프 실패 무로깅.
 - 2026-08-02 (주일예배 prod 모니터링 세션): 코드 변경 없음. §6 의 WU5 상태를
   "대기" → "구현·검증 완료·머지 대기(PR #61)" 로 정정. 2026-07-27 WU5 세션이
   구현·검증을 마치고 PR 까지 열었는데 §6 갱신이 누락돼 있었다.
@@ -215,3 +262,75 @@
   7/26 15:53 빌드).
   이 계획 범위 밖 신규 항목 2건(자막 자동 스크롤 UX, 모니터 도메인 분리)은
   `docs/monitor-page-v3-plan.md` 로 분리했다. 다음 세션: WU1~WU5 통합 리뷰.
+- 2026-08-02 (WU1~WU5 통합 리뷰 세션): 전 범위 재검증 + 확정 3건 반영.
+  **재현 결과**: pytest 145 통과, ruff·mypy 신규 유입 0(위반 라인 집합이
+  develop과 완전 동일), `tsc --noEmit` 무오류, `npm run build` 재빌드본이
+  커밋된 `app.js`와 바이트 동일 — §6 주장 전부 재현됨.
+  **반영한 3건**:
+  ① `/api/monitor/status`가 DB 조회 실패 시 500 — 라우트 docstring이 선언한
+  "node 장애가 상태 개요 전체를 막지 않는다" 열화 원칙이 DB에는 적용돼 있지
+  않았다. DB가 죽은 순간이야말로 NATS·자막기기·node 칩을 봐야 하는 순간인데
+  프런트는 상태 바 전체를 "상태 조회 실패" 칩 하나로 덮었다.
+  `activeSessions`를 nullable로 열고 try/except로 이 필드만 열화. 회귀
+  테스트 1개 추가(수정 제거 시 실패 확인, 146 통과).
+  ② **번역 0건 라이브 세션은 절대 STALE이 안 됐다** — `isStale()`이
+  `!s.lastTranslationAt`에서 false로 빠져나갔고, `session_started`는
+  `lastTranslationAt`을 null로 리셋한다(WU4 오탐 수정 ④). 즉 "송출은 켰는데
+  번역이 한 건도 안 나온다"는 가장 중요한 장애가 초록 LIVE로 보였다.
+  기준 시각을 `lastTranslationAt ?? startedAt`으로 변경 (D4-b 의도 복원).
+  ③ 칩 라벨 "마지막 브로드캐스트" → "마지막 자막 전송". `record_broadcast`는
+  `_send_text` 성공 시에만 찍혀 자막기기가 끊긴 동안은 번역이 정상 생산돼도
+  멈춘다 — 파이프라인 생존 지표로 오독되는 라벨이었다.
+  **머지 순서 (중요)**: WU5 상태 칩이 읽는 node 게이지 2개가 미머지 PR
+  **#63**(`feature/gauge-teardown-paths`, WU-D)에서 고쳐지는 바로 그 게이지다.
+  `neemba_rtmp_auth_enabled`는 배포 후 첫 송출 전까지 0, `neemba_stt_paused`는
+  paused 종료 시 1 고착 → WU5만 먼저 올리면 평시에 주황 경고 칩 2개가 상시
+  표시된다. **#63(CLEAN·CI green)을 먼저 머지할 것.**
+  **미반영 — 실측 후 판단(사용자 결정)**: 세션 목록의
+  `(SELECT max(created_at) ... WHERE session_id = ...)` 상관 서브쿼리에
+  맞는 인덱스가 없다(`ix_translations_session_id`는 session_id 단일). 세션마다
+  힙 전수 → 50세션 페이지가 세션당 행 수에 선형. 이벤트 채널 재연결마다
+  재조회되므로 호출 빈도도 낮지 않다. 후보:
+  `CREATE INDEX ON app.translations (session_id, created_at DESC)`.
+  검증: prod에서 `SELECT count(*) FROM app.translations` +
+  `EXPLAIN (ANALYZE, BUFFERS)`.
+  **종결**: WU2 §7의 "sessionId 재사용" 미해결 메모는 닫아도 된다 — node는
+  `uuidv4()`로만 생성한다(`router/rtmp.ts:156`, `router/mic.ts:396`).
+  수동으로 고정 id를 넣는 검증 세션에만 해당.
+  ②는 프런트 테스트 하니스가 없어 자동 검증 불가 — dev compose에서
+  start만 하고 번역 주입 없이 3분 대기해 배지 전환을 눈으로 확인해야 한다.
+  **커밋 전 `/code-review`(high) 결과 반영 — 지적 10건 중 7건 수정·3건 보류**:
+  - **결정 3 반전(중요)**: ②의 `startedAt` 폴백이 *미선택* 라이브 행을 시작
+    180초 뒤 결정론적으로 STALE 오탐으로 뒤집는다는 지적이 확인됐다. 뿌리는
+    페이지가 미선택 세션의 번역을 볼 수단이 전혀 없다는 것 — 라이브 WS는
+    선택 세션에만 붙고 전역 채널은 start/end만 나른다. 그래서 **WU5의 "결정 3:
+    목록 폴링은 추가하지 않음"을 뒤집고 30초 병합 폴링(`refreshSessions`)을
+    넣었다.** 행을 지우지 않고 제자리 병합만 해 스크롤·선택이 유지된다.
+    (사용자 결정: 폴링 추가 채택, 폴백은 전체 라이브 행에 유지)
+  - ①의 열화가 "예외를 던지는 실패"만 덮었다 — pool에 `command_timeout`이
+    없어 DB 무응답은 매달림이 되고 nginx `proxy_read_timeout`(30s)이 504를
+    내 결국 상태 바가 전멸한다. `asyncio.timeout(3s)` 데드라인 추가.
+  - `active_sessions`의 `default=None` 제거(필수이면서 nullable) — 라우트가
+    필드를 빠뜨리면 조용히 null이 나가는 대신 ValidationError로 드러나야 한다.
+  - `neemba_monitor_status_db_failed_total` 추가 + `print`→`logger.exception`.
+    열화가 화면 칩 하나로만 남아 알람 계층에 안 보이던 문제.
+  - 회귀 테스트를 저장소 모킹에서 **실 pool close** 방식으로 교체 —
+    실제 `asyncpg.InterfaceError`로 검증된다(테스트 DB 규칙 준수).
+    파일 전역 metrics 스냅샷 원복 autouse 픽스처 추가.
+  - **보류 3건**: 시계 스큐(서버 startedAt vs 브라우저 Date.now() — 서버
+    상대시각으로 바꿔야 해 범위 밖), 캐시된 옛 `app.js`가 `live 세션 null개`
+    렌더(자산 캐시 전략 — WU5 기존 보류 목록에 병합), `except Exception`
+    범위(저장소의 격리 경로가 모두 같은 형태라 의도적 유지).
+  검증: pytest 146 통과, ruff·mypy 신규 유입 0, `tsc --noEmit` 무오류.
+- 2026-08-02 (prod release 세션): **release PR #65 머지·배포 완료**(`93e526d`).
+  prod가 release #57(WU1)에서 develop 전체(WU2·3·4 + #60 + #62 + #63)로 올라갔다.
+  선행으로 PR #63(WU-D)을 develop에 머지 — WU5 상태 칩이 읽는 node 게이지
+  2건을 고치는 PR이라 순서를 지켰다.
+  배포 동기는 4시간째 반복되던 Discord 경보 3종(`stt_paused` 240분,
+  `heartbeat` 180분, `ffmpeg 무진행` 10분마다)이었다. 원인은 전부
+  "게이지가 프로세스 전역인데 리셋이 인스턴스 필드에 게이팅"(`StreamOrchestrator.ts:104`)
+  + "운영자 stop 미호출로 `hub_active_session`이 1 고정"이라, 컨테이너
+  재생성만으로 즉시 해소되고 #60·#62·#63이 재발을 막는다. SSH·SG 개방은
+  필요 없었다(`deploy.yml`이 `--force-recreate`).
+  배포 후 확인: `/health` 200, `/monitor`·`/api/monitor/` 401(Basic Auth 정상).
+  다음 세션 주의: prod `/monitor`가 이제 TS 산출물이다 — 열어둔 탭은 새로고침 필요.
