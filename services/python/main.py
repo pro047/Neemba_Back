@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import traceback
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -23,6 +24,8 @@ from src.compose import build
 from src.config import get_nats_config, get_deepl_config, get_ws_url
 from src.database.pool import Db
 from src.deepL.deepL import DeeplTranslationService
+from src.monitor.node_metrics import fetch_node_gauges, gauge_bool, gauge_int
+from src.monitoring import metrics
 from src.pushClient.pusher import Pusher
 from src.repository.implementation import monitor_query_repository as mq
 from src.repository.implementation.translation_repository import (
@@ -256,9 +259,41 @@ class WsBlipListResponse(BaseModel):
     next_offset: int | None = Field(default=None, alias="nextOffset")
 
 
+class NodeStatus(BaseModel):
+    # WU5: node /metrics 게이지 스냅샷. 게이지가 응답에 없으면 None
+    # (node 는 떠 있으나 해당 게이지 미노출).
+    model_config = ConfigDict(populate_by_name=True)
+
+    stt_paused: bool | None = Field(default=None, alias="sttPaused")
+    rtmp_auth_enabled: bool | None = Field(default=None, alias="rtmpAuthEnabled")
+    publish_buffer_size: int | None = Field(default=None, alias="publishBufferSize")
+
+
+class MonitorStatusResponse(BaseModel):
+    # WU5 시스템 상태 개요. 판정(경보) 없이 현재값 표시만 — 판정은 사이드카 책임.
+    model_config = ConfigDict(populate_by_name=True)
+
+    # None = DB 조회 실패로 이 필드만 열화 (나머지 칩은 그대로 응답).
+    # nullable 이지만 default 는 두지 않는다 — 라우트가 이 필드를 빠뜨리면
+    # 조용히 null 이 나가는 대신 ValidationError 로 즉시 드러나야 한다.
+    active_sessions: int | None = Field(alias="activeSessions")
+    ws_client_connected: bool = Field(alias="wsClientConnected")
+    nats_connected: bool = Field(alias="natsConnected")
+    # None = 이 프로세스에서 브로드캐스트 이력 없음 (기동 직후 등).
+    last_broadcast_ago_sec: float | None = Field(
+        default=None, alias="lastBroadcastAgoSec"
+    )
+    node_up: bool = Field(alias="nodeUp")
+    node: NodeStatus | None = None
+
+
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
+
+# 상태 개요의 DB 조회 데드라인. 프런트 폴링 주기(10s)보다 넉넉히 짧아야
+# 요청이 겹쳐 쌓이지 않는다. node 수집 상한(3s)과 같은 자릿수로 맞췄다.
+_STATUS_DB_TIMEOUT_SECONDS = 3.0
 
 
 def get_db_pool(request: Request):
@@ -407,6 +442,61 @@ async def monitor_ws_blips(
     items = [WsBlip(**dict(r)) for r in rows]
     return WsBlipListResponse(
         items=items, limit=limit, offset=offset, nextOffset=next_offset
+    )
+
+
+@app.get('/api/monitor/status', response_model=MonitorStatusResponse)
+async def monitor_status(request: Request, pool=Depends(get_db_pool)):
+    """시스템 상태 개요 (WU5): python 게이지 + DB 집계 + node /metrics 통합.
+
+    node 수집 실패는 ``nodeUp:false, node:null`` 로 표시하고 나머지 필드는
+    정상 응답한다 — node 장애가 상태 개요 전체를 막지 않는다 (D 결정).
+    DB 조회 실패도 같은 정책: ``activeSessions:null`` 로만 열화시킨다.
+    """
+    # DB 가 죽은 순간이야말로 NATS·자막기기·node 칩을 봐야 하는 순간이다.
+    # 여기서 예외를 올려보내면 라우트가 500 이 되고 프런트는 상태 바 전체를
+    # "상태 조회 실패" 칩 하나로 덮어버린다 — 위 docstring 의 열화 원칙과 모순.
+    #
+    # 데드라인이 필요한 이유: pool 에 command_timeout 이 없어(database/pool.py)
+    # DB 가 accept 만 하고 응답을 멈추면 예외가 아니라 '매달림'이 된다. 그러면
+    # try/except 는 발동하지 않고 nginx proxy_read_timeout(30s)이 504 를 내
+    # 결국 상태 바 전멸 — 예외 경로만 막아서는 이 결함이 안 닫힌다.
+    # node 수집(node_metrics.fetch_node_gauges)과 같은 방식이다.
+    try:
+        async with asyncio.timeout(_STATUS_DB_TIMEOUT_SECONDS):
+            active: int | None = await mq.count_active_sessions(pool)
+    except Exception:
+        metrics.record_status_db_failed()
+        logger.exception("monitor_status: count_active_sessions failed (degraded)")
+        active = None
+
+    hub: WebSocketHub | None = getattr(request.app.state, "hub", None)
+    ws_connected = hub.is_client_connected() if hub is not None else False
+
+    snap = metrics.get_snapshot()
+    last_ts = snap["last_broadcast_ts"]
+    ago = max(0.0, time.time() - last_ts) if last_ts else None
+
+    # gauge_bool/gauge_int 를 쓰는 이유: Prometheus 텍스트 형식은 NaN/+Inf 를
+    # 허용하고 prom-client 도 그대로 내보낸다. 맨 int() 는 거기서 예외를 던져
+    # node 게이지 하나 때문에 라우트 전체가 500 이 된다 — nodeUp:false 로
+    # 열화시키려는 이 라우트의 설계와 정반대다.
+    gauges = await fetch_node_gauges()
+    node = None
+    if gauges is not None:
+        node = NodeStatus(
+            sttPaused=gauge_bool(gauges.get('neemba_stt_paused')),
+            rtmpAuthEnabled=gauge_bool(gauges.get('neemba_rtmp_auth_enabled')),
+            publishBufferSize=gauge_int(gauges.get('neemba_publish_buffer_size')),
+        )
+
+    return MonitorStatusResponse(
+        activeSessions=active,
+        wsClientConnected=ws_connected,
+        natsConnected=bool(snap["nats_connected"]),
+        lastBroadcastAgoSec=ago,
+        nodeUp=gauges is not None,
+        node=node,
     )
 
 

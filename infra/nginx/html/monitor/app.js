@@ -43,6 +43,14 @@
     function langPair(src, tgt) {
         return `${src || "?"} → ${tgt || "?"}`;
     }
+    function fmtAgoSec(sec) {
+        const s = Math.max(0, Math.round(sec));
+        if (s < 60)
+            return s + "초 전";
+        if (s < 3600)
+            return Math.floor(s / 60) + "분 전";
+        return Math.floor(s / 3600) + "시간 전";
+    }
     async function fetchJson(url) {
         const res = await fetch(url, { headers: { Accept: "application/json" } });
         if (!res.ok) {
@@ -136,15 +144,20 @@
     // ====================================================================
     // 탭 전환
     // ====================================================================
+    const VIEW_NAMES = ["sessions", "search", "blips"];
     function showView(name) {
-        const isSessions = name === "sessions";
-        $("view-sessions").hidden = !isSessions;
-        $("view-search").hidden = isSessions;
-        $("tab-sessions").classList.toggle("active", isSessions);
-        $("tab-search").classList.toggle("active", !isSessions);
+        VIEW_NAMES.forEach((v) => {
+            $("view-" + v).hidden = v !== name;
+            $("tab-" + v).classList.toggle("active", v === name);
+        });
     }
     $("tab-sessions").addEventListener("click", () => showView("sessions"));
     $("tab-search").addEventListener("click", () => showView("search"));
+    $("tab-blips").addEventListener("click", () => {
+        // 결정 3: 별도 탭, 진입 시 로드 (상시 폴링 없음).
+        showView("blips");
+        loadBlips(true);
+    });
     const sessionsState = {
         offset: 0,
         nextOffset: null,
@@ -154,9 +167,13 @@
         rows: new Map(), // sessionId → 행 (이벤트로 개별 갱신)
     };
     function isStale(s) {
-        if (!s.live || !s.lastTranslationAt)
+        if (!s.live)
             return false;
-        const t = new Date(s.lastTranslationAt).getTime();
+        // 번역이 한 건도 없는 세션(lastTranslationAt=null)이야말로 STALE 로 잡아야 할
+        // 대상이다 — "송출은 켰는데 번역이 안 나온다". 마지막 번역이 없으면 시작
+        // 시각을 기준으로 재서 영영 초록 LIVE 로 남지 않게 한다.
+        const ref = s.lastTranslationAt ?? s.startedAt;
+        const t = new Date(ref).getTime();
         if (isNaN(t))
             return false;
         return Date.now() - t > STALE_THRESHOLD_MS;
@@ -263,6 +280,55 @@
             }
         });
     }
+    /* 통합 리뷰(2026-08-02): WU5 "결정 3 — 목록 폴링 없음"을 뒤집는다.
+     *
+     * 미선택 라이브 행은 lastTranslationAt 을 갱신할 경로가 전혀 없다 —
+     * 라이브 WS 는 선택한 세션에만 붙고 전역 이벤트 채널은 start/end 만 나른다.
+     * 그래서 STALE 판정이 마지막 REST 조회 시점 데이터로 굳어, 번역이 정상으로
+     * 흐르는 세션도 배지가 STALE 로 고착됐다. 주기 병합 갱신이 유일한 해법이다.
+     *
+     * loadSessions(true) 를 쓰지 않는 이유: 그쪽은 행 Map 과 DOM 을 통째로 비우고
+     * 다시 쌓아 스크롤·포커스가 튄다. 여기서는 제자리 병합만 한다. */
+    const SESSIONS_POLL_MS = 30_000;
+    function refreshSessions() {
+        // 진행 중인 조회가 곧 최신값을 준다 — 겹쳐 쏘지 않는다.
+        if (sessionsState.loading)
+            return;
+        fetchJson(`${API}/sessions?limit=50&offset=0`)
+            .then((data) => {
+            const list = $("session-list");
+            (data.items ?? []).forEach((raw) => {
+                const existing = sessionsState.rows.get(raw.sessionId);
+                if (existing) {
+                    Object.assign(existing.session, raw);
+                    renderSessionRow(existing);
+                    return;
+                }
+                // 이벤트를 놓친 새 세션 — 목록 맨 위가 최신순 정렬과 맞는다.
+                const entry = makeSessionRow(adoptSession(raw));
+                sessionsState.rows.set(raw.sessionId, entry);
+                list.insertBefore(entry.li, list.firstChild);
+            });
+            renderSessionsCount();
+            // 놓친 session_ended 를 여기서 만나면 라이브 재연결 루프도 끊어야 한다
+            // (loadSessions 의 복구 경로와 같은 이유 — 끊긴 사이 종료된 세션).
+            if (detail.session && !detail.session.live && (detail.liveOn || detail.live)) {
+                $("detail-status").textContent =
+                    "세션 종료됨 (" +
+                        (detail.session.translationCount != null
+                            ? detail.session.translationCount
+                            : "?") +
+                        "건)";
+                stopLive();
+            }
+            renderDetailHeader();
+        })
+            .catch(() => {
+            // 폴링 실패는 조용히 넘긴다 — 다음 틱에 재시도하고, 실패를 화면에
+            // 쓰면 사용자가 누른 조회 결과 문구를 덮어쓴다.
+        });
+    }
+    window.setInterval(refreshSessions, SESSIONS_POLL_MS);
     $("sessions-refresh").addEventListener("click", () => loadSessions(true));
     $("sessions-more").addEventListener("click", () => {
         if (sessionsState.nextOffset != null) {
@@ -287,6 +353,9 @@
         // 세션 전환·라이브 중지마다 증가 — 같은 세션을 빠르게 재선택해도
         // 이전 fill 루프의 늦은 fetch가 새 뷰에 끼어들지 못하게 무효화한다.
         epoch: 0,
+        // WU5 결정 4: 분당 건수는 프런트 파생 — 수신 행 createdAt(epoch ms)만 모아
+        // 렌더 시 최근 60초로 걸러 센다. 라이브·gap fill 수신 공용, 세션 전환 시 리셋.
+        recentTimes: [],
     };
     function closeLive() {
         if (detail.live) {
@@ -324,11 +393,25 @@
         if (s.live && isStale(s)) {
             title.appendChild(el("span", { className: "badge stale", text: "STALE" }));
         }
+        // WU5 미니 통계: 분당 건수(최근 60s 수신 행)·마지막 수신 경과 — 진행중 세션만,
+        // 종료 세션은 "—" (결정 4). 10s STALE 타이머가 재렌더해 주기 갱신된다.
+        let stats;
+        if (s.live) {
+            const now = Date.now();
+            detail.recentTimes = detail.recentTimes.filter((t) => now - t <= 60_000);
+            stats = "  ·  분당 " + detail.recentTimes.length + "건";
+            const last = s.lastTranslationAt ? new Date(s.lastTranslationAt).getTime() : NaN;
+            stats += "  ·  마지막 수신 " + (isNaN(last) ? "없음" : fmtAgoSec((now - last) / 1000));
+        }
+        else {
+            stats = "  ·  분당 —";
+        }
         $("detail-meta").textContent =
             langPair(s.sourceLang, s.targetLang) +
                 "  ·  시작 " + fmtTime(s.startedAt) +
                 (s.endedAt ? "  ·  종료 " + fmtTime(s.endedAt) : "  ·  진행중") +
-                "  ·  " + (s.translationCount != null ? s.translationCount : 0) + "건";
+                "  ·  " + (s.translationCount != null ? s.translationCount : 0) + "건" +
+                stats;
         // live(ended_at IS NULL) 세션이면 라이브 토글 노출. 수신 중(liveOn)엔 중지용으로 유지.
         $("live-toggle").hidden = !s.live && !detail.liveOn;
     }
@@ -338,6 +421,7 @@
         detail.cursor = null;
         detail.seenIds = new Set();
         detail.lastId = null;
+        detail.recentTimes = [];
         sessionsState.selectedId = s.sessionId;
         document.querySelectorAll(".session-item").forEach((b) => {
             b.classList.toggle("selected", b === btnEl);
@@ -456,6 +540,9 @@
         // id:null(insert 실패 폴백)은 dedup 불가 — 그대로 append (D3 수용 범위).
         // createdAt이 없는 payload는 수신 시각으로 표기.
         const createdAt = m.createdAt != null ? m.createdAt : new Date().toISOString();
+        const createdMs = new Date(createdAt).getTime();
+        if (!isNaN(createdMs))
+            detail.recentTimes.push(createdMs); // 분당 건수(WU5)
         const body = $("detail-rows");
         body.appendChild(pairRow({ ...m, createdAt }, { flash: true }));
         const wrap = body.parentElement;
@@ -494,6 +581,9 @@
                 detail.seenIds.add(p.id);
                 if (detail.lastId == null || p.id > detail.lastId)
                     detail.lastId = p.id;
+                const tMs = new Date(p.createdAt).getTime();
+                if (!isNaN(tMs))
+                    detail.recentTimes.push(tMs); // 분당 건수(WU5)
                 body.appendChild(pairRow(p));
             });
             // gap fill로 받은 행도 활동으로 반영 — 복구 직후 STALE 오탐 방지 (items는 id ASC).
@@ -655,6 +745,127 @@
             runSearch(false);
     });
     // ====================================================================
+    // 시스템 상태 칩 바 (WU5) — 10s 폴링, 현재값 표시 전용 (판정은 사이드카)
+    // ====================================================================
+    const STATUS_POLL_MS = 10_000;
+    function chip(text, tone) {
+        const node = el("span", { className: "chip" + (tone ? " " + tone : "") });
+        if (tone)
+            node.appendChild(el("span", { className: "dot" }));
+        node.appendChild(el("span", { text }));
+        return node;
+    }
+    function renderStatus(st) {
+        const bar = $("status-bar");
+        clear(bar);
+        // 결정 2: 활성 칩은 둘 다 — 자막기기(/ws) 연결 여부 + DB 기준 live 세션 수.
+        bar.appendChild(chip("자막기기 " + (st.wsClientConnected ? "연결" : "끊김"), st.wsClientConnected ? "ok" : "bad"));
+        // activeSessions=null 은 DB 조회만 실패한 열화 상태 — 나머지 칩은 유효하다.
+        bar.appendChild(st.activeSessions != null
+            ? chip("live 세션 " + st.activeSessions + "개")
+            : chip("live 세션 조회 실패", "warn"));
+        bar.appendChild(chip("NATS " + (st.natsConnected ? "연결" : "끊김"), st.natsConnected ? "ok" : "bad"));
+        // "브로드캐스트"가 아니라 "자막 전송"인 이유: 이 값의 소스인
+        // record_broadcast 는 자막기기 소켓 send 성공 시에만 찍힌다. 기기가 끊겨
+        // pending 큐잉되는 동안은 번역이 정상 생산돼도 멈춘다 — 파이프라인 생존
+        // 지표로 읽히면 오독이다(옆 "자막기기" 칩과 같이 봐야 하는 값).
+        bar.appendChild(chip("마지막 자막 전송 " +
+            (st.lastBroadcastAgoSec != null ? fmtAgoSec(st.lastBroadcastAgoSec) : "없음")));
+        if (!st.nodeUp || !st.node) {
+            bar.appendChild(chip("node 응답 없음", "bad"));
+            return;
+        }
+        const n = st.node;
+        bar.appendChild(chip("STT " + (n.sttPaused == null ? "—" : n.sttPaused ? "일시정지" : "동작"), n.sttPaused == null ? undefined : n.sttPaused ? "warn" : "ok"));
+        bar.appendChild(chip("RTMP 인증 " + (n.rtmpAuthEnabled == null ? "—" : n.rtmpAuthEnabled ? "켜짐" : "꺼짐"), n.rtmpAuthEnabled == null ? undefined : n.rtmpAuthEnabled ? "ok" : "warn"));
+        bar.appendChild(chip("버퍼 " + (n.publishBufferSize != null ? n.publishBufferSize : "—")));
+    }
+    function pollStatus() {
+        fetchJson(`${API}/status`)
+            .then(renderStatus)
+            .catch(() => {
+            // python 자체가 안 죽어도 nginx·네트워크 단절일 수 있다 — 칩 하나로 표시.
+            const bar = $("status-bar");
+            clear(bar);
+            bar.appendChild(chip("상태 조회 실패", "bad"));
+        });
+    }
+    window.setInterval(pollStatus, STATUS_POLL_MS);
+    // ====================================================================
+    // 순단 이력 탭 (WU5 — §4-7 ws_blips, REST 조회만·라이브 이벤트 없음(결정 1))
+    // ====================================================================
+    const blipsState = {
+        offset: 0,
+        nextOffset: null,
+        loading: false,
+    };
+    function fmtDurationMs(ms) {
+        if (ms == null)
+            return "—";
+        if (ms < 1000)
+            return ms + "ms";
+        return (ms / 1000).toFixed(1) + "s";
+    }
+    function blipRow(b) {
+        const tr = el("tr");
+        tr.appendChild(el("td", { className: "col-sess", text: b.sessionId }));
+        tr.appendChild(el("td", { className: "col-time", text: fmtTime(b.disconnectedAt) }));
+        const rec = el("td", { className: "col-time" });
+        if (b.reconnectedAt) {
+            rec.textContent = fmtTime(b.reconnectedAt);
+        }
+        else {
+            // reconnected_at NULL 잔존 = 미복귀 (§4-7 결정 — sweeper 없음).
+            rec.appendChild(el("span", { className: "badge stale", text: "미복귀" }));
+        }
+        tr.appendChild(rec);
+        tr.appendChild(el("td", { className: "col-num", text: fmtDurationMs(b.durationMs) }));
+        tr.appendChild(el("td", { className: "col-num", text: b.flushedCount != null ? b.flushedCount : "—" }));
+        tr.appendChild(el("td", { className: "col-num", text: b.lostCount != null ? b.lostCount : "—" }));
+        tr.appendChild(el("td", {
+            className: "col-code",
+            text: b.closeCode != null
+                ? String(b.closeCode) + (b.closeReason ? " " + b.closeReason : "")
+                : "—",
+        }));
+        tr.appendChild(el("td", { className: "col-det", text: b.detectedBy }));
+        return tr;
+    }
+    function loadBlips(reset) {
+        if (blipsState.loading)
+            return;
+        blipsState.loading = true;
+        if (reset) {
+            blipsState.offset = 0;
+            clear($("blips-rows"));
+        }
+        $("blips-status").textContent = "불러오는 중…";
+        const url = `${API}/ws-blips?limit=50&offset=${blipsState.offset}`;
+        fetchJson(url)
+            .then((data) => {
+            const body = $("blips-rows");
+            (data.items ?? []).forEach((b) => body.appendChild(blipRow(b)));
+            blipsState.nextOffset = data.nextOffset != null ? data.nextOffset : null;
+            $("blips-more").hidden = blipsState.nextOffset == null;
+            $("blips-status").textContent =
+                body.children.length + "건" +
+                    (blipsState.nextOffset != null ? " (더 있음)" : "");
+        })
+            .catch((err) => {
+            $("blips-status").textContent = "오류: " + err.message;
+        })
+            .finally(() => {
+            blipsState.loading = false;
+        });
+    }
+    $("blips-refresh").addEventListener("click", () => loadBlips(true));
+    $("blips-more").addEventListener("click", () => {
+        if (blipsState.nextOffset != null) {
+            blipsState.offset = blipsState.nextOffset;
+            loadBlips(false);
+        }
+    });
+    // ====================================================================
     // 전역 이벤트 채널 (/ws/monitor/events) — 세션 목록 실시간화
     // ====================================================================
     function handleGlobalEvent(msg) {
@@ -744,4 +955,5 @@
     // 초기 로드
     // ====================================================================
     loadSessions(true);
+    pollStatus();
 })();

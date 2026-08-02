@@ -12,6 +12,7 @@
   --live: #2ecc71;
   --ended: #6b7280;
   --stale: #f5a623;
+  --down: #e05252;
 }
 
 html, body {
@@ -46,6 +47,37 @@ html, body {
 
 main { padding: 14px; }
 .view { width: 100%; }
+
+/* WU5: 시스템 상태 칩 바 */
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 18px 0;
+}
+.status-bar:empty { display: none; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ended);
+}
+.chip.ok .dot { background: var(--live); }
+.chip.bad .dot { background: var(--down); }
+.chip.warn .dot { background: var(--stale); }
+.chip.bad { color: var(--down); }
+.chip.warn { color: var(--stale); }
 
 .split { display: flex; gap: 14px; align-items: flex-start; }
 .pane-list { flex: 0 0 340px; }
@@ -141,6 +173,8 @@ table.pairs thead th {
 table.pairs td.col-src, table.pairs td.col-tgt { white-space: pre-wrap; word-break: break-word; }
 .col-seq, .col-time { width: 1%; white-space: nowrap; color: var(--muted); }
 .col-lang, .col-sess { width: 1%; white-space: nowrap; color: var(--muted); font-size: 12px; }
+/* WU5 순단 이력 표 */
+.col-num, .col-code, .col-det { width: 1%; white-space: nowrap; color: var(--muted); font-size: 12px; }
 tr.new-row { animation: flash 1s ease-out; }
 @keyframes flash { from { background: rgba(76, 139, 245, 0.22); } to { background: transparent; } }
 
