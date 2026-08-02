@@ -273,7 +273,10 @@ class MonitorStatusResponse(BaseModel):
     # WU5 시스템 상태 개요. 판정(경보) 없이 현재값 표시만 — 판정은 사이드카 책임.
     model_config = ConfigDict(populate_by_name=True)
 
-    active_sessions: int = Field(alias="activeSessions")
+    # None = DB 조회 실패로 이 필드만 열화 (나머지 칩은 그대로 응답).
+    # nullable 이지만 default 는 두지 않는다 — 라우트가 이 필드를 빠뜨리면
+    # 조용히 null 이 나가는 대신 ValidationError 로 즉시 드러나야 한다.
+    active_sessions: int | None = Field(alias="activeSessions")
     ws_client_connected: bool = Field(alias="wsClientConnected")
     nats_connected: bool = Field(alias="natsConnected")
     # None = 이 프로세스에서 브로드캐스트 이력 없음 (기동 직후 등).
@@ -287,6 +290,10 @@ class MonitorStatusResponse(BaseModel):
 app = FastAPI(title='neemba-python', lifespan=lifespan)
 
 request_count = Counter('neemba_requests_total', 'Total number of requests')
+
+# 상태 개요의 DB 조회 데드라인. 프런트 폴링 주기(10s)보다 넉넉히 짧아야
+# 요청이 겹쳐 쌓이지 않는다. node 수집 상한(3s)과 같은 자릿수로 맞췄다.
+_STATUS_DB_TIMEOUT_SECONDS = 3.0
 
 
 def get_db_pool(request: Request):
@@ -444,8 +451,24 @@ async def monitor_status(request: Request, pool=Depends(get_db_pool)):
 
     node 수집 실패는 ``nodeUp:false, node:null`` 로 표시하고 나머지 필드는
     정상 응답한다 — node 장애가 상태 개요 전체를 막지 않는다 (D 결정).
+    DB 조회 실패도 같은 정책: ``activeSessions:null`` 로만 열화시킨다.
     """
-    active = await mq.count_active_sessions(pool)
+    # DB 가 죽은 순간이야말로 NATS·자막기기·node 칩을 봐야 하는 순간이다.
+    # 여기서 예외를 올려보내면 라우트가 500 이 되고 프런트는 상태 바 전체를
+    # "상태 조회 실패" 칩 하나로 덮어버린다 — 위 docstring 의 열화 원칙과 모순.
+    #
+    # 데드라인이 필요한 이유: pool 에 command_timeout 이 없어(database/pool.py)
+    # DB 가 accept 만 하고 응답을 멈추면 예외가 아니라 '매달림'이 된다. 그러면
+    # try/except 는 발동하지 않고 nginx proxy_read_timeout(30s)이 504 를 내
+    # 결국 상태 바 전멸 — 예외 경로만 막아서는 이 결함이 안 닫힌다.
+    # node 수집(node_metrics.fetch_node_gauges)과 같은 방식이다.
+    try:
+        async with asyncio.timeout(_STATUS_DB_TIMEOUT_SECONDS):
+            active: int | None = await mq.count_active_sessions(pool)
+    except Exception:
+        metrics.record_status_db_failed()
+        logger.exception("monitor_status: count_active_sessions failed (degraded)")
+        active = None
 
     hub: WebSocketHub | None = getattr(request.app.state, "hub", None)
     ws_connected = hub.is_client_connected() if hub is not None else False

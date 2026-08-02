@@ -11,8 +11,11 @@
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+import main
 from src.consumer import consumer as consumer_module
 from src.monitor import node_metrics
 from src.monitoring import metrics
@@ -21,6 +24,20 @@ from src.repository.implementation.translation_repository import (
     end_session,
     ensure_session,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_metrics_snapshot():
+    # 이 파일의 테스트들은 모듈 전역 게이지 스냅샷을 건드린다. 되돌리지 않으면
+    # 뒤에 오는 테스트가 기본값을 전제할 때 파일 전체 실행에서만 깨진다.
+    # last_broadcast_ts 는 None 으로 되돌릴 setter 가 없어 값이 있을 때만 복원한다.
+    before = metrics.get_snapshot()
+    yield
+    metrics.set_active_session(bool(before["active_session"]))
+    metrics.set_nats_connected(bool(before["nats_connected"]))
+    if before["last_broadcast_ts"] is not None:
+        metrics.record_broadcast(before["last_broadcast_ts"])
+
 
 # --- metrics snapshot ---------------------------------------------------------
 
@@ -105,6 +122,32 @@ async def test_fetch_node_gauges_returns_none_when_node_unreachable():
     # 닫힌 포트로 즉시 connection refused — 모든 실패는 None (nodeUp:false).
     result = await node_metrics.fetch_node_gauges("http://127.0.0.1:59999/metrics")
     assert result is None
+
+
+async def test_DB_조회가_실패해도_나머지_상태_필드는_응답해야_한다(pg_pool, monkeypatch):
+    # DB 가 죽은 순간이야말로 NATS·자막기기·node 칩을 봐야 하는 순간이다.
+    # 라우트가 500 을 내면 프런트는 상태 바 전체를 "상태 조회 실패" 칩 하나로
+    # 덮어버린다 — node 실패를 nodeUp:false 로만 열화시키는 정책과 같아야 한다.
+    #
+    # 저장소 함수를 모킹하지 않고 실 pool 을 닫아서 장애를 만든다 — 그래야
+    # asyncpg 가 실제로 던지는 예외 타입으로 검증되고, 나중에 except 절을
+    # 좁히는 변경이 있으면 이 테스트가 잡는다.
+    async def _node_unreachable(*_args, **_kwargs):
+        return None
+
+    class _Request:
+        app = SimpleNamespace(state=SimpleNamespace(hub=None))
+
+    monkeypatch.setattr(main, "fetch_node_gauges", _node_unreachable)
+    metrics.set_nats_connected(True)
+    await pg_pool.close()
+
+    res = await main.monitor_status(_Request(), pool=pg_pool)
+
+    assert res.active_sessions is None       # 이 필드만 열화
+    assert res.nats_connected is True        # 나머지는 그대로 응답
+    assert res.ws_client_connected is False
+    assert res.node_up is False
 
 
 async def test_JetStream_준비가_실패하면_NATS_연결_플래그가_False여야_한다(monkeypatch):

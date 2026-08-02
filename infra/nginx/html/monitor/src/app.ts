@@ -112,7 +112,8 @@ interface NodeGauges {
 }
 
 interface StatusResponse {
-  activeSessions: number;
+  /** null = DB 조회 실패로 이 필드만 열화 (나머지 필드는 유효). */
+  activeSessions: number | null;
   /** 자막 기기(/ws) 소켓이 지금 붙어 있는지. */
   wsClientConnected: boolean;
   natsConnected: boolean;
@@ -338,8 +339,12 @@ interface PairLike {
   };
 
   function isStale(s: SessionItem): boolean {
-    if (!s.live || !s.lastTranslationAt) return false;
-    const t = new Date(s.lastTranslationAt).getTime();
+    if (!s.live) return false;
+    // 번역이 한 건도 없는 세션(lastTranslationAt=null)이야말로 STALE 로 잡아야 할
+    // 대상이다 — "송출은 켰는데 번역이 안 나온다". 마지막 번역이 없으면 시작
+    // 시각을 기준으로 재서 영영 초록 LIVE 로 남지 않게 한다.
+    const ref = s.lastTranslationAt ?? s.startedAt;
+    const t = new Date(ref).getTime();
     if (isNaN(t)) return false;
     return Date.now() - t > STALE_THRESHOLD_MS;
   }
@@ -451,6 +456,56 @@ interface PairLike {
         }
       });
   }
+
+  /* 통합 리뷰(2026-08-02): WU5 "결정 3 — 목록 폴링 없음"을 뒤집는다.
+   *
+   * 미선택 라이브 행은 lastTranslationAt 을 갱신할 경로가 전혀 없다 —
+   * 라이브 WS 는 선택한 세션에만 붙고 전역 이벤트 채널은 start/end 만 나른다.
+   * 그래서 STALE 판정이 마지막 REST 조회 시점 데이터로 굳어, 번역이 정상으로
+   * 흐르는 세션도 배지가 STALE 로 고착됐다. 주기 병합 갱신이 유일한 해법이다.
+   *
+   * loadSessions(true) 를 쓰지 않는 이유: 그쪽은 행 Map 과 DOM 을 통째로 비우고
+   * 다시 쌓아 스크롤·포커스가 튄다. 여기서는 제자리 병합만 한다. */
+  const SESSIONS_POLL_MS = 30_000;
+
+  function refreshSessions(): void {
+    // 진행 중인 조회가 곧 최신값을 준다 — 겹쳐 쏘지 않는다.
+    if (sessionsState.loading) return;
+    fetchJson<SessionsResponse>(`${API}/sessions?limit=50&offset=0`)
+      .then((data) => {
+        const list = $("session-list");
+        (data.items ?? []).forEach((raw) => {
+          const existing = sessionsState.rows.get(raw.sessionId);
+          if (existing) {
+            Object.assign(existing.session, raw);
+            renderSessionRow(existing);
+            return;
+          }
+          // 이벤트를 놓친 새 세션 — 목록 맨 위가 최신순 정렬과 맞는다.
+          const entry = makeSessionRow(adoptSession(raw));
+          sessionsState.rows.set(raw.sessionId, entry);
+          list.insertBefore(entry.li, list.firstChild);
+        });
+        renderSessionsCount();
+        // 놓친 session_ended 를 여기서 만나면 라이브 재연결 루프도 끊어야 한다
+        // (loadSessions 의 복구 경로와 같은 이유 — 끊긴 사이 종료된 세션).
+        if (detail.session && !detail.session.live && (detail.liveOn || detail.live)) {
+          $("detail-status").textContent =
+            "세션 종료됨 (" +
+            (detail.session.translationCount != null
+              ? detail.session.translationCount
+              : "?") +
+            "건)";
+          stopLive();
+        }
+        renderDetailHeader();
+      })
+      .catch(() => {
+        // 폴링 실패는 조용히 넘긴다 — 다음 틱에 재시도하고, 실패를 화면에
+        // 쓰면 사용자가 누른 조회 결과 문구를 덮어쓴다.
+      });
+  }
+  window.setInterval(refreshSessions, SESSIONS_POLL_MS);
 
   $("sessions-refresh").addEventListener("click", () => loadSessions(true));
   $("sessions-more").addEventListener("click", () => {
@@ -875,13 +930,20 @@ interface PairLike {
       "자막기기 " + (st.wsClientConnected ? "연결" : "끊김"),
       st.wsClientConnected ? "ok" : "bad"
     ));
-    bar.appendChild(chip("live 세션 " + st.activeSessions + "개"));
+    // activeSessions=null 은 DB 조회만 실패한 열화 상태 — 나머지 칩은 유효하다.
+    bar.appendChild(st.activeSessions != null
+      ? chip("live 세션 " + st.activeSessions + "개")
+      : chip("live 세션 조회 실패", "warn"));
     bar.appendChild(chip(
       "NATS " + (st.natsConnected ? "연결" : "끊김"),
       st.natsConnected ? "ok" : "bad"
     ));
+    // "브로드캐스트"가 아니라 "자막 전송"인 이유: 이 값의 소스인
+    // record_broadcast 는 자막기기 소켓 send 성공 시에만 찍힌다. 기기가 끊겨
+    // pending 큐잉되는 동안은 번역이 정상 생산돼도 멈춘다 — 파이프라인 생존
+    // 지표로 읽히면 오독이다(옆 "자막기기" 칩과 같이 봐야 하는 값).
     bar.appendChild(chip(
-      "마지막 브로드캐스트 " +
+      "마지막 자막 전송 " +
       (st.lastBroadcastAgoSec != null ? fmtAgoSec(st.lastBroadcastAgoSec) : "없음")
     ));
     if (!st.nodeUp || !st.node) {

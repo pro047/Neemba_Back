@@ -31,6 +31,10 @@ _ensure_session_failed = Counter(
     'neemba_ensure_session_failed_total',
     'Failed ensure_session attempts (session row upsert), counted per attempt',
 )
+_status_db_failed = Counter(
+    'neemba_monitor_status_db_failed_total',
+    'DB query failures on GET /api/monitor/status (degraded to activeSessions:null)',
+)
 
 # WU5(GET /api/monitor/status): prometheus_client 레지스트리는 앱 코드용 읽기
 # API 가 없어서, 게이지 setter 가 모듈 수준 스냅샷에도 병기한다. setter 시그니처
@@ -72,3 +76,9 @@ def record_unparseable() -> None:
 
 def record_ensure_session_failed() -> None:
     _ensure_session_failed.inc()
+
+
+def record_status_db_failed() -> None:
+    # 상태 개요가 DB 없이 열화 응답한 횟수. 화면은 칩 하나로 조용히 넘어가므로
+    # 이 카운터가 없으면 사람이 브라우저를 열기 전까지 열화를 아무도 모른다.
+    _status_db_failed.inc()
