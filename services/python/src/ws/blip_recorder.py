@@ -34,6 +34,19 @@ class WsBlipRecorder:
             print("blips: record_disconnect failed (ignored):", repr(e))
             return None
 
+    async def record_abandon(self, blip_id: int, *, lost_count: int) -> None:
+        """Mark an open blip as never-recovered (session ended first).
+
+        Leaves ``reconnected_at`` NULL — that is what "미복귀" means (§4-7
+        결정 2) — and records only the tail the session will never flush.
+        """
+        try:
+            await wb.abandon_blip(
+                self._pool, blip_id=blip_id, lost_count=lost_count
+            )
+        except Exception as e:
+            print("blips: record_abandon failed (ignored):", repr(e))
+
     async def record_reconnect(
         self, blip_id: int, *, flushed_count: int, lost_count: int
     ) -> None:
