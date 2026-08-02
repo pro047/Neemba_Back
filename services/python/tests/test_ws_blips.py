@@ -127,6 +127,22 @@ async def test_close_blip_stamps_reconnect_and_counts():
     assert pool.last_args == (7, 21, 0)
 
 
+# --- repository: abandon_blip -----------------------------------------------
+
+
+async def test_abandon_blip_stamps_loss_without_reconnect():
+    """세션이 먼저 끝난 blip 은 lost_count 만 찍고 reconnected_at 은 NULL 로
+    남아야 한다 (§4-7 결정 2: NULL = 미복귀)."""
+    pool = _FakePool()
+    await wb.abandon_blip(pool, blip_id=3, lost_count=5)
+    sql = pool.last_sql
+    assert "UPDATE app.ws_blips" in sql
+    assert "reconnected_at = now()" not in sql
+    # 이미 종결된 blip 의 집계를 덮어쓰지 않는다
+    assert "reconnected_at IS NULL" in sql
+    assert pool.last_args == (3, 5)
+
+
 # --- repository: list_blips -------------------------------------------------
 
 
@@ -212,6 +228,7 @@ class FakeRecorder:
     def __init__(self) -> None:
         self.disconnects: list[dict] = []
         self.reconnects: list[dict] = []
+        self.abandons: list[dict] = []
         self._next_id = 0
 
     async def record_disconnect(
@@ -233,6 +250,9 @@ class FakeRecorder:
             "flushed_count": flushed_count,
             "lost_count": lost_count,
         })
+
+    async def record_abandon(self, blip_id, *, lost_count):
+        self.abandons.append({"blip_id": blip_id, "lost_count": lost_count})
 
 
 async def _drain(n: int = 10) -> None:
@@ -340,6 +360,123 @@ async def test_different_session_leaves_blip_unreconnected():
     await _drain()
 
     assert rec.reconnects == []
+    assert rec.abandons == [{"blip_id": 1, "lost_count": 0}]
+    await _teardown(hub)
+
+
+async def test_detach_releases_slot_so_next_session_records_its_blip():
+    """세션이 순단 상태로 종료되면 슬롯이 반납돼, 다음 세션의 순단도
+    기록돼야 한다 (§11 F-1 — 2026-08-02 순단 3회 중 2회 누락의 근인)."""
+    rec = FakeRecorder()
+    hub = WebSocketHub(blip_recorder=rec)
+    ws = FakeWS()
+    await hub.attach(ws, "s1")
+    await _drain()
+    ws.client_disconnect()
+    await hub.handle_client_disconnect("s1", ws, close_code=1006)
+    await _drain()
+
+    await hub.detach("s1")  # 재접속 없이 종료 (stop 호출)
+    ws2 = FakeWS()
+    await hub.attach(ws2, "s2")
+    await _drain()
+    ws2.client_disconnect()
+    await hub.handle_client_disconnect("s2", ws2, close_code=1006)
+    await _drain()
+
+    assert [d["session_id"] for d in rec.disconnects] == ["s1", "s2"]
+    await _teardown(hub)
+
+
+async def test_detach_marks_open_blip_as_never_recovered():
+    """미복귀 종료 시 열린 행은 reconnected_at NULL 로 두되, 다시는 방류되지
+    않을 pending 을 lost_count 로 마감해야 한다."""
+    rec = FakeRecorder()
+    hub = WebSocketHub(blip_recorder=rec)
+    ws = FakeWS()
+    await hub.attach(ws, "s1")
+    await _drain()
+    ws.client_disconnect()
+    await hub.handle_client_disconnect("s1", ws, close_code=1006)
+    await _drain()
+    await hub.broadcast_to_session("s1", {"sentence": "m1"})
+    await hub.broadcast_to_session("s1", {"sentence": "m2"})
+
+    await hub.detach("s1")
+    await _drain()
+
+    assert rec.reconnects == []
+    assert rec.abandons == [{"blip_id": 1, "lost_count": 2}]
+    await _teardown(hub)
+
+
+async def test_next_session_reconnect_does_not_close_previous_blip():
+    """다음 세션의 재접속이 이전 세션의 행을 닫으면 안 된다
+    (§11 F-1 — prod 행 2 가 3.6일·타 세션으로 찍힌 경로)."""
+    rec = FakeRecorder()
+    hub = WebSocketHub(blip_recorder=rec)
+    ws = FakeWS()
+    await hub.attach(ws, "s1")
+    await _drain()
+    ws.client_disconnect()
+    await hub.handle_client_disconnect("s1", ws, close_code=1006)
+    await _drain()
+    await hub.detach("s1")
+    await _drain()
+
+    ws2 = FakeWS()
+    await hub.attach(ws2, "s2")  # 새 세션 첫 접속
+    await _drain()
+    ws2.client_disconnect()  # s2 자신의 순단
+    await hub.handle_client_disconnect("s2", ws2, close_code=1006)
+    await _drain()
+    ws3 = FakeWS()
+    await hub.attach(ws3, "s2")  # s2 의 재접속
+    await _drain()
+
+    # s2 의 재접속은 자기 blip(2)만 닫는다 — s1 의 blip 1 은 미복귀로 남는다
+    assert [r["blip_id"] for r in rec.reconnects] == [2]
+    assert rec.abandons == [{"blip_id": 1, "lost_count": 0}]
+    await _teardown(hub)
+
+
+async def test_multiple_blips_in_one_session_each_get_a_row():
+    """한 세션에서 순단이 여러 번 나면 행도 그만큼 생겨야 한다."""
+    rec = FakeRecorder()
+    hub = WebSocketHub(blip_recorder=rec)
+    for _ in range(3):
+        ws = FakeWS()
+        await hub.attach(ws, "s1")
+        await _drain()
+        ws.client_disconnect()
+        await hub.handle_client_disconnect("s1", ws, close_code=1006)
+        await _drain()
+
+    assert len(rec.disconnects) == 3
+    assert [r["blip_id"] for r in rec.reconnects] == [1, 2]
+    await _teardown(hub)
+
+
+async def test_late_reconnect_after_keepalive_gave_up_closes_blip():
+    """keepalive 가 재연결 대기를 포기한 뒤 온 재접속도 blip 을 종결해야 한다."""
+    rec = FakeRecorder()
+    hub = WebSocketHub(blip_recorder=rec)
+    ws = FakeWS()
+    await hub.attach(ws, "s1")
+    await _drain()
+    ws.client_disconnect()
+    await hub.handle_client_disconnect("s1", ws, close_code=1006)
+    await _drain()
+
+    # keepalive 300초 타임아웃이 대기를 접은 상태 재현
+    hub._reconnect_waiting = False
+    hub._reconnect_waiting_since = 0
+
+    ws2 = FakeWS()
+    await hub.attach(ws2, "s1")
+    await _drain()
+
+    assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 0}]
     await _teardown(hub)
 
 
