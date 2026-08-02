@@ -16,14 +16,22 @@ const ffmpegStale = new Counter({
   registers: [register],
 });
 
-// Absolute-value gauges (not self-incrementing counters): the publisher
-// already keeps its own cumulative droppedCount, so the hook just mirrors it.
-const publishBufferDropped = new Gauge({
+// A real process-lifetime counter, not a mirror of the buffer's own tally:
+// createStreamOrchestrator builds a fresh RetryingTranscriptPublisher per
+// session, so setting an instance-local total reset the series to 0 on every
+// session swap. The sidecar reads this as a counter (delta between scrapes)
+// and ignores negative deltas, which hid five real subtitle losses on
+// 2026-08-02 (§11 F-2). Hooks therefore report increments, not totals.
+const publishBufferDropped = new Counter({
   name: "neemba_publish_buffer_dropped_total",
   help: "Spans dropped by the publish retry buffer (expired/capacity/stop)",
   registers: [register],
 });
 
+// Instance-scoped gauge: with one live session at a time the last writer is
+// the current publisher. A late stop() from a replaced instance can still
+// zero it for one scrape — acceptable for a queue-depth gauge, unlike the
+// loss counter above.
 const publishBufferSize = new Gauge({
   name: "neemba_publish_buffer_size",
   help: "Spans currently waiting in the publish retry buffer",
@@ -69,8 +77,8 @@ export const incFfmpegStale = (): void => {
   ffmpegStale.inc();
 };
 
-export const setPublishBufferDropped = (total: number): void => {
-  publishBufferDropped.set(total);
+export const incPublishBufferDropped = (dropped: number): void => {
+  publishBufferDropped.inc(dropped);
 };
 
 export const setPublishBufferSize = (size: number): void => {
