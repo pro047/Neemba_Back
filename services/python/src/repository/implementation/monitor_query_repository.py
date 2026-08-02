@@ -97,10 +97,15 @@ def decode_search_cursor(cursor: str | None) -> tuple[datetime, int] | None:
 
 # --- SQL -------------------------------------------------------------------
 
+# last_translation_at (WU2): correlated subquery so it only runs for the
+# LIMIT-ed page rows, via ix_translations_session_id. Feeds the STALE badge
+# (D4-b) and the per-session mini stats; NULL for zero-translation sessions.
 _LIST_SESSIONS_SQL = (
     "SELECT session_id, started_at, ended_at, source_lang, target_lang, "
-    "translation_count "
-    "FROM app.sessions "
+    "translation_count, "
+    "(SELECT max(created_at) FROM app.translations t "
+    " WHERE t.session_id = s.session_id) AS last_translation_at "
+    "FROM app.sessions s "
     "ORDER BY started_at DESC, session_id DESC "
     "LIMIT $1 OFFSET $2"
 )

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PassThrough } from "node:stream";
+import { register } from "prom-client";
 import { StreamOrchestrator } from "../src/usecases/StreamOrchestrator.js";
 import { StreamSwitcher } from "../src/stream/StreamSwitcher.js";
 import type { SpeechToTextPort } from "../src/ports/sttPorts.js";
@@ -66,6 +67,14 @@ describe("StreamOrchestrator — STT 에러 회전 경계", () => {
   // in-flight rotation settle before the next error is fired.
   const flush = async () => {
     await vi.advanceTimersByTimeAsync(0);
+  };
+
+  const gaugeValue = async (name: string): Promise<number | undefined> => {
+    const metric = (await register.getMetricsAsJSON()).find(
+      (m) => m.name === name
+    );
+    return (metric as { values?: { value: number }[] } | undefined)?.values?.[0]
+      ?.value;
   };
 
   it("연속 STT 에러가 임계값을 초과하면 스트림 회전을 멈춰야 한다", async () => {
@@ -150,5 +159,27 @@ describe("StreamOrchestrator — STT 에러 회전 경계", () => {
 
     // Assert: no new stream beyond the initial one
     expect(streams).toHaveLength(1);
+  });
+
+  // 2026-07-30: prod 세션을 stop 한 뒤에도 neemba_stt_paused 가 1로 남아 있었다.
+  // 게이지를 내리는 곳이 "오디오 복귀" 경로뿐이었는데, 종료된 세션에는 돌아올
+  // 오디오가 없어 영영 1로 고착된다.
+  it("일시정지 상태에서 세션을 정지하면 stt_paused 게이지가 0으로 돌아와야 한다", async () => {
+    // Arrange: 에러 임계값을 넘겨 pause 상태로 만든다
+    const { port, streams } = createFakeSttPort();
+    const orchestrator = makeOrchestrator(port, 3);
+    const pcm = new PassThrough();
+    const stop = await orchestrator.start(pcm, { sessionId: "s1" });
+    for (let i = 0; i < 4; i++) {
+      streams[streams.length - 1].onError(new Error("Stream timed out"));
+      await flush();
+    }
+    expect(await gaugeValue("neemba_stt_paused")).toBe(1);
+
+    // Act
+    await stop();
+
+    // Assert
+    expect(await gaugeValue("neemba_stt_paused")).toBe(0);
   });
 });

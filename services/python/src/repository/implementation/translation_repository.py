@@ -8,6 +8,11 @@ translation hot path. ``end_session`` is idempotent — the heart of the
 """
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
+
+from src.monitoring.metrics import record_ensure_session_failed
+
 # --- SQL -------------------------------------------------------------------
 
 # Session-row upsert. Created on the session start signal, but also called as
@@ -23,7 +28,21 @@ _INSERT_TRANSLATION_SQL = (
     "INSERT INTO app.translations "
     "(session_id, segment_id, sequence, source_text, translated_text, "
     " source_lang, target_lang, confidence) "
-    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+    "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+    "RETURNING id, created_at"
+)
+
+# Startup reconciliation (monitor-page-v2 D4-a): any session left with
+# ended_at IS NULL when python boots is a ghost — its WS/pipeline state died
+# with the previous process. Stamp them ended in bulk and refresh the
+# translation_count that the lost stop handler would have written.
+_CLOSE_STALE_SESSIONS_SQL = (
+    "UPDATE app.sessions s SET ended_at = now(), "
+    "translation_count = ("
+    " SELECT count(*) FROM app.translations t WHERE t.session_id = s.session_id"
+    ") "
+    "WHERE ended_at IS NULL "
+    "RETURNING session_id"
 )
 
 # Idempotent end: ended_at is stamped exactly once (the WHERE guard makes a
@@ -58,6 +77,35 @@ async def ensure_session(
         await conn.execute(_ENSURE_SESSION_SQL, session_id, source_lang, target_lang)
 
 
+async def ensure_session_with_retry(
+    pool,
+    session_id: str,
+    source_lang: str | None = None,
+    target_lang: str | None = None,
+    *,
+    retries: int = 2,
+    retry_delay: float = 0.1,
+) -> None:
+    """:func:`ensure_session` with transient-failure retries (WU2).
+
+    Every failed attempt bumps ``neemba_ensure_session_failed_total``; the last
+    attempt's exception propagates so callers keep their existing isolation
+    (try/except) semantics. Delay doubles per retry (0.1s → 0.2s …) — this only
+    ever runs on the start handler and the fire-and-forget capture task, never
+    on the translation hot path.
+    """
+    for attempt in range(retries + 1):
+        try:
+            await ensure_session(pool, session_id, source_lang, target_lang)
+        except Exception:
+            record_ensure_session_failed()
+            if attempt == retries:
+                raise
+            await asyncio.sleep(retry_delay * (2 ** attempt))
+        else:
+            return
+
+
 async def insert_translation(
     pool,
     *,
@@ -69,10 +117,15 @@ async def insert_translation(
     source_lang: str | None = None,
     target_lang: str | None = None,
     confidence: float | None = None,
-) -> None:
-    """Insert one (already-masked) source↔translation pair."""
+) -> tuple[int, datetime] | None:
+    """Insert one (already-masked) source↔translation pair.
+
+    Returns the DB-assigned ``(id, created_at)`` so the capture path can put
+    them on the live monitor payload (D3: broadcast after insert) — the keys
+    the frontend uses for history↔live dedup and gap fill.
+    """
     async with pool.acquire() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             _INSERT_TRANSLATION_SQL,
             session_id,
             segment_id,
@@ -83,6 +136,22 @@ async def insert_translation(
             target_lang,
             confidence,
         )
+    if row is None:
+        return None
+    return int(row["id"]), row["created_at"]
+
+
+async def close_stale_sessions(pool) -> list[str]:
+    """Stamp every ``ended_at IS NULL`` session ended (startup, D4-a).
+
+    Called once from lifespan startup: sessions whose stop signal was lost
+    (or that were live when the previous process died) would otherwise show a
+    ghost LIVE badge forever. Also refreshes their ``translation_count``.
+    Returns the reconciled session ids (empty on a clean start).
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(_CLOSE_STALE_SESSIONS_SQL)
+    return [r["session_id"] for r in rows]
 
 
 async def end_session(pool, session_id: str) -> tuple[bool, int]:

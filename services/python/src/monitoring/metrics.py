@@ -27,6 +27,10 @@ _unparseable = Counter(
     'neemba_consumer_unparseable_total',
     'NATS messages dropped as unparseable (term-ed)',
 )
+_ensure_session_failed = Counter(
+    'neemba_ensure_session_failed_total',
+    'Failed ensure_session attempts (session row upsert), counted per attempt',
+)
 
 
 def set_active_session(active: bool) -> None:
@@ -47,3 +51,7 @@ def set_nats_connected(connected: bool) -> None:
 
 def record_unparseable() -> None:
     _unparseable.inc()
+
+
+def record_ensure_session_failed() -> None:
+    _ensure_session_failed.inc()

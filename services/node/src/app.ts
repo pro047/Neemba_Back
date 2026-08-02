@@ -9,6 +9,7 @@ import {
 import micRouter from "./router/mic.js";
 import rtmpRouter from "./router/rtmp.js";
 import { createMicWebSocketServer } from "./micWebSocket.js";
+import { setRtmpAuthEnabled } from "./monitoring/metrics.js";
 import {
   micRuntimeStore,
   type SessionRuntimeStore,
@@ -25,6 +26,17 @@ export function createApp({
   rtmp = rtmpRouter,
   runtimeStore = micRuntimeStore,
 }: CreateAppDependencies = {}) {
+  // Until now the only writer was the on_publish handler, so between a deploy
+  // and the first publish the gauge sat at prom-client's default 0 and the
+  // monitor's daily tick reported "RTMP auth off" — a false alarm that
+  // recurred on every single deploy. Seeding it here makes the metric describe
+  // the config rather than the traffic.
+  //
+  // Safe to read process.env at this point: importing rtmpRouter above pulls
+  // in config.js, whose dotenv.config() runs during module evaluation, before
+  // this function body can be called.
+  setRtmpAuthEnabled(Boolean(process.env.RTMP_PUBLISH_KEY));
+
   const app = express();
 
   app.use(express.json());

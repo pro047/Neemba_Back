@@ -120,11 +120,11 @@
 
 | WU | 상태 | 세션 일자 | 비고 |
 |----|------|----------|------|
-| WU1 | 완료 | 2026-07-25 | pytest 111 통과 + dev compose 이벤트 수신 검증. 커밋 미실행 |
-| WU2 | 대기 | — | |
-| WU3 | 대기 | — | |
-| WU4 | 대기 | — | |
-| WU5 | 대기 | — | |
+| WU1 | 완료 | 2026-07-25 | pytest 111 통과 + dev compose 이벤트 수신 검증. PR #55 머지, 2026-07-26 release #57로 prod 배포 완료 |
+| WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
+| WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
+| WU4 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome 15개 시나리오 검증 (start 자동 등장·자동 라이브·재연결 gap fill·STALE·이벤트 채널 복구) |
+| WU5 | **구현·검증 완료 · 머지 대기** | 2026-07-27 | PR **#61** `feature/monitor-v2-wu5` (`076690c`). pytest 143 통과(신규 8), ruff·mypy 신규 유입 0, `tsc --noEmit` 무오류, dev compose 검증 완료. 2026-08-02 기준 develop 미머지 |
 
 ## 7. 세션 로그
 
@@ -140,3 +140,78 @@
   컨테이너의 `docker logs`가 2026-07-18에서 멈춰 있음(프로세스는 정상,
   uvicorn reload도 동작) — 로그 드라이버 이상 의심, WU 범위 밖이라 미조치.
   다음 세션: `neemba/docs/monitor-page-v2-plan.md 읽고 WU2 진행해`
+- 2026-07-26 (WU2 세션): 캡처 경로 개편 + 세션 정합성. 변경:
+  `translation_repository.py`(insert `RETURNING id, created_at` 반환,
+  `ensure_session_with_retry`(2회 재시도·백오프 0.1s→0.2s),
+  `close_stale_sessions`(D4-a, translation_count 재계산 포함)),
+  `pusher.py`(`_capture` 순서 역전: insert→broadcast, payload에 id/createdAt
+  — insert 실패·pool 부재 시 null로 항상 포함(안정 shape)),
+  `metrics.py`(`neemba_ensure_session_failed_total`, 실패 시도당 1 증가),
+  `main.py`(lifespan 기동 시 stale 세션 일괄 종료, start 핸들러 재시도 적용,
+  `MonitorSession.lastTranslationAt`),
+  `monitor_query_repository.py`(세션 목록에 `last_translation_at` 상관 서브쿼리).
+  테스트: **테스트 DB 도입**(사용자 결정) — `tests/conftest.py`가 일회용
+  `postgres:16-alpine` 컨테이너(호스트 54329) 기동 + alembic upgrade head,
+  테스트마다 TRUNCATE. 장애 주입만 실 pool 래퍼, 성공 경로는 실 DB.
+  `tests/test_capture_db.py` 신규(11개). 검증: pytest 135 통과, ruff 클린
+  (main.py I001·F841 2건, pusher.py I001은 기존 위반으로 미조치), dev
+  compose에서 `/ws/monitor` payload에 id=222/createdAt 수신,
+  `lastTranslationAt` 일치, reload 기동 시 유령 세션 4건 일괄 종료 확인.
+  범위 밖 발견: 동일 sessionId 재사용(start) 시 `ensure_session`이
+  DO NOTHING이라 이미 종료된 세션의 `ended_at`이 NULL로 리셋되지 않음 →
+  재사용 세션은 live로 안 보이고 stop도 no-op(`ended:false`). WU4 LIVE
+  배지·WU5에서 영향 검토 필요. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU3 진행해`
+- 2026-07-26 (WU3 세션): TS 마이그레이션 (관용적 TS 스타일, 동작 불변).
+  변경: `infra/nginx/html/monitor/src/app.ts` 신규(계약 타입 포함 — WU2의
+  id/createdAt/lastTranslationAt도 타입에 선언, 사용은 WU4),
+  `tsconfig.json`(ES2022·strict·`types:[]`·outDir `.`), `package.json`+lock
+  (typescript ^5.9.2만), `app.js`는 이제 빌드 산출물(직접 수정 금지,
+  `npm run build`). 세션 시작 시 브랜치 정리: WU2 브랜치를 develop에
+  ff-merge·push 후 피처 브랜치 삭제(사용자 지시), WU3 브랜치는 develop에서
+  분기. 검증: `tsc --noEmit` 무오류, 헤드리스 Chrome(puppeteer-core)으로
+  ① 세션 목록 27개 렌더 ② 이력 8행 ③ 라이브 WS 연결·`session_closed` 전이
+  ④ 검색 6행 + 콘솔 오류 없음(favicon 404는 기존과 동일) 확인.
+  다음 세션 주의: dev nginx 컨테이너에는 html 마운트·htpasswd가 없어
+  `/monitor` 페이지를 nginx 경유로 못 봄 → 검증은 socat 브리지
+  (`docker run --rm -d --name wu3-py-bridge --network neemba_appnet -p
+  18000:8000 alpine/socat tcp-listen:8000,fork,reuseaddr tcp:python:8000`)
+  + 로컬 정적/프록시 서버로 수행했음(WU4도 동일 방법 권장). 검증용 세션
+  `wu3-verify-live-01`(종료됨)이 dev DB에 남아 있음. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU4 진행해`
+- 2026-07-26 (WU4 세션): 프런트 실시간 기능 (백엔드 무변경). 변경:
+  `infra/nginx/html/monitor/src/app.ts`(세션 목록 `Map<sessionId, 행>` 리팩터,
+  공용 재연결 WS 헬퍼(백오프 1s→2s→…→30s, open 시 리셋), `/ws/monitor/events`
+  상시 구독 — started→상단 삽입+LIVE(기존 행이면 LIVE 전환+상단 이동),
+  ended→배지·건수·상세 메타 갱신, 재연결 성공 시 목록 REST 1회 재조회,
+  D5 자동 라이브(선택 시 `startLive`, 이력도 syncLive가 처음부터 로드),
+  세션 WS 재연결+gap fill(`cursor=마지막 수신 id`로 nextCursor 소진까지,
+  `seenIds` dedup, fill 중 라이브 수신은 버퍼링 후 flush), STALE 배지
+  (목록 행+상세 헤더, 10s 타이머 재평가, 선택 세션은 라이브 수신 즉시 갱신)),
+  `style.css`(`--stale`·`.badge.stale`), `app.js` 재빌드. 검증: `tsc --noEmit`
+  무오류, socat 브리지+로컬 WS 프록시(강제 절단/차단 스위치 포함)+헤드리스
+  Chrome으로 15개 시나리오 전부 통과 — start→목록 자동 등장, 선택→자동
+  라이브·수신, WS 차단 중 2건 주입→재연결 후 gap fill 정확 행수(중복 없음),
+  stop→배지·건수 전환, 이벤트 채널 차단 중 start→복구 시 재조회로 등장·선택
+  하이라이트 유지, STALE(목록·상세). NATS 직접 주입(`transcript.session.*`)으로
+  실 번역 파이프라인 사용. 범위 밖 발견: 없음(WU2의 sessionId 재사용 이슈는
+  결정 2대로 이벤트 신뢰로 처리, 백엔드 미조치 그대로). 검증용 세션
+  `wu4-live-*`(모두 종료)가 dev DB에 잔존, STALE 검증용 세션은 삭제함.
+  커밋 전 코드 리뷰(워크플로)에서 실버그 6건 발견·수정: ① 전역 session_ended가
+  라이브 재연결 루프 미중단(끊긴 사이 종료 시 무한 재연결) → 전역 이벤트·재조회
+  경로에서 stopLive ② 재조회가 loading 중이면 복구 재조회 소실 → reloadQueued
+  ③ 재조회 병합으로 종료 판명 시 상세 헤더 "진행중" 고착 → 헤더 재렌더
+  ④ sessionId 재시작 시 이전 런 lastTranslationAt로 STALE 오탐 → null 리셋
+  ⑤ gap fill 행이 lastTranslationAt 미갱신 → fill에서 갱신 ⑥ 같은 세션 빠른
+  재선택 시 이전 fill 루프 늦은 fetch 개입 → epoch 가드. 수정 후 회귀 시나리오
+  (WS 절단 중 stop→전역 이벤트로 라이브 중단) 추가해 15/15 재통과. 다음 세션:
+  `neemba/docs/monitor-page-v2-plan.md 읽고 WU5 진행해`
+- 2026-08-02 (주일예배 prod 모니터링 세션): 코드 변경 없음. §6 의 WU5 상태를
+  "대기" → "구현·검증 완료·머지 대기(PR #61)" 로 정정. 2026-07-27 WU5 세션이
+  구현·검증을 마치고 PR 까지 열었는데 §6 갱신이 누락돼 있었다.
+  **prod 는 release #57(WU1까지)에 멈춰 있다** — WU2·3·4 는 develop 에만 있고
+  prod 화면은 TS 마이그레이션 이전의 `app.js` 다. prod 화면으로 WU2~4 기능의
+  동작 여부를 판단하면 안 된다(2026-08-02 실측: prod `app.js` 14,597 bytes,
+  7/26 15:53 빌드).
+  이 계획 범위 밖 신규 항목 2건(자막 자동 스크롤 UX, 모니터 도메인 분리)은
+  `docs/monitor-page-v3-plan.md` 로 분리했다. 다음 세션: WU1~WU5 통합 리뷰.
