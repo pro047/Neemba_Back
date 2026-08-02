@@ -30,6 +30,14 @@ _CLOSE_BLIP_SQL = (
     "WHERE id = $1 AND reconnected_at IS NULL"
 )
 
+# Session ended before the client came back: stamp only what was lost.
+# reconnected_at stays NULL on purpose (§4-7 결정 2 — NULL = 미복귀), so the
+# same IS NULL guard also keeps this from touching an already-closed row.
+_ABANDON_BLIP_SQL = (
+    "UPDATE app.ws_blips SET lost_count = $2 "
+    "WHERE id = $1 AND reconnected_at IS NULL"
+)
+
 _BLIP_COLS = (
     "id, session_id, disconnected_at, reconnected_at, duration_ms, "
     "flushed_count, lost_count, close_code, close_reason, detected_by"
@@ -64,6 +72,12 @@ async def close_blip(
     """Stamp the reconnect (timestamp + duration + counts) on an open blip."""
     async with pool.acquire() as conn:
         await conn.execute(_CLOSE_BLIP_SQL, blip_id, flushed_count, lost_count)
+
+
+async def abandon_blip(pool, *, blip_id: int, lost_count: int) -> None:
+    """Close the books on a blip whose session ended without a reconnect."""
+    async with pool.acquire() as conn:
+        await conn.execute(_ABANDON_BLIP_SQL, blip_id, lost_count)
 
 
 async def list_blips(

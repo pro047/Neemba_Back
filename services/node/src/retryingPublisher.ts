@@ -30,7 +30,10 @@ type BufferedSpan = {
 // Observation hooks so the buffer stays free of metrics dependencies —
 // createStreamOrchestrator wires these to prom-client.
 export type RetryBufferHooks = {
-  onDropped?: (cumulativeTotal: number) => void;
+  // Increment, not a running total: this buffer is rebuilt per session, so
+  // only a process-lifetime counter on the metrics side survives a session
+  // swap (§11 F-2). Called once per drop event with how many spans it lost.
+  onDropped?: (dropped: number) => void;
   onQueueSize?: (size: number) => void;
 };
 
@@ -50,7 +53,13 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
 
   private notify(): void {
     this.hooks.onQueueSize?.(this.queue.length);
-    this.hooks.onDropped?.(this.dropped);
+  }
+
+  // Single place where a drop is booked, so the local tally used by logs and
+  // droppedCount can never drift from what the metrics counter was told.
+  private recordDropped(count: number): void {
+    this.dropped += count;
+    this.hooks.onDropped?.(count);
   }
 
   get droppedCount(): number {
@@ -64,7 +73,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.queue.length > 0) {
-      this.dropped += this.queue.length;
+      this.recordDropped(this.queue.length);
       console.warn(
         `publish buffer: dropped ${this.queue.length} spans on stop, total dropped=${this.dropped}`
       );
@@ -79,8 +88,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
   // fire-and-forget).
   async publish(message: PublishEvent): Promise<void> {
     if (this.stopped) {
-      this.dropped += 1;
-      this.notify();
+      this.recordDropped(1);
       console.warn(
         `publish buffer: span dropped after stop, total dropped=${this.dropped}`
       );
@@ -90,7 +98,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
     this.queue.push({ event: message, enqueuedAt: Date.now() });
     if (this.queue.length > this.maxBuffered) {
       this.queue.shift();
-      this.dropped += 1;
+      this.recordDropped(1);
       console.warn(
         `publish buffer: capacity exceeded, oldest span dropped, total dropped=${this.dropped}`
       );
@@ -135,7 +143,7 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
       now - this.queue[0]!.enqueuedAt > this.ttlMs
     ) {
       const expired = this.queue.shift()!;
-      this.dropped += 1;
+      this.recordDropped(1);
       console.warn(
         `publish buffer: span expired after ${this.ttlMs}ms, dropped ` +
           `(session=${expired.event.sessionId} seq=${expired.event.sequence}), ` +

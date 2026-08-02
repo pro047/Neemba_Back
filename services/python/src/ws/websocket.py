@@ -28,6 +28,11 @@ class WebSocketHub:
         # resolve) → 같은 세션 재접속 시 종결. 미주입(None)이면 전부 no-op.
         self._blip_recorder = blip_recorder
         self._blip_start_task: asyncio.Task | None = None
+        # Owner of the open blip. Kept next to the task because the hub's
+        # _session_id moves on (detach → None → next session) while the blip
+        # does not: without it, another session's reconnect closed a previous
+        # session's row (§11 F-1).
+        self._blip_session_id: str | None = None
         self._blip_lost = 0  # 열린 blip 동안 pending 캡 초과로 버린 건수
 
     @staticmethod
@@ -61,25 +66,25 @@ class WebSocketHub:
             same_session = self._session_id == session_id
             # 세션 주인이 바뀌면 이전 세션의 미전송 큐를 비운다 (에러B: 교차 전송 방지)
             if self._session_id is not None and not same_session:
+                # Release before clearing: the pending tail is what the
+                # abandoned blip loses for good.
+                self._release_blip_locked()
                 self._pending.clear()
-                # 이전 세션의 열린 blip 은 종결하지 않는다 — reconnected_at NULL
-                # 잔존 = 미복귀 (§4-7 결정 2). 추적 상태만 리셋.
-                self._blip_start_task = None
-                self._blip_lost = 0
             self._session_id = session_id
             metrics.set_active_session(True)
-            # §4-7: 같은 세션의 재접속이면 열린 blip 을 종결한다. flushed 는
-            # 이 시점의 방류 예정 pending 건수. _reconnect_waiting 리셋(아래)
-            # 전, 같은 락 안에서 판정해야 attach 경쟁과 직렬화된다.
+            # §4-7: blip 주인이 돌아온 것이면 종결한다. flushed 는 이 시점의
+            # 방류 예정 pending 건수. 같은 락 안에서 판정해야 attach 경쟁과
+            # 직렬화된다.
+            # 판정 기준은 _reconnect_waiting 이 아니라 blip 주인이다: keepalive
+            # 가 300초 뒤 대기를 포기(_reconnect_waiting=False)한 다음에 온
+            # 재접속도 그 blip 을 닫아야 한다 (§11 F-1).
             if (
-                self._reconnect_waiting
-                and same_session
-                and self._blip_start_task is not None
+                self._blip_start_task is not None
+                and self._blip_session_id == session_id
             ):
                 start_task = self._blip_start_task
-                self._blip_start_task = None
                 flushed, lost = len(self._pending), self._blip_lost
-                self._blip_lost = 0
+                self._clear_blip_state_locked()
                 asyncio.create_task(self._finish_blip(start_task, flushed, lost))
         await ws.accept()
         was_reconnecting = self._reconnect_waiting
@@ -115,6 +120,10 @@ class WebSocketHub:
                 await self._safe_close(self.client)
                 self.client = None
             self._session_id = None
+            # §11 F-1: 세션이 끝나면 열린 blip 슬롯도 반납한다. 안 하면 다음
+            # 세션의 순단이 아예 기록되지 않고(_open_blip_locked 가드), 그 세션의
+            # 재접속이 남의 행을 닫는다. release 는 pending 을 비우기 전에.
+            self._release_blip_locked()
             self._pending.clear()
             metrics.set_active_session(False)
             print('hub: detached', session_id)
@@ -271,6 +280,7 @@ class WebSocketHub:
         if self._session_id is None:
             return
         self._blip_lost = 0
+        self._blip_session_id = self._session_id
         self._blip_start_task = asyncio.create_task(
             self._blip_recorder.record_disconnect(
                 self._session_id,
@@ -279,6 +289,40 @@ class WebSocketHub:
                 detected_by=detected_by,
             )
         )
+
+    def _clear_blip_state_locked(self) -> None:
+        # 슬롯만 비운다 — DB 쪽 마감은 호출자가 책임진다.
+        # (호출자가 _lock 보유 전제)
+        self._blip_start_task = None
+        self._blip_session_id = None
+        self._blip_lost = 0
+
+    def _release_blip_locked(self) -> None:
+        """세션 종료·교체로 열린 blip 을 미복귀 확정하고 슬롯을 반납한다.
+
+        ``reconnected_at`` 은 NULL 로 남긴다 — 잔존 NULL = 미복귀가 §4-7 결정 2
+        이고 모니터도 그 규약으로 '미복귀' 뱃지를 그린다. 대신 다시는 방류되지
+        않을 pending 을 ``lost_count`` 로 마감해 행이 피해량을 갖게 한다.
+        (호출자가 _lock 보유 전제 — pending 을 비우기 전에 불러야 한다)
+        """
+        start_task = self._blip_start_task
+        lost = len(self._pending) + self._blip_lost
+        self._clear_blip_state_locked()
+        if start_task is None:
+            return
+        asyncio.create_task(self._abandon_blip(start_task, lost))
+
+    async def _abandon_blip(
+        self, start_task: "asyncio.Task[int | None]", lost: int
+    ) -> None:
+        # _finish_blip 과 같은 이유로 insert 완료를 기다린다 — 종료가 insert
+        # 보다 먼저 올 수 있다.
+        try:
+            blip_id = await start_task
+            if blip_id is not None and self._blip_recorder is not None:
+                await self._blip_recorder.record_abandon(blip_id, lost_count=lost)
+        except Exception as e:
+            print('hub: blip abandon failed (ignored):', repr(e))
 
     async def _finish_blip(
         self, start_task: "asyncio.Task[int | None]", flushed: int, lost: int
