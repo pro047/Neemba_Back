@@ -118,6 +118,12 @@ export class StreamOrchestrator implements AudioConsumerPort {
 
     return async () => {
       this.stopFlag = true;
+      // Only the pcm pump above cleared this gauge, so a session that ended
+      // while paused left neemba_stt_paused stuck at 1 forever — there is no
+      // audio coming back to a stopped session. A stopped session is not a
+      // paused one; report 0 before anything below can throw.
+      this.paused = false;
+      setSttPaused(false);
       this._clearRestartTimer();
       await this.rotationInFlight?.catch(() => undefined);
       session.stop(sessionId);

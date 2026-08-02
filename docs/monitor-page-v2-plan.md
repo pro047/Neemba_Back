@@ -125,7 +125,7 @@
 | WU2 | 완료 | 2026-07-26 | pytest 135 통과(테스트 DB 도입) + dev compose에서 payload id/createdAt·lastTranslationAt·D4-a 일괄 종료 검증 |
 | WU3 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome으로 목록/이력/라이브/검색 4시나리오 검증 |
 | WU4 | 완료 | 2026-07-26 | `tsc --noEmit` 무오류 + 헤드리스 Chrome 15개 시나리오 검증 (start 자동 등장·자동 라이브·재연결 gap fill·STALE·이벤트 채널 복구) |
-| WU5 | 완료 | 2026-07-27 | pytest 145 통과 + dev compose 검증: 칩 표시·node 중지→nodeUp:false·/ws 절단→순단 이력 행·라이브 분당 건수 (헤드리스 Chrome 23개 체크). 2026-07-29 코드 리뷰 지적 2건 반영 후 커밋 |
+| WU5 | 완료 | 2026-07-27 | PR **#61** `feature/monitor-v2-wu5`. pytest 145 통과 + dev compose 검증: 칩 표시·node 중지→nodeUp:false·/ws 절단→순단 이력 행·라이브 분당 건수 (헤드리스 Chrome 23개 체크). 2026-07-29 코드 리뷰 지적 2건 반영 후 커밋 |
 | 통합 리뷰 | **완료 · PR #61 갱신 대기** | 2026-08-02 | WU1~WU5 전 범위 재검증(주장 전부 재현) + 확정 3건 반영, pytest 146 통과. **머지 순서: PR #63(WU-D) → PR #61** — WU5 칩이 읽는 node 게이지 2건이 #63에서 고쳐진다 |
 
 ## 7. 세션 로그
@@ -253,6 +253,15 @@
   activeSessions가 버려진 세션 포함, 10s 폴링 in-flight 가드·teardown 부재,
   캐시 스큐 시 init 예외로 페이지 백지화, nodeUp이 임의 2xx를 healthy로 판정,
   폴링 1회 실패에 칩 전체 소거, 스크레이프 실패 무로깅.
+- 2026-08-02 (주일예배 prod 모니터링 세션): 코드 변경 없음. §6 의 WU5 상태를
+  "대기" → "구현·검증 완료·머지 대기(PR #61)" 로 정정. 2026-07-27 WU5 세션이
+  구현·검증을 마치고 PR 까지 열었는데 §6 갱신이 누락돼 있었다.
+  **prod 는 release #57(WU1까지)에 멈춰 있다** — WU2·3·4 는 develop 에만 있고
+  prod 화면은 TS 마이그레이션 이전의 `app.js` 다. prod 화면으로 WU2~4 기능의
+  동작 여부를 판단하면 안 된다(2026-08-02 실측: prod `app.js` 14,597 bytes,
+  7/26 15:53 빌드).
+  이 계획 범위 밖 신규 항목 2건(자막 자동 스크롤 UX, 모니터 도메인 분리)은
+  `docs/monitor-page-v3-plan.md` 로 분리했다. 다음 세션: WU1~WU5 통합 리뷰.
 - 2026-08-02 (WU1~WU5 통합 리뷰 세션): 전 범위 재검증 + 확정 3건 반영.
   **재현 결과**: pytest 145 통과, ruff·mypy 신규 유입 0(위반 라인 집합이
   develop과 완전 동일), `tsc --noEmit` 무오류, `npm run build` 재빌드본이
