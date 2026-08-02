@@ -6,7 +6,7 @@ import { natsUrl } from "./config.js";
 import { JetStreamTranscriptPublisher } from "./js_pub.js";
 import { RetryingTranscriptPublisher } from "./retryingPublisher.js";
 import {
-  setPublishBufferDropped,
+  incPublishBufferDropped,
   setPublishBufferSize,
 } from "./monitoring/metrics.js";
 import { SegmentManager } from "./stream/SegmentManager.js";
@@ -56,7 +56,7 @@ export async function createStreamOrchestrator(
     undefined,
     undefined,
     {
-      onDropped: setPublishBufferDropped,
+      onDropped: incPublishBufferDropped,
       onQueueSize: setPublishBufferSize,
     }
   );
