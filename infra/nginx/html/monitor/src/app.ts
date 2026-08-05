@@ -888,6 +888,9 @@ interface PairLike {
   function stopLive(): void {
     flushLiveBuffer(); // fill 중이던 버퍼도 화면에 남긴다
     closeLive();
+    // 라이브가 끝났으면 "새 번역" 알림도 끝난다. flush 로 들어온 행까지 세고
+    // 나서 지워야 하므로 flushLiveBuffer 뒤여야 한다.
+    setPendingNew(0);
     $("live-toggle").textContent = "라이브 시작";
     $("detail-mode-label").textContent = "이력";
     $("detail-mode-label").className = "mode-label";
