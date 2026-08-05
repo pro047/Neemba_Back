@@ -356,7 +356,52 @@
         // WU5 결정 4: 분당 건수는 프런트 파생 — 수신 행 createdAt(epoch ms)만 모아
         // 렌더 시 최근 60초로 걸러 센다. 라이브·gap fill 수신 공용, 세션 전환 시 리셋.
         recentTimes: [],
+        // V1: 바닥에서 벗어난 동안 도착한 행 수. "새 번역 N건" 버튼에 표시한다.
+        pendingNew: 0,
     };
+    // ---- 스크롤 추종 (V3-A) ----------------------------------------------
+    // 바닥 판정 여유값. 0 비교는 소수점 스크롤·브라우저 확대 배율에서 깨지고,
+    // 행 높이(약 34px)보다 크면 "한 행 밀렸는데 바닥"으로 오판한다.
+    const BOTTOM_THRESHOLD_PX = 32;
+    /**
+     * 상세 목록의 실제 스크롤 컨테이너.
+     * #detail-rows 는 <tbody> 이고 그 부모는 <table> 이다. overflow 는 조부모인
+     * .table-wrap 에만 걸려 있어, 한 단계만 올라가면 스크롤 불가 요소를 잡게 된다.
+     * 그런 요소에 scrollTop 을 대입하면 예외 없이 0 으로 클램프되어 조용히 버려진다.
+     */
+    function rowsWrap() {
+        return $("detail-rows").closest(".table-wrap");
+    }
+    function isAtBottom(w) {
+        return w.scrollHeight - w.scrollTop - w.clientHeight <= BOTTOM_THRESHOLD_PX;
+    }
+    // 바닥 이동을 예약해 두고 아직 반영하지 않은 상태. 예약과 실행 사이에 낀
+    // 코드가 옛 scrollTop 을 읽고 "바닥 아님" 으로 오판하는 것을 막는다.
+    let bottomScrollQueued = false;
+    /** 행 추가 직후 scrollHeight 는 레이아웃 확정 전 값일 수 있어 다음 프레임에 민다. */
+    function scrollToBottom() {
+        const w = rowsWrap();
+        if (!w || bottomScrollQueued)
+            return; // 한 프레임에 한 번이면 충분
+        bottomScrollQueued = true;
+        requestAnimationFrame(() => {
+            bottomScrollQueued = false;
+            w.scrollTop = w.scrollHeight;
+        });
+    }
+    /** 행을 붙이기 "전에" 호출할 것 — 붙인 뒤엔 항상 바닥이 아니게 된다. */
+    function stickToBottom() {
+        if (bottomScrollQueued)
+            return true; // 곧 바닥으로 갈 예정 = 바닥으로 친다
+        const w = rowsWrap();
+        return !w || isAtBottom(w); // 컨테이너를 못 찾으면 카운터를 늘리지 않는다
+    }
+    function setPendingNew(n) {
+        detail.pendingNew = n;
+        const btn = $("detail-new");
+        btn.hidden = n <= 0;
+        btn.textContent = "↓ 새 번역 " + n + "건";
+    }
     function closeLive() {
         if (detail.live) {
             detail.live.close();
@@ -422,6 +467,7 @@
         detail.seenIds = new Set();
         detail.lastId = null;
         detail.recentTimes = [];
+        setPendingNew(0); // 세션 전환 — 이전 뷰의 미확인 건수를 물려주지 않는다
         sessionsState.selectedId = s.sessionId;
         document.querySelectorAll(".session-item").forEach((b) => {
             b.classList.toggle("selected", b === btnEl);
@@ -469,6 +515,10 @@
             $("detail-status").textContent =
                 body.children.length + "행" +
                     (detail.cursor != null ? " (더 있음)" : "");
+            // V2: 상세 진입 시 맨 아래로. "더 보기"(reset=false)는 사용자가 읽던
+            // 위치를 유지해야 하므로 최초 로드에서만 민다.
+            if (reset)
+                scrollToBottom();
         })
             .catch((err) => {
             $("detail-status").textContent = "오류: " + err.message;
@@ -481,6 +531,23 @@
         if (detail.cursor != null)
             loadHistory(false);
     });
+    function handleNewRowsClick() {
+        setPendingNew(0);
+        scrollToBottom();
+    }
+    $("detail-new").addEventListener("click", handleNewRowsClick);
+    // 사용자가 직접 바닥까지 내려오면 버튼을 거둔다. 프로그램적 스크롤이 이 핸들러를
+    // 깨워도 결과가 같으므로(어차피 바닥) "내가 스크롤했음" 플래그가 필요 없다.
+    function handleRowsScroll() {
+        if (detail.pendingNew === 0)
+            return; // scroll 은 초당 수십 번 — 싼 검사부터
+        const w = rowsWrap();
+        if (w && isAtBottom(w))
+            setPendingNew(0);
+    }
+    const rowsScrollTarget = rowsWrap();
+    if (rowsScrollTarget)
+        rowsScrollTarget.addEventListener("scroll", handleRowsScroll);
     // ---- 라이브 (WebSocket, 자동 재연결 + gap fill) -----------------------
     function startLive() {
         if (!detail.session || detail.live)
@@ -544,10 +611,12 @@
         if (!isNaN(createdMs))
             detail.recentTimes.push(createdMs); // 분당 건수(WU5)
         const body = $("detail-rows");
+        const stick = stickToBottom(); // V1: 붙이기 전에 측정
         body.appendChild(pairRow({ ...m, createdAt }, { flash: true }));
-        const wrap = body.parentElement;
-        if (wrap)
-            wrap.scrollTop = wrap.scrollHeight;
+        if (stick)
+            scrollToBottom();
+        else
+            setPendingNew(detail.pendingNew + 1);
         if (detail.session) {
             // 결정 3: 선택 세션은 라이브 수신으로 lastTranslationAt 즉시 갱신 → STALE 즉시 해제
             detail.session.lastTranslationAt = createdAt;
@@ -575,6 +644,8 @@
                 return; // 세션 전환·중지·재선택 시 중단
             const body = $("detail-rows");
             const items = data.items ?? [];
+            const stick = stickToBottom(); // V1: gap fill 도 사용자 위치를 뺏지 않는다
+            let added = 0;
             items.forEach((p) => {
                 if (detail.seenIds.has(p.id))
                     return;
@@ -585,6 +656,7 @@
                 if (!isNaN(tMs))
                     detail.recentTimes.push(tMs); // 분당 건수(WU5)
                 body.appendChild(pairRow(p));
+                added += 1;
             });
             // gap fill로 받은 행도 활동으로 반영 — 복구 직후 STALE 오탐 방지 (items는 id ASC).
             const lastItem = items[items.length - 1];
@@ -598,9 +670,10 @@
                 }
             }
             $("detail-status").textContent = "이력 동기화 중… " + body.children.length + "행";
-            const wrap = body.parentElement;
-            if (wrap)
-                wrap.scrollTop = wrap.scrollHeight;
+            if (stick)
+                scrollToBottom();
+            else if (added > 0)
+                setPendingNew(detail.pendingNew + added);
             if (data.nextCursor == null)
                 return;
             cursor = data.nextCursor;
@@ -649,6 +722,9 @@
     function stopLive() {
         flushLiveBuffer(); // fill 중이던 버퍼도 화면에 남긴다
         closeLive();
+        // 라이브가 끝났으면 "새 번역" 알림도 끝난다. flush 로 들어온 행까지 세고
+        // 나서 지워야 하므로 flushLiveBuffer 뒤여야 한다.
+        setPendingNew(0);
         $("live-toggle").textContent = "라이브 시작";
         $("detail-mode-label").textContent = "이력";
         $("detail-mode-label").className = "mode-label";
