@@ -39,14 +39,25 @@ resource "aws_iam_role_policy" "gha_deploy_sg" {
   # Exactly what scripts/update-gha-ssh-ips.sh calls, scoped to the one SG.
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ec2:AuthorizeSecurityGroupIngress",
-        "ec2:RevokeSecurityGroupIngress",
-      ]
-      Resource = aws_security_group.neemba.arn
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:AuthorizeSecurityGroupIngress",
+          "ec2:RevokeSecurityGroupIngress",
+        ]
+        Resource = aws_security_group.neemba.arn
+      },
+      {
+        # The script re-reads the SG after revoking: revoke reports a miss in the
+        # response body, not the exit code, so the only trustworthy answer is
+        # whether port 22 is still open. Read-only, and ec2:DescribeSecurityGroups
+        # does not support resource-level scoping — "*" is the only valid form.
+        Effect   = "Allow"
+        Action   = "ec2:DescribeSecurityGroups"
+        Resource = "*"
+      },
+    ]
   })
 }
 
