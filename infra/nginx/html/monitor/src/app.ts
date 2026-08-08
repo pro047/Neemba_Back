@@ -181,6 +181,28 @@ interface PairLike {
     return node as T;
   }
 
+  /* 캐시 스큐 방어: 브라우저가 옛 index.html 을 캐시한 채 새 app.js 를 받으면
+   * 새 릴리스가 추가한 요소가 없다. 전체가 IIFE 한 덩어리라 $() 가 최상위에서
+   * 던지면 그 아래 배선이 통째로 안 일어나 페이지가 죽는다 — 목록도 상태 칩도 빈다.
+   * 배선만 건너뛰어 "죽은 페이지" 를 "죽은 버튼 하나" 로 줄인다. */
+  function $opt<T extends HTMLElement = HTMLElement>(id: string): T | null {
+    return document.getElementById(id) as T | null;
+  }
+
+  /** 요소가 없으면 경고만 남기고 건너뛴다 (최상위 배선 전용 — 렌더 경로는 $() 유지). */
+  function wire<K extends keyof HTMLElementEventMap>(
+    id: string,
+    type: K,
+    fn: (ev: HTMLElementEventMap[K]) => void
+  ): void {
+    const node = $opt(id);
+    if (!node) {
+      console.warn(`monitor: missing #${id} — skip ${type}`);
+      return;
+    }
+    node.addEventListener(type, fn);
+  }
+
   function fmtTime(iso: string | null | undefined): string {
     if (!iso) return "";
     const d = new Date(iso);
@@ -247,8 +269,12 @@ interface PairLike {
       const delayMs = Math.min(RECONNECT_BASE_MS * 2 ** attempt, RECONNECT_MAX_MS);
       attempt += 1;
       resumed = true;
-      opts.onDown(delayMs);
+      // 재예약을 먼저 건다. onDown 은 상태 문구를 쓰려고 $() 를 부르는데, 캐시
+      // 스큐로 그 요소가 없으면 던진다 — 예전 순서에서는 그 예외가 setTimeout
+      // 앞에서 터져 재연결이 영영 예약되지 않았다(라이브가 통째로 죽는다).
+      // 이제 던져도 잃는 것은 문구 한 줄뿐이고, 예외는 콘솔에 남아 진단된다.
       timer = window.setTimeout(connect, delayMs);
+      opts.onDown(delayMs);
     }
 
     function connect(): void {
@@ -311,9 +337,9 @@ interface PairLike {
       $("tab-" + v).classList.toggle("active", v === name);
     });
   }
-  $("tab-sessions").addEventListener("click", () => showView("sessions"));
-  $("tab-search").addEventListener("click", () => showView("search"));
-  $("tab-blips").addEventListener("click", () => {
+  wire("tab-sessions", "click", () => showView("sessions"));
+  wire("tab-search", "click", () => showView("search"));
+  wire("tab-blips", "click", () => {
     // 결정 3: 별도 탭, 진입 시 로드 (상시 폴링 없음).
     showView("blips");
     loadBlips(true);
@@ -407,13 +433,17 @@ interface PairLike {
       if (reset) sessionsState.reloadQueued = true;
       return;
     }
-    sessionsState.loading = true;
     if (reset) {
       sessionsState.offset = 0;
       sessionsState.rows.clear();
       clear($("session-list"));
     }
     $("sessions-status").textContent = "불러오는 중…";
+    // 플래그는 동기 DOM 작업을 넘긴 뒤에 세운다. 위쪽 $() 가 던지면(캐시 스큐)
+    // 해제하는 .finally 에 영영 닿지 못해 loading 이 true 로 굳고, refreshSessions·
+    // 새로고침·WS 복구가 전부 조용히 no-op 이 된다. 여기까지는 콜백이 끼어들
+    // 여지가 없는 동기 구간이라 가드와 세팅 사이가 벌어져도 재진입 위험은 없다.
+    sessionsState.loading = true;
     const url = `${API}/sessions?limit=50&offset=${sessionsState.offset}`;
     fetchJson<SessionsResponse>(url)
       .then((data) => {
@@ -468,9 +498,16 @@ interface PairLike {
    * 다시 쌓아 스크롤·포커스가 튄다. 여기서는 제자리 병합만 한다. */
   const SESSIONS_POLL_MS = 30_000;
 
+  /* sessionsState.loading 을 공유하지 않는 이유: 그 플래그는 loadSessions 의 것이고
+   * finally 에서 reloadQueued 이어달리기를 발동시킨다. 여기서 세우면 폴링이 뜬 사이
+   * 누른 "더 보기"(loadSessions(false))가 조기 리턴하는데 reset=false 라 큐에도 안
+   * 걸려 클릭이 조용히 사라진다. 읽기는 양쪽 다, 쓰기는 각자 자기 것만. */
+  let refreshInFlight = false;
+
   function refreshSessions(): void {
     // 진행 중인 조회가 곧 최신값을 준다 — 겹쳐 쏘지 않는다.
-    if (sessionsState.loading) return;
+    if (sessionsState.loading || refreshInFlight) return;
+    refreshInFlight = true;
     fetchJson<SessionsResponse>(`${API}/sessions?limit=50&offset=0`)
       .then((data) => {
         const list = $("session-list");
@@ -503,12 +540,15 @@ interface PairLike {
       .catch(() => {
         // 폴링 실패는 조용히 넘긴다 — 다음 틱에 재시도하고, 실패를 화면에
         // 쓰면 사용자가 누른 조회 결과 문구를 덮어쓴다.
+      })
+      .finally(() => {
+        refreshInFlight = false;
       });
   }
   window.setInterval(refreshSessions, SESSIONS_POLL_MS);
 
-  $("sessions-refresh").addEventListener("click", () => loadSessions(true));
-  $("sessions-more").addEventListener("click", () => {
+  wire("sessions-refresh", "click", () => loadSessions(true));
+  wire("sessions-more", "click", () => {
     if (sessionsState.nextOffset != null) {
       sessionsState.offset = sessionsState.nextOffset;
       loadSessions(false);
@@ -551,7 +591,7 @@ interface PairLike {
    * 그런 요소에 scrollTop 을 대입하면 예외 없이 0 으로 클램프되어 조용히 버려진다.
    */
   function rowsWrap(): HTMLElement | null {
-    return $("detail-rows").closest<HTMLElement>(".table-wrap");
+    return $opt("detail-rows")?.closest<HTMLElement>(".table-wrap") ?? null;
   }
 
   function isAtBottom(w: HTMLElement): boolean {
@@ -582,7 +622,10 @@ interface PairLike {
 
   function setPendingNew(n: number): void {
     detail.pendingNew = n;
-    const btn = $("detail-new");
+    // selectSession 이 맨 먼저 부르는 경로다 — #detail-new 가 없는 캐시 스큐에서
+    // 여기서 던지면 배선을 건너뛴 보람 없이 세션 선택 자체가 죽는다.
+    const btn = $opt("detail-new");
+    if (!btn) return;
     btn.hidden = n <= 0;
     btn.textContent = "↓ 새 번역 " + n + "건";
   }
@@ -712,7 +755,7 @@ interface PairLike {
       });
   }
 
-  $("detail-more").addEventListener("click", () => {
+  wire("detail-more", "click", () => {
     if (detail.cursor != null) loadHistory(false);
   });
 
@@ -720,7 +763,7 @@ interface PairLike {
     setPendingNew(0);
     scrollToBottom();
   }
-  $("detail-new").addEventListener("click", handleNewRowsClick);
+  wire("detail-new", "click", handleNewRowsClick);
 
   // 사용자가 직접 바닥까지 내려오면 버튼을 거둔다. 프로그램적 스크롤이 이 핸들러를
   // 깨워도 결과가 같으므로(어차피 바닥) "내가 스크롤했음" 플래그가 필요 없다.
@@ -898,7 +941,7 @@ interface PairLike {
     renderDetailHeader();
   }
 
-  $("live-toggle").addEventListener("click", () => {
+  wire("live-toggle", "click", () => {
     if (detail.liveOn || detail.live) {
       stopLive();
     } else {
@@ -977,11 +1020,11 @@ interface PairLike {
       });
   }
 
-  $<HTMLFormElement>("search-form").addEventListener("submit", (ev) => {
+  wire("search-form", "submit", (ev) => {
     ev.preventDefault();
     runSearch(true);
   });
-  $("search-more").addEventListener("click", () => {
+  wire("search-more", "click", () => {
     if (searchState.cursor != null) runSearch(false);
   });
 
@@ -989,6 +1032,12 @@ interface PairLike {
   // 시스템 상태 칩 바 (WU5) — 10s 폴링, 현재값 표시 전용 (판정은 사이드카)
   // ====================================================================
   const STATUS_POLL_MS = 10_000;
+
+  /* 10s 주기 폴링이라 /status 가 그보다 오래 걸리면 — 즉 DB 가 느려 정확히 상태를
+   * 봐야 할 때 — 요청이 쌓이고 응답마다 칩 바가 다시 그려져 깜빡인다. */
+  let statusInFlight = false;
+  /** 실패 칩이 이미 붙어 있는가 — 연속 실패마다 중복으로 덧붙이지 않기 위한 상태. */
+  let statusStale = false;
 
   type ChipTone = "ok" | "bad" | "warn";
 
@@ -1002,6 +1051,7 @@ interface PairLike {
   function renderStatus(st: StatusResponse): void {
     const bar = $("status-bar");
     clear(bar);
+    statusStale = false;
     // 결정 2: 활성 칩은 둘 다 — 자막기기(/ws) 연결 여부 + DB 기준 live 세션 수.
     bar.appendChild(chip(
       "자막기기 " + (st.wsClientConnected ? "연결" : "끊김"),
@@ -1041,14 +1091,36 @@ interface PairLike {
     ));
   }
 
+  /* 결정(2026-08-06): 실패해도 기존 칩을 지우지 않고 "조회 실패" 만 덧붙인다.
+   * 오래된 값을 보여줄 위험은 있지만 실패 사실을 같이 띄우므로 최신으로 오인하지
+   * 않는다 — 아무것도 안 보이는 것보다 "이 값은 N초 전 것" 이 낫다.
+   * 바로 위 refreshSessions 와 실패 철학을 맞추는 변경이기도 하다. */
+  function markStatusStale(): void {
+    if (statusStale) return; // 연속 실패 — 칩은 하나면 된다
+    statusStale = true;
+    const bar = $opt("status-bar");
+    if (!bar) return;
+    // 칩이 하나도 없으면(최초 로드부터 실패) 덧붙일 옛 값 자체가 없다.
+    bar.appendChild(chip(
+      bar.children.length > 0 ? "조회 실패 — 앞의 값은 마지막 성공분" : "상태 조회 실패",
+      "bad"
+    ));
+  }
+
   function pollStatus(): void {
+    if (statusInFlight) return;
+    statusInFlight = true;
     fetchJson<StatusResponse>(`${API}/status`)
       .then(renderStatus)
-      .catch(() => {
-        // python 자체가 안 죽어도 nginx·네트워크 단절일 수 있다 — 칩 하나로 표시.
-        const bar = $("status-bar");
-        clear(bar);
-        bar.appendChild(chip("상태 조회 실패", "bad"));
+      // python 자체가 안 죽어도 nginx·네트워크 단절일 수 있다. renderStatus 가
+      // 던진 경우도 여기로 오는데 칩 문구만으로는 그 둘이 구분되지 않는다 —
+      // 백엔드는 멀쩡한데 백엔드를 뒤지게 되므로 에러는 반드시 콘솔에 남긴다.
+      .catch((err: unknown) => {
+        console.error("monitor: 상태 조회·렌더 실패", err);
+        markStatusStale();
+      })
+      .finally(() => {
+        statusInFlight = false;
       });
   }
   window.setInterval(pollStatus, STATUS_POLL_MS);
@@ -1120,8 +1192,8 @@ interface PairLike {
       });
   }
 
-  $("blips-refresh").addEventListener("click", () => loadBlips(true));
-  $("blips-more").addEventListener("click", () => {
+  wire("blips-refresh", "click", () => loadBlips(true));
+  wire("blips-more", "click", () => {
     if (blipsState.nextOffset != null) {
       blipsState.offset = blipsState.nextOffset;
       loadBlips(false);
@@ -1215,6 +1287,15 @@ interface PairLike {
   // ====================================================================
   // 초기 로드
   // ====================================================================
-  loadSessions(true);
-  pollStatus();
+  // 한쪽 렌더 경로가 던져도 나머지 초기화는 살린다 (배선과 같은 캐시 스큐 방어).
+  try {
+    loadSessions(true);
+  } catch (err) {
+    console.error("monitor: 초기 세션 로드 실패", err);
+  }
+  try {
+    pollStatus();
+  } catch (err) {
+    console.error("monitor: 초기 상태 조회 실패", err);
+  }
 })();
