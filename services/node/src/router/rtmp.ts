@@ -1,6 +1,6 @@
 import express from "express";
 import { z } from "zod";
-import { pythonHost } from "../config.js";
+import { DEFAULT_RTMP_PULL_URL, pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
 import { runPipelines } from "../runPipeLines.js";
 import { removeSessionId, setSessionId } from "../ports/sessionStore.js";
@@ -24,14 +24,42 @@ function publishDoneGraceMs(): number {
   return seconds * 1000;
 }
 
-// nginx-rtmp posts its notify hooks as urlencoded form fields. Only the three
-// fields we act on are declared; nginx sends a dozen more and passthrough is
-// fine because nothing downstream reads the rest.
+// nginx-rtmp posts its notify hooks as urlencoded form fields. Only the four
+// fields we act on are declared; nginx sends a dozen more (app, tcurl, flashver,
+// …) and passthrough is fine because nothing downstream reads the rest.
+// Verified against the live dev stack 2026-08-09: `name` is present on both
+// on_publish and on_publish_done.
 const hookBodySchema = z.object({
   key: z.string().optional(),
   clientid: z.string().optional(),
   addr: z.string().optional(),
+  name: z.string().optional(),
 });
+
+// The one stream node accepts, derived from the URL ffmpeg actually pulls so
+// the two can never disagree (see config.ts). Read per call for the same reason
+// RTMP_PUBLISH_KEY is: container env and tests must both take effect.
+function expectedStreamName(): string {
+  const pullUrl = process.env.RTMP_PULL_URL || DEFAULT_RTMP_PULL_URL;
+  const path = (pullUrl.split(/[?#]/, 1)[0] ?? "").replace(/\/+$/, "");
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
+// A second OBS publishing under a DIFFERENT stream name is not rejected by
+// nginx — only a same-name duplicate hits "Already publishing" (measured
+// 2026-08-09). So nginx accepts it, the hook fires, and that publisher's
+// clientid starts steering this node's single session slot. node has to be the
+// one that says no.
+//
+// Fails OPEN when the name cannot be checked (no `name` field, or a
+// RTMP_PULL_URL with no path segment): same call as RTMP_PUBLISH_KEY being
+// unset. A config typo that silently denies every publisher would take the
+// whole service down mid-worship, which is worse than the risk it removes.
+function isForeignStream(name: string | undefined): boolean {
+  const expected = expectedStreamName();
+  if (!expected || name === undefined) return false;
+  return name !== expected;
+}
 
 const stopBodySchema = z.object({
   sessionId: z.string().min(1),
@@ -58,6 +86,20 @@ export function createRtmpRouter(lifecycle: SessionLifecycle): express.Router {
       const hook = body.success ? body.data : {};
       const configuredKey = process.env.RTMP_PUBLISH_KEY;
       setRtmpAuthEnabled(Boolean(configuredKey));
+
+      // Before the key check, and unconditional on it: a wrong stream is wrong
+      // even from someone holding the key. Denying here is what keeps the
+      // publisher out of the lifecycle entirely — a 403'd publisher gets no
+      // on_publish_done from nginx either (measured 2026-08-09), so it cannot
+      // touch the session at all.
+      if (isForeignStream(hook.name)) {
+        console.warn(
+          `rtmp on_publish: denied stream "${hook.name}" from ${
+            hook.addr ?? "unknown"
+          } — only "${expectedStreamName()}" is accepted`
+        );
+        return res.status(403).end();
+      }
 
       if (!configuredKey) {
         console.warn(
@@ -92,6 +134,15 @@ export function createRtmpRouter(lifecycle: SessionLifecycle): express.Router {
       const body = hookBodySchema.safeParse(req.body ?? {});
       const hook = body.success ? body.data : {};
       const configuredKey = process.env.RTMP_PUBLISH_KEY;
+
+      if (isForeignStream(hook.name)) {
+        console.warn(
+          `rtmp on_publish_done: rejected stream "${hook.name}" from ${
+            hook.addr ?? "unknown"
+          }`
+        );
+        return res.status(403).end();
+      }
 
       // Deliberately mirrors on_publish above, positive match and all: both
       // hooks guard the same trust boundary, and writing this one as
