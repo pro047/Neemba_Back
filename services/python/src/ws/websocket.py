@@ -1,39 +1,141 @@
+"""청취자 소켓 팬아웃 허브 (멀티 청취자 P1 — `docs/multi-listener-p1-plan.md`).
+
+P1 이전에는 허브가 소켓을 1개만 들었다. 두 번째 청취자가 붙으면 첫 소켓을
+닫았고(`attach` 의 무조건 `_safe_close`), send gate·keepalive·pong·blip 이
+전부 '그 하나의 소켓' 전제로 허브 필드에 있었다.
+
+지금 구조:
+
+    세션 (session_id)                     ← 라이브 여부 = _sessions 등재 여부
+      └─ 언어 채널 (session_id, lang)     ← _channels. P1 은 세션당 1개 (D2)
+           ├─ 소켓 → _Conn               ← 소켓별 자원의 단일 소유자
+           └─ 소켓 → _Conn
+
+D2 로 채널 키를 처음부터 ``(session_id, target_lang)`` 으로 둔다. P1 에서는
+언어가 1개일 뿐이고, P2(청취자별 언어)가 자료구조를 갈아엎지 않게 하는 자리다.
+
+D3 으로 백로그(``_pending``)를 들어냈다. 커서 없이 멀티 소켓에 백로그를
+태우면 붙어 있던 청취자에게 중복 전송이 되고, 커서를 넣으면 전송 포맷이
+JSON 으로 바뀌어 앱 배포가 필요해진다. 순단 구간 자막은 P3 까지 유실을
+감수하며, 유실량은 blip 의 ``lost_count`` 로 집계한다.
+
+지켜야 할 불변식 (계획 §7):
+- 락 순서는 ``_lock → conn.send_gate`` 만. 역방향은 ABBA 데드락이다
+- send gate 는 **소켓별**. 전역이면 느린 청취자 1명이 전원의 자막을 막는다
+- 연결 검사는 ``client_state`` 와 ``application_state`` 를 함께 본다
+- ``_safe_close`` 는 send 와 같은 게이트로 직렬화한다 (에러A)
+- 다른 세션의 번역은 큐잉 없이 drop 한다 (에러B 교차 전송 방지)
+"""
 import asyncio
+import time
+import uuid
+from collections import deque
+from typing import Any, Deque, Dict, Optional
+
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
-from typing import Deque, Dict, Any, Optional
-from collections import deque
-import time
 
 from src.monitoring import metrics
 from src.ws.blip_recorder import WsBlipRecorder
+
+# node 의 rtmp 라우터 zod 기본값과 같은 값 (`router/rtmp.ts:42`).
+DEFAULT_TARGET_LANG = "en-US"
+
+# 라이브가 아닌 세션으로 붙은 소켓의 close code. 1008(파라미터 오류)과 갈라두면
+# 서버 로그에서 '세션 없음' 과 'sessionId 누락' 이 구분된다. 앱은 아직 close
+# code 로 분기하지 않지만(P2 배포 때 재시도 중단에 쓴다) 코드 자체는 지금부터
+# 정확한 값을 실어 보낸다.
+CLOSE_SESSION_NOT_FOUND = 4404
+
+_PING_INTERVAL_SECONDS = 30
+_PONG_TIMEOUT_SECONDS = 60
+
+
+def _norm_lang(lang: str | None) -> str:
+    """언어 채널 키 정규화. 'en-US' 와 'en-us' 가 다른 채널이 되면 안 된다."""
+    return (lang or DEFAULT_TARGET_LANG).strip().lower()
+
+
+class _Conn:
+    """소켓 1개분의 상태 — send gate·keepalive·pong·blip 식별자가 모두 여기 붙는다.
+
+    P1 이전에는 이 값들이 허브 필드였다. 소켓이 N개가 된 지금도 허브에 두면
+    소켓 간 간섭이 그대로 버그가 된다: 세마포어 1개는 head-of-line blocking,
+    pong 타임스탬프 1개는 '남의 pong 으로 살아있는 판정'이다.
+    """
+
+    __slots__ = (
+        "ws", "session_id", "target_lang", "client_id", "send_gate",
+        "keepalive_task", "last_pong_time", "first_pong_received",
+        "first_ping_sent_time",
+    )
+
+    def __init__(
+        self,
+        ws: WebSocket,
+        session_id: str,
+        target_lang: str,
+        client_id: str,
+    ) -> None:
+        self.ws = ws
+        self.session_id = session_id
+        self.target_lang = target_lang
+        self.client_id = client_id
+        self.send_gate = asyncio.Semaphore(1)
+        self.keepalive_task: asyncio.Task | None = None
+        self.last_pong_time = 0.0
+        self.first_pong_received = False
+        self.first_ping_sent_time = 0.0
+
+
+class _OpenBlip:
+    """기록 중인 순단 1건. ``task`` 는 insert 를 돌리는 fire-and-forget 태스크."""
+
+    __slots__ = ("task", "client_id", "lost")
+
+    def __init__(self, task: "asyncio.Task[int | None]", client_id: str) -> None:
+        self.task = task
+        self.client_id = client_id
+        self.lost = 0
 
 
 class WebSocketHub:
     def __init__(self, blip_recorder: WsBlipRecorder | None = None) -> None:
         self._lock = asyncio.Lock()
-        self.client: Optional[WebSocket] = None
-        # 동시 1세션 전제: 풀 dict 맵 대신 '지금 슬롯의 주인' sessionId 1개만 추적
-        self._session_id: Optional[str] = None
-        self._send_gate = asyncio.Semaphore(1)
-        self._keepalive_task: Optional[asyncio.Task] = None
-        self._last_pong_time = 0
-        self._first_pong_received = False  # 첫 pong을 받았는지 추적
-        self._first_ping_sent_time = 0  # REV-3: 첫 ping 송신 시각(초기 pong 타임아웃 기준)
-        self._reconnect_waiting = False
-        self._reconnect_waiting_since = 0
-        self._pending: Deque[str] = deque()
-        self._max_pending = 100
+        # (session_id, lang) -> 그 언어 채널에 붙은 소켓 집합 (D2).
+        self._channels: Dict[tuple[str, str], set[WebSocket]] = {}
+        # ws -> _Conn. 소켓별 자원의 단일 소유자이자 '붙어 있는 소켓' 명부.
+        self._conns: Dict[WebSocket, _Conn] = {}
+        # 라이브 세션 -> 등록된 언어. broadcast stale drop 의 판정 기준(에러B)
+        # 이자 /ws 가 소켓을 어느 채널에 넣을지 정하는 근거다.
+        self._sessions: Dict[str, str] = {}
         # §4-7 순단 계측: 끊김 시 ws_blips insert(fire-and-forget task 가 id 로
-        # resolve) → 같은 세션 재접속 시 종결. 미주입(None)이면 전부 no-op.
+        # resolve) → 재접속 시 종결. 미주입(None)이면 전부 no-op.
         self._blip_recorder = blip_recorder
-        self._blip_start_task: asyncio.Task | None = None
-        # Owner of the open blip. Kept next to the task because the hub's
-        # _session_id moves on (detach → None → next session) while the blip
-        # does not: without it, another session's reconnect closed a previous
-        # session's row (§11 F-1).
-        self._blip_session_id: str | None = None
-        self._blip_lost = 0  # 열린 blip 동안 pending 캡 초과로 버린 건수
+        # session_id -> 열린 blip 들(오래된 것부터). D5 로 소켓별 1행이다.
+        self._open_blips: Dict[str, Deque[_OpenBlip]] = {}
+        # fire-and-forget 태스크의 강한 참조 (`pushClient/pusher.py:49` 와 같은
+        # 관용구). 이벤트 루프는 실행 중인 태스크를 약한 참조로만 들고 있어,
+        # create_task 의 반환값을 아무도 안 붙잡으면 GC 가 그 태스크를 거둬갈 수
+        # 있다. 여기서는 자막 1건이 조용히 사라지는 것이고, D3 으로 재적재가
+        # 없어져 복구 경로가 없다.
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    # --- 태스크 수명 -------------------------------------------------------
+
+    def _spawn(self, coro: "Any") -> "asyncio.Task[Any]":
+        """fire-and-forget 코루틴을 태스크로 띄우고 참조를 붙잡는다.
+
+        ``add_done_callback(discard)`` 로 끝난 태스크는 스스로 빠지므로 set 이
+        무한히 자라지 않는다. keepalive 루프는 여기 담지 않는다 — 그건
+        ``conn.keepalive_task`` 가 소켓 수명 동안 이미 붙잡고 있다.
+        """
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    # --- 연결 상태 ---------------------------------------------------------
 
     @staticmethod
     def _is_connected(ws: WebSocket) -> bool:
@@ -47,88 +149,232 @@ class WebSocketHub:
         )
 
     def is_client_connected(self) -> bool:
-        # WU5 상태 개요(GET /api/monitor/status): 자막 기기 소켓이 지금 붙어
+        # WU5 상태 개요(GET /api/monitor/status): 자막 기기가 하나라도 붙어
         # 있는지. 읽기 전용 — 락 없이 스냅샷만 본다 (표시용, 정합성 요구 없음).
-        ws = self.client
-        return ws is not None and self._is_connected(ws)
+        return any(self._is_connected(ws) for ws in list(self._conns))
 
-    def _drop_oldest_pending_locked(self) -> None:
-        # 캡 초과로 가장 오래된 문장을 버린다. §4-7: 열린 blip(순단) 동안의
-        # 드롭은 실제 자막 유실이므로 lost_count 로 집계한다. (호출자가 _lock 보유 전제)
-        self._pending.popleft()
-        if self._blip_start_task is not None:
-            self._blip_lost += 1
+    def listener_count(self) -> int:
+        """지금 붙어 있는 청취자 소켓 수 (P1: 상태 개요·게이지용)."""
+        return sum(1 for ws in list(self._conns) if self._is_connected(ws))
 
-    async def attach(self, ws: WebSocket, session_id: str) -> None:
+    # --- 세션 등록 ---------------------------------------------------------
+
+    async def register_session(
+        self, session_id: str, target_lang: str | None = None
+    ) -> None:
+        """세션을 라이브로 등록한다 (`/internal/sessions/start`).
+
+        청취자보다 먼저 불린다 — 첫 소켓이 붙기 전에 언어 채널이 정해져야
+        브로드캐스트가 갈 곳을 안다. 재호출은 언어만 갱신하는 멱등 연산이다.
+        """
+        lang = _norm_lang(target_lang)
         async with self._lock:
-            if self.client and self.client is not ws:
-                await self._safe_close(self.client)
-            same_session = self._session_id == session_id
-            # 세션 주인이 바뀌면 이전 세션의 미전송 큐를 비운다 (에러B: 교차 전송 방지)
-            if self._session_id is not None and not same_session:
-                # Release before clearing: the pending tail is what the
-                # abandoned blip loses for good.
-                self._release_blip_locked()
-                self._pending.clear()
-            self._session_id = session_id
+            previous = self._sessions.get(session_id)
+            self._sessions[session_id] = lang
+            if previous is not None and previous != lang:
+                # 세션의 언어가 바뀌면 옛 채널의 소켓들을 새 채널로 옮긴다.
+                # 안 옮기면 그 소켓들은 등재된 채로 영원히 자막을 못 받는다.
+                self._move_channel_locked(session_id, previous, lang)
             metrics.set_active_session(True)
-            # §4-7: blip 주인이 돌아온 것이면 종결한다. flushed 는 이 시점의
-            # 방류 예정 pending 건수. 같은 락 안에서 판정해야 attach 경쟁과
-            # 직렬화된다.
-            # 판정 기준은 _reconnect_waiting 이 아니라 blip 주인이다: keepalive
-            # 가 300초 뒤 대기를 포기(_reconnect_waiting=False)한 다음에 온
-            # 재접속도 그 blip 을 닫아야 한다 (§11 F-1).
-            if (
-                self._blip_start_task is not None
-                and self._blip_session_id == session_id
-            ):
-                start_task = self._blip_start_task
-                flushed, lost = len(self._pending), self._blip_lost
-                self._clear_blip_state_locked()
-                asyncio.create_task(self._finish_blip(start_task, flushed, lost))
+        print('hub: session registered', session_id, lang)
+
+    def _move_channel_locked(
+        self, session_id: str, old_lang: str, new_lang: str
+    ) -> None:
+        peers = self._channels.pop((session_id, old_lang), None)
+        if not peers:
+            return
+        target = self._channels.setdefault((session_id, new_lang), set())
+        for ws in peers:
+            target.add(ws)
+            conn = self._conns.get(ws)
+            if conn is not None:
+                conn.target_lang = new_lang
+
+    # --- attach / detach ---------------------------------------------------
+
+    async def attach(
+        self,
+        ws: WebSocket,
+        session_id: str,
+        *,
+        target_lang: str | None = None,
+        client_id: str | None = None,
+    ) -> str | None:
+        """청취자 소켓을 세션의 언어 채널에 등재한다. 발급된 client_id 를 반환.
+
+        **기존 소켓을 닫지 않는다** — 여기가 P1 의 본질이다. 같은 세션에 N명이
+        동시에 붙을 수 있고, 각자 자기 ``_Conn`` 을 갖는다.
+
+        **라이브 세션에만 붙일 수 있다.** ``_sessions`` 에 없는 sessionId 면
+        등재하지 않고 ``4404`` 로 닫은 뒤 ``None`` 을 돌려준다. 세션을 라이브로
+        만드는 곳은 ``register_session`` 하나뿐이다 — 소켓이 자기를 등재할 수
+        있으면 종료된 세션이 재접속만으로 되살아나고, 그러면 stale drop 규약
+        (§7 에러B)과 ``neemba_hub_active_session`` 낙하가 함께 무너진다.
+
+        ``client_id`` 는 호출자가 줄 수 있고(앱이 보내기 시작하면 P2 에서 정확한
+        순단 매칭이 된다) 없으면 서버가 발급한다.
+        """
+        cid = client_id or uuid.uuid4().hex
+        # accept 를 등재보다 먼저: 등재된 소켓에 accept 전 send 가 나가면
+        # application_state 가 CONNECTING 이라 그 자막만 조용히 버려진다.
+        # 거절할 때도 accept 는 필요하다 — accept 전 close 는 핸드셰이크 실패
+        # (HTTP 403)라 close code 가 클라에 도달하지 않는다.
         await ws.accept()
-        was_reconnecting = self._reconnect_waiting
-        self.client = ws
-        self._last_pong_time = 0  # 초기값은 0 (첫 pong 받기 전까지는 타임아웃 체크 안 함)
-        self._first_pong_received = False  # 첫 pong 아직 받지 않음
-        self._first_ping_sent_time = 0  # REV-3: 새 연결마다 초기 pong 타임아웃 기준점 리셋
-        self._reconnect_waiting = False
-        self._reconnect_waiting_since = 0
-        if was_reconnecting:
-            print('curr ws : reconnected successfully!', self.client)
-        else:
-            print('curr ws :', self.client, 'session:', session_id)
 
-        # 기존 keepalive 태스크 취소
-        if self._keepalive_task and not self._keepalive_task.done():
-            self._keepalive_task.cancel()
+        conn: _Conn | None = None
+        reopened: _OpenBlip | None = None
 
-        # 새로운 keepalive 태스크 시작
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        asyncio.create_task(self._flush_pending(ws))
+        async with self._lock:
+            existing = self._conns.get(ws)
+            if existing is not None:
+                # 같은 소켓의 중복 attach 는 멱등 — 채널을 두 번 등재하지 않는다.
+                print('hub: attach ignored, already attached', existing.client_id)
+                return existing.client_id
+
+            # 화이트리스트: 세션에 등록된 언어가 곧 이 소켓이 들어갈 채널이다.
+            # target_lang 은 P2 에서 '같은 세션의 다른 언어 채널' 을 고를 때
+            # 쓸 훅이고, 세션을 만드는 근거가 되지는 않는다.
+            lang = self._sessions.get(session_id)
+            if lang is not None:
+                if target_lang and _norm_lang(target_lang) != lang:
+                    # P2 전까지 세션의 언어는 하나뿐이라 요청 언어를 들어줄 수
+                    # 없다. 조용히 무시하면 '내 언어로 듣는 중' 오해가 남는다.
+                    print('hub: requested lang ignored',
+                          _norm_lang(target_lang), '->', lang)
+                conn = _Conn(ws, session_id, lang, cid)
+                self._conns[ws] = conn
+                self._channels.setdefault((session_id, lang), set()).add(ws)
+                metrics.set_listeners(len(self._conns))
+
+                # §4-7: 이 재접속이 세션의 열린 blip 을 닫는다. 같은 락 안에서
+                # 판정해야 attach 경쟁과 직렬화된다.
+                reopened = self._match_open_blip_locked(session_id, cid)
+
+        if conn is None:
+            print('hub: attach rejected, not a live session', session_id,
+                  'live=', sorted(self._sessions))
+            try:
+                await ws.close(code=CLOSE_SESSION_NOT_FOUND)
+            except Exception as e:
+                print('hub: reject close failed (ignored):', repr(e))
+            return None
+
+        if reopened is not None:
+            self._spawn(self._finish_blip(reopened))
+
+        conn.keepalive_task = asyncio.create_task(self._keepalive_loop(conn))
+        print('curr ws :', ws, 'session:', session_id,
+              'lang:', conn.target_lang, 'client:', cid)
+        return cid
 
     async def detach(self, session_id: str) -> None:
-        async with self._lock:
-            # 다른 세션의 stop은 현재 소켓을 끊지 못한다 (mic/rtmp 교차 종료 방지의 핵심)
-            if session_id != self._session_id:
-                print('hub: detach ignored, not current session',
-                      session_id, 'current=', self._session_id)
-                return
-            if self._keepalive_task and not self._keepalive_task.done():
-                self._keepalive_task.cancel()
-            if self.client:
-                await self._safe_close(self.client)
-                self.client = None
-            self._session_id = None
-            # §11 F-1: 세션이 끝나면 열린 blip 슬롯도 반납한다. 안 하면 다음
-            # 세션의 순단이 아예 기록되지 않고(_open_blip_locked 가드), 그 세션의
-            # 재접속이 남의 행을 닫는다. release 는 pending 을 비우기 전에.
-            self._release_blip_locked()
-            self._pending.clear()
-            metrics.set_active_session(False)
-            print('hub: detached', session_id)
+        """세션 종료: 그 세션의 모든 소켓을 닫고 라이브 등록을 해제한다.
 
-    async def broadcast_to_session(self, session_id: str, payload: Dict[str, Any]) -> None:
+        다른 세션의 stop 은 현재 소켓들을 끊지 못한다 (mic/rtmp 교차 종료 방지).
+        """
+        async with self._lock:
+            if session_id not in self._sessions:
+                print('hub: detach ignored, not a live session', session_id,
+                      'live=', sorted(self._sessions))
+                return
+            conns = [c for c in self._conns.values() if c.session_id == session_id]
+            for conn in conns:
+                self._forget_conn_locked(conn)
+            self._sessions.pop(session_id, None)
+            # §11 F-1: 세션이 끝나면 열린 blip 도 미복귀로 마감하고 슬롯을 반납한다.
+            abandoned = self._release_blips_locked(session_id)
+            metrics.set_active_session(bool(self._sessions))
+            metrics.set_listeners(len(self._conns))
+
+        # close 는 락 밖에서. 안에서 하면 게이트를 쥔 느린 소켓 하나가
+        # 허브 전체(_lock)를 얼린다 — 소켓이 N개가 된 지금은 그게 전면 정지다.
+        if conns:
+            await asyncio.gather(
+                *(self._safe_close(c) for c in conns), return_exceptions=True
+            )
+        for conn in conns:
+            self._cancel_keepalive(conn)
+        for blip in abandoned:
+            self._spawn(self._abandon_blip(blip))
+        print('hub: detached', session_id, f'sockets={len(conns)}')
+
+    def _forget_conn_locked(self, conn: _Conn) -> None:
+        """명부에서만 지운다 — close 와 blip 은 호출자 책임. (_lock 보유 전제)"""
+        self._conns.pop(conn.ws, None)
+        key = (conn.session_id, conn.target_lang)
+        peers = self._channels.get(key)
+        if peers is not None:
+            peers.discard(conn.ws)
+            if not peers:
+                del self._channels[key]
+
+    def _cancel_keepalive(self, conn: _Conn) -> None:
+        task = conn.keepalive_task
+        # 자기 자신을 취소하면 뒤따르는 close 가 중간에 잘린다 — keepalive 가
+        # 스스로 소켓을 버리는 경로(_drop_conn)가 이 함수를 지난다.
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    async def _drop_conn(
+        self,
+        conn: _Conn,
+        *,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        detected_by: str,
+    ) -> None:
+        """소켓 1개를 명부에서 내리고 순단을 연다. 세션과 다른 소켓은 그대로."""
+        async with self._lock:
+            if self._conns.get(conn.ws) is not conn:
+                # 이미 정리됨 — 중복 통지(끊김 통지 + keepalive)는 여기서 멎는다.
+                return
+            self._forget_conn_locked(conn)
+            self._open_blip_locked(conn, close_code, close_reason, detected_by)
+            metrics.set_listeners(len(self._conns))
+        self._cancel_keepalive(conn)
+        await self._safe_close(conn)
+        print('hub: listener dropped', conn.client_id,
+              'session:', conn.session_id, 'by:', detected_by)
+
+    async def handle_client_disconnect(
+        self,
+        session_id: str,
+        ws: WebSocket,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        detected_by: str = "client_disconnect",
+    ) -> None:
+        """/ws 엔드포인트가 소켓 하나를 잃었을 때 호출 (§4-3 원인 1).
+
+        detach 와 달리 **세션을 끝내지 않는다** — 나머지 청취자는 계속 듣는다.
+        주인 검사로 늦게 도착한 통지(이미 정리된 소켓)는 무시한다.
+        close_code/reason 은 클라 close frame 값(1001=정상 종료, 1006=비정상
+        단절)으로 ws_blips 에 기록된다 (§4-7).
+
+        ``detected_by`` 는 ws_blips 행에 그대로 실린다. /ws 의 일반 예외 경로도
+        이 함수를 쓰므로(정상 close frame 이 아니다) 그쪽은 다른 값을 넘긴다.
+        """
+        conn = self._conns.get(ws)
+        if conn is None or conn.session_id != session_id:
+            print('hub: disconnect notice ignored (stale)', session_id)
+            return
+        await self._drop_conn(
+            conn,
+            close_code=close_code,
+            close_reason=close_reason,
+            detected_by=detected_by,
+        )
+
+    # --- 브로드캐스트 ------------------------------------------------------
+
+    async def broadcast_to_session(
+        self,
+        session_id: str,
+        payload: Dict[str, Any],
+        *,
+        target_lang: str | None = None,
+    ) -> None:
         raw_text = payload.get('sentence')
         if raw_text is None:
             print('hub: skip send, sentence is None')
@@ -137,351 +383,280 @@ class WebSocketHub:
         text = str(raw_text)
 
         async with self._lock:
-            # 슬롯 주인이 아닌 세션의 번역은 stale → drop (큐잉하지 않음, 에러B)
-            if session_id != self._session_id:
+            # 라이브가 아닌 세션의 번역은 stale → drop (에러B). D3 으로 백로그가
+            # 없어졌으므로 큐잉 없이 버린다. 이 규약을 완화하면 다른 세션의
+            # 번역이 새 청취자에게 새는 교차 전송이 된다.
+            if session_id not in self._sessions:
                 print('hub: drop stale broadcast', session_id,
-                      'current=', self._session_id)
-                return
-            ws = self.client
-
-            # REV-1: 주인검사·연결검사·pending append 를 같은 락 안에서 처리한다.
-            # 둘로 쪼개면 두 락 사이에 새 세션 attach(_pending.clear + _session_id 교체)가
-            # 끼어들어, 이전 세션 텍스트가 pending 에 들어가 새 클라로 새는 교차전송(에러B)
-            # 창이 남는다. 한 락으로 묶으면 attach 와 직렬화되어 그 창이 닫힌다.
-            if ws is None or not self._is_connected(ws):
-                if len(self._pending) >= self._max_pending:
-                    self._drop_oldest_pending_locked()
-                self._pending.append(text)
-                state = (ws.client_state, ws.application_state) if ws is not None else None
-                print("hub: queued send, ws not connected", state, f"pending={len(self._pending)}")
+                      'live=', sorted(self._sessions))
                 return
 
-        asyncio.create_task(self._send_text(ws, text, session_id))
+            lang = self._channel_lang_locked(session_id, target_lang)
+            targets = [
+                self._conns[ws]
+                for ws in self._channels.get((session_id, lang), ())
+                if ws in self._conns and self._is_connected(ws)
+            ]
+            if not targets:
+                # 아무도 못 받은 문장은 이 세션의 열린 순단들이 놓친 문장이다.
+                self._count_lost_locked(session_id)
 
-    async def _requeue(self, session_id: str, text: str) -> None:
-        # §4-3(원인 3): 전송하지 못한 문장은 버리지 않고 pending 앞쪽에 되돌려
-        # 재접속 _flush_pending 이 방류하게 한다. 슬롯 주인이 바뀌었거나
-        # 세션이 이미 끝났으면(detach 로 None) stale → drop.
-        async with self._lock:
-            if session_id is None or session_id != self._session_id:
-                return
-            if len(self._pending) >= self._max_pending:
-                self._drop_oldest_pending_locked()
-            self._pending.appendleft(text)
-            print('hub: re-queued unsent text', f"pending={len(self._pending)}")
+        if not targets:
+            print('hub: no connected listener', session_id, lang)
+            return
 
-    async def _send_text(self, ws: WebSocket, text: str, session_id: str) -> None:
+        # 소켓마다 별개 태스크 → 별개 게이트. 느린 청취자가 다른 청취자의
+        # 자막을 막지 못한다 (§7 head-of-line blocking 방지). 참조는 허브가
+        # 든다 — 여기서 GC 된 태스크는 그 청취자의 자막 1건 유실이다.
+        for conn in targets:
+            self._spawn(self._send_text(conn, text))
+
+    def _channel_lang_locked(
+        self, session_id: str, target_lang: str | None
+    ) -> str:
+        """이 브로드캐스트가 실릴 언어 채널을 고른다. (_lock 보유 전제)
+
+        P1 은 세션당 채널이 1개다. upstream 이 넘긴 ``target_lang`` 이 그 채널
+        이름과 어긋나면(설정 표기 차이 등) 자막이 통째로 사라지므로, 채널이
+        하나뿐일 때는 그 하나로 보낸다. 채널이 2개 이상인 P2 부터는 이 폴백이
+        스스로 꺼지고 정확 일치만 남는다.
+        """
+        lang = _norm_lang(target_lang)
+        if (session_id, lang) in self._channels:
+            return lang
+        channels = [l for (s, l) in self._channels if s == session_id]
+        if len(channels) == 1:
+            if lang != channels[0]:
+                print('hub: lang fallback', lang, '->', channels[0])
+            return channels[0]
+        return lang
+
+    async def send_to_socket(self, ws: WebSocket, text: str) -> None:
+        """소켓 하나에만 보낸다 (/ws 접속 인사).
+
+        브로드캐스트로 보내면 이미 듣고 있던 청취자 전원의 화면에 남의 접속
+        인사가 자막으로 뜬다 — 소켓이 1개일 때는 없던 문제다.
+        """
+        conn = self._conns.get(ws)
+        if conn is None:
+            return
+        await self._send_text(conn, text)
+
+    async def _send_text(self, conn: _Conn, text: str) -> None:
         try:
-            requeue = False
-            async with self._send_gate:
-                # 에러A 수정: 게이트 획득 후 send 직전에 상태 재확인 (TOCTOU 해소).
-                # 게이트 대기 중 detach/close 가 일어났을 수 있으므로 닫혔으면
-                # §4-3 에 따라 버리지 않고 재적재.
-                # 락 순서 불변식('_lock→_send_gate'만 허용) 때문에 _requeue(_lock)는
-                # 반드시 게이트 블록 밖에서 호출한다 — 안에서 부르면 ABBA 데드락.
-                if not self._is_connected(ws):
-                    requeue = True
-                else:
-                    await ws.send_text(text)
-            if requeue:
-                await self._requeue(session_id, text)
-                return
+            async with conn.send_gate:
+                # 게이트 대기 중 close 가 일어났을 수 있으므로 send 직전 재확인
+                # (에러A TOCTOU). D3 으로 재적재 경로가 없어져 여기서 버린다.
+                if not self._is_connected(conn.ws):
+                    print('hub: drop send, socket closed', conn.client_id)
+                    return
+                await conn.ws.send_text(text)
             metrics.record_broadcast(time.time())
             print('hub: broadcast:', text)
 
         except Exception as e:
             metrics.record_send_failed()
-            print('hub: send failed:', e)
-            # §4-3(원인 3): 실패 문장 재적재 (게이트는 이미 빠져나온 상태)
-            await self._requeue(session_id, text)
-            # 연결이 끊어진 경우에만 클라이언트 초기화
-            if not self._is_connected(ws):
-                await self._safe_close(ws)
-                async with self._lock:
-                    # REV-2: send 실패와 락 획득 사이에 새 클라가 attach 됐을 수 있으므로
-                    # 현재 슬롯이 여전히 이 ws 일 때만 비운다(새 클라 오염 방지).
-                    if self.client is ws:
-                        self.client = None
+            print('hub: send failed:', conn.client_id, e)
+            # 연결이 끊어진 경우에만 명부에서 내린다 — 일시적 실패로 살아 있는
+            # 청취자를 쫓아내면 안 된다.
+            if not self._is_connected(conn.ws):
+                await self._drop_conn(conn, detected_by="send_failed")
 
-    async def _safe_close(self, ws: WebSocket) -> None:
-        # REV-4(에러A): close 도 send 와 같은 _send_gate 로 직렬화한다.
-        # starlette 의 send_text/_send_ping/close 는 모두 같은 ASGI send 채널로 메시지를
-        # 흘리므로, _send_text 가 send 를 await 하는 '도중' 게이트 밖에서 close 가 끼어들면
-        # 'send after websocket.close'(에러A)가 난다. 게이트로 묶으면 close 는 진행 중인
-        # send 가 끝날 때까지 대기하고, close 가 먼저면 후속 _send_text 가 게이트 안
-        # 재확인(application_state)에서 return 한다.
+    async def _safe_close(self, conn: _Conn) -> None:
+        # REV-4(에러A): close 도 send 와 같은 게이트로 직렬화한다. starlette 의
+        # send_text/send_json/close 는 모두 같은 ASGI send 채널을 쓰므로,
+        # _send_text 가 send 를 await 하는 '도중' 게이트 밖에서 close 가 끼어들면
+        # 'send after websocket.close'(에러A)가 난다.
         #
-        # 락 순서 불변식: '_lock 이 _send_gate 를 감쌀 수는 있어도 그 반대는 금지'.
-        # detach/attach 는 _lock 보유 중 _safe_close(→_send_gate)를 호출(_lock→_send_gate).
-        # _safe_close 를 _send_gate 보유 중에 호출하는 경로는 없어야 한다(Semaphore 비재진입).
+        # 락 순서 불변식: '_lock 이 send_gate 를 감쌀 수는 있어도 그 반대는 금지'.
+        # 게이트가 소켓별이 된 지금도 규칙은 같다 (Semaphore 비재진입).
         try:
-            async with self._send_gate:
-                if ws.application_state == WebSocketState.CONNECTED:
-                    await ws.close()
+            async with conn.send_gate:
+                if conn.ws.application_state == WebSocketState.CONNECTED:
+                    await conn.ws.close()
         except Exception:
             pass
 
-    async def _flush_pending(self, ws: WebSocket) -> None:
-        async with self._lock:
-            if not self._pending:
-                return
-            # flush 는 attach 직후 그 세션의 소켓으로만 실행되므로 이 시점의
-            # 슬롯 주인이 곧 이 flush 의 세션이다 (_send_text 재적재 판정용).
-            session_id = self._session_id
-            pending = list(self._pending)
-            self._pending.clear()
-        if session_id is None:
-            return
-        for i, text in enumerate(pending):
-            if not self._is_connected(ws):
-                async with self._lock:
-                    for item in pending[i:]:
-                        if len(self._pending) >= self._max_pending:
-                            self._drop_oldest_pending_locked()
-                        self._pending.append(item)
-                print("hub: flush interrupted, re-queued", f"pending={len(self._pending)}")
-                return
-            await self._send_text(ws, text, session_id)
-        print("hub: flushed pending", f"count={len(pending)}")
-
-    def _mark_waiting_for_reconnect_locked(
-        self,
-        close_code: int | None = None,
-        close_reason: str | None = None,
-        detected_by: str = "keepalive_timeout",
-    ) -> None:
-        # 소켓만 비우고 _session_id·pending 은 보존한다 — 세션은 살아 있고
-        # 연결만 죽은 상태이므로, 이후 번역은 pending 에 쌓였다가 재접속
-        # attach 의 _flush_pending 으로 방류된다. (호출자가 _lock 보유 전제)
-        # §4-7: 모든 '연결만 죽음' 전이는 이 함수를 지나므로 blip 기록도
-        # 여기서 연다. 기본 detected_by 는 서버발(keepalive) — 클라발은
-        # handle_client_disconnect 가 close frame 정보와 함께 넘긴다.
-        self.client = None
-        self._reconnect_waiting = True
-        self._reconnect_waiting_since = time.time()
-        self._first_pong_received = False
-        self._last_pong_time = 0
-        self._open_blip_locked(close_code, close_reason, detected_by)
-
-    async def _mark_waiting_for_reconnect(self) -> None:
-        async with self._lock:
-            self._mark_waiting_for_reconnect_locked()
+    # --- 순단(blip) 계측 ---------------------------------------------------
 
     def _open_blip_locked(
         self,
+        conn: _Conn,
         close_code: int | None,
         close_reason: str | None,
         detected_by: str,
     ) -> None:
         # fire-and-forget insert — DB 가 죽어도 /ws 경로를 막지 않는다
-        # (recorder 가 예외를 삼킴). 이미 열린 blip 이 있으면(연속 전이) 유지.
-        if self._blip_recorder is None or self._blip_start_task is not None:
+        # (recorder 가 예외를 삼킴). D5: 소켓별 1행이라 세션당 N행이 될 수 있고,
+        # client_id 가 그 행들을 구분한다. (_lock 보유 전제)
+        if self._blip_recorder is None:
             return
-        if self._session_id is None:
-            return
-        self._blip_lost = 0
-        self._blip_session_id = self._session_id
-        self._blip_start_task = asyncio.create_task(
+        task = asyncio.create_task(
             self._blip_recorder.record_disconnect(
-                self._session_id,
+                conn.session_id,
+                client_id=conn.client_id,
                 close_code=close_code,
                 close_reason=close_reason,
                 detected_by=detected_by,
             )
         )
+        self._open_blips.setdefault(conn.session_id, deque()).append(
+            _OpenBlip(task, conn.client_id)
+        )
 
-    def _clear_blip_state_locked(self) -> None:
-        # 슬롯만 비운다 — DB 쪽 마감은 호출자가 책임진다.
-        # (호출자가 _lock 보유 전제)
-        self._blip_start_task = None
-        self._blip_session_id = None
-        self._blip_lost = 0
+    def _match_open_blip_locked(
+        self, session_id: str, client_id: str
+    ) -> _OpenBlip | None:
+        """재접속한 소켓이 닫을 순단을 고른다. (_lock 보유 전제)
 
-    def _release_blip_locked(self) -> None:
-        """세션 종료·교체로 열린 blip 을 미복귀 확정하고 슬롯을 반납한다.
+        client_id 가 일치하면 그것 — 앱이 ``/ws?clientId=`` 를 보내기 시작하면
+        (P2) 코드 변경 없이 정확 매칭이 된다.
+
+        P1 에서는 앱이 안 보내 서버가 접속마다 새 id 를 발급하므로 정확 매칭이
+        성립하지 않는다. 그래서 같은 세션의 **가장 오래된** 열린 순단을 복귀로
+        본다 (사용자 결정 2026-08-08). 청취자가 여럿이면 A 의 순단이 B 의
+        접속으로 닫히는 오귀속이 가능하다 — 정확도보다 '순단 이력이 전부
+        미복귀로 남지 않는 것'을 택한 결과다.
+        """
+        queue = self._open_blips.get(session_id)
+        if not queue:
+            return None
+        matched: _OpenBlip | None = None
+        for i, blip in enumerate(queue):
+            if blip.client_id == client_id:
+                del queue[i]
+                matched = blip
+                break
+        if matched is None:
+            matched = queue.popleft()
+        if not queue:
+            del self._open_blips[session_id]
+        return matched
+
+    def _release_blips_locked(self, session_id: str) -> list[_OpenBlip]:
+        """세션 종료로 열린 순단들을 미복귀 확정하고 슬롯을 반납한다.
 
         ``reconnected_at`` 은 NULL 로 남긴다 — 잔존 NULL = 미복귀가 §4-7 결정 2
-        이고 모니터도 그 규약으로 '미복귀' 뱃지를 그린다. 대신 다시는 방류되지
-        않을 pending 을 ``lost_count`` 로 마감해 행이 피해량을 갖게 한다.
-        (호출자가 _lock 보유 전제 — pending 을 비우기 전에 불러야 한다)
+        이고 모니터도 그 규약으로 '미복귀' 뱃지를 그린다. (_lock 보유 전제)
         """
-        start_task = self._blip_start_task
-        lost = len(self._pending) + self._blip_lost
-        self._clear_blip_state_locked()
-        if start_task is None:
-            return
-        asyncio.create_task(self._abandon_blip(start_task, lost))
+        queue = self._open_blips.pop(session_id, None)
+        return list(queue) if queue else []
 
-    async def _abandon_blip(
-        self, start_task: "asyncio.Task[int | None]", lost: int
-    ) -> None:
-        # _finish_blip 과 같은 이유로 insert 완료를 기다린다 — 종료가 insert
-        # 보다 먼저 올 수 있다.
+    def _count_lost_locked(self, session_id: str) -> None:
+        """이 세션의 열린 순단들에 '놓친 문장 1건' 을 적는다. (_lock 보유 전제)
+
+        D3 으로 백로그가 사라져 순단 중 자막은 되돌려지지 않는다. 유실을 세지
+        않으면 순단 행이 '얼마나 손해였나' 를 못 말한다.
+        """
+        for blip in self._open_blips.get(session_id, ()):
+            blip.lost += 1
+
+    async def _abandon_blip(self, blip: _OpenBlip) -> None:
+        # insert 완료를 기다린다 — 세션 종료가 insert 보다 먼저 올 수 있다.
         try:
-            blip_id = await start_task
+            blip_id = await blip.task
             if blip_id is not None and self._blip_recorder is not None:
-                await self._blip_recorder.record_abandon(blip_id, lost_count=lost)
+                await self._blip_recorder.record_abandon(
+                    blip_id, lost_count=blip.lost
+                )
         except Exception as e:
             print('hub: blip abandon failed (ignored):', repr(e))
 
-    async def _finish_blip(
-        self, start_task: "asyncio.Task[int | None]", flushed: int, lost: int
-    ) -> None:
+    async def _finish_blip(self, blip: _OpenBlip) -> None:
         # 빠른 재접속이 insert 완료보다 먼저 올 수 있으므로 start 태스크의
         # id 를 await 로 기다렸다가 종결한다 (레이스를 대기로 직렬화).
+        # flushed_count 는 D3 이후 항상 0 이다 — 방류할 백로그가 없다.
         try:
-            blip_id = await start_task
+            blip_id = await blip.task
             if blip_id is not None and self._blip_recorder is not None:
                 await self._blip_recorder.record_reconnect(
-                    blip_id, flushed_count=flushed, lost_count=lost
+                    blip_id, flushed_count=0, lost_count=blip.lost
                 )
         except Exception as e:
             print('hub: blip close failed (ignored):', repr(e))
 
-    async def handle_client_disconnect(
-        self,
-        session_id: str,
-        ws: WebSocket,
-        close_code: int | None = None,
-        close_reason: str | None = None,
-    ) -> None:
-        """/ws 엔드포인트가 WebSocketDisconnect 를 잡는 즉시 호출 (§4-3 원인 1).
+    # --- keepalive ---------------------------------------------------------
 
-        detach 와 달리 pending 을 비우지 않는다 — 끊김~재접속 사이의 번역을
-        보존해 유실을 막기 위함. 주인 검사로 늦게 도착한 통지(이미 새 소켓으로
-        교체된 뒤)는 무시한다. close_code/reason 은 클라 close frame 값
-        (1001=정상 종료, 1006=비정상 단절)으로 ws_blips 에 기록된다 (§4-7).
-        """
-        async with self._lock:
-            if session_id != self._session_id or self.client is not ws:
-                print('hub: disconnect notice ignored (stale)', session_id)
-                return
-            self._mark_waiting_for_reconnect_locked(
-                close_code, close_reason, detected_by="client_disconnect"
-            )
-            pending = len(self._pending)
-        print('hub: client disconnected, waiting for reconnect',
-              session_id, f'pending={pending}')
-
-    async def _send_ping(self, ws: WebSocket) -> bool:
-        """ping 전송 (클라이언트는 자동으로 pong 응답해야 함)"""
+    async def _send_ping(self, conn: _Conn) -> bool:
+        """ping 전송 (클라이언트는 자동으로 pong 응답해야 함)."""
         try:
-            # ping 메시지를 JSON으로 전송
-            # 클라이언트는 이를 받으면 자동으로 {"type": "pong"}을 보내야 함
-            async with self._send_gate:
-                if not self._is_connected(ws):
+            async with conn.send_gate:
+                if not self._is_connected(conn.ws):
                     return False
-                await ws.send_json({"type": "ping"})
+                await conn.ws.send_json({"type": "ping"})
             return True
         except Exception as e:
             msg = str(e)
-            # 연결이 이미 종료된 뒤 ping을 보내려 하면 Starlette가 RuntimeError를 발생시킴
-            if isinstance(e, RuntimeError) and ("websocket.send" in msg or "close" in msg.lower()):
+            # 연결이 이미 종료된 뒤 ping 을 보내려 하면 starlette 가 RuntimeError.
+            if isinstance(e, RuntimeError) and (
+                "websocket.send" in msg or "close" in msg.lower()
+            ):
                 print('ping skipped: websocket already closed')
                 return False
             print(f'ping send error: {e}')
-            raise
+            return False
 
-    async def _reconnect_ws(self, ws: WebSocket) -> None:
-        pass
+    async def _keepalive_loop(self, conn: _Conn) -> None:
+        """소켓 1개를 살피는 루프. 소켓마다 하나씩 돈다.
 
-    async def _keepalive_loop(self) -> None:
-        """주기적으로 ping을 보내서 연결을 유지"""
+        P1 이전의 '재연결 300초 대기' 는 사라졌다 — 백로그(D3)가 없어져
+        붙잡고 있을 상태가 없고, 재접속은 그냥 새 소켓으로 등재된다.
+        """
         try:
             while True:
-                await asyncio.sleep(30)  # 30초마다 ping
+                await asyncio.sleep(_PING_INTERVAL_SECONDS)
 
-                async with self._lock:
-                    ws = self.client
-                    reconnect_waiting = self._reconnect_waiting
-                    reconnect_waiting_since = self._reconnect_waiting_since
+                if not self._is_connected(conn.ws):
+                    await self._drop_conn(conn, detected_by="keepalive_timeout")
+                    return
 
-                if ws is None or not self._is_connected(ws):
-                    if reconnect_waiting:
-                        # 재연결 대기 시간 확인 (5분 제한)
-                        wait_time = time.time() - reconnect_waiting_since
-                        if wait_time > 300:  # 5분
-                            print(
-                                f'keepalive: reconnection timeout after {wait_time:.1f}s, giving up')
-                            async with self._lock:
-                                self._reconnect_waiting = False
-                                self._reconnect_waiting_since = 0
-                            break
-                        print(
-                            f'keepalive: waiting for reconnection... ({wait_time:.0f}s / 300s)')
-                        # 재연결 대기 중 - 클라이언트가 재연결할 때까지 기다림
-                        await asyncio.sleep(5)
-                        continue
-                    else:
-                        print('keepalive: no client, exiting')
-                        break
+                now = time.time()
+                if conn.first_pong_received and conn.last_pong_time > 0:
+                    # 60초 이상 pong 이 없으면 half-open 으로 보고 버린다.
+                    idle = now - conn.last_pong_time
+                    if idle > _PONG_TIMEOUT_SECONDS:
+                        print(f'keepalive: no pong for {idle:.1f}s, dropping',
+                              conn.client_id)
+                        await self._drop_conn(
+                            conn, detected_by="keepalive_timeout"
+                        )
+                        return
+                elif conn.first_ping_sent_time > 0:
+                    # REV-3: 첫 ping 을 보냈는데 첫 pong 이 한 번도 안 옴.
+                    # 처음부터 pong 을 못 보내는 클라가 붙으면 서버가 ping 만
+                    # 무한 전송하게 되므로 같은 기준으로 끊는다.
+                    idle = now - conn.first_ping_sent_time
+                    if idle > _PONG_TIMEOUT_SECONDS:
+                        print(f'keepalive: no first pong for {idle:.1f}s, dropping',
+                              conn.client_id)
+                        await self._drop_conn(
+                            conn, detected_by="keepalive_timeout"
+                        )
+                        return
 
-                try:
-                    # 에러C 수정: 게이트 역전 제거.
-                    # 첫 pong을 받은 적이 있을 때만 half-open 타임아웃을 체크하고,
-                    # 그 외에는 매 주기 ping 을 '무조건' 보낸다. (이전엔 첫 pong 전까지
-                    # ping 을 안 보내 서버·클라가 서로를 영원히 기다리는 데드락이 있었음.)
-                    if self._first_pong_received and self._last_pong_time > 0:
-                        # 60초 이상 pong이 없으면 연결 끊고 재연결 준비
-                        time_since_last_pong = time.time() - self._last_pong_time
-                        if time_since_last_pong > 60:
-                            print(
-                                f'keepalive: no pong for {time_since_last_pong:.1f}s, closing and preparing for reconnect')
-                            await self._safe_close(ws)
-                            await self._mark_waiting_for_reconnect()
-                            print(
-                                'keepalive: connection closed, waiting for client to reconnect...')
-                            # 재연결 대기 루프로 전환
-                            await asyncio.sleep(5)
-                            continue
-                    elif self._first_ping_sent_time > 0:
-                        # REV-3: 첫 ping 을 보냈는데 첫 pong 이 한 번도 안 옴(초기 half-open).
-                        # 에러C 수정으로 데드락은 풀렸지만, 처음부터 pong 을 못 보내는 클라가
-                        # 붙으면 서버가 ping 만 무한 전송하게 된다. 첫 ping 후 60초 안에
-                        # 첫 pong 이 없으면 끊고 재연결 대기로 넘긴다.
-                        time_since_first_ping = time.time() - self._first_ping_sent_time
-                        if time_since_first_ping > 60:
-                            print(
-                                f'keepalive: no first pong for {time_since_first_ping:.1f}s, closing and preparing for reconnect')
-                            await self._safe_close(ws)
-                            await self._mark_waiting_for_reconnect()
-                            await asyncio.sleep(5)
-                            continue
-
-                    # ping 전송
-                    # ping 직전에 현재 클라이언트인지와 상태를 다시 확인
-                    async with self._lock:
-                        current = self.client
-
-                    if current is not ws:
-                        print('keepalive: client replaced before ping, skipping this round')
-                        continue
-
-                    # 클라이언트는 이를 받으면 자동으로 {"type": "pong"}을 보내야 함
-                    sent = await self._send_ping(ws)
-                    if not sent:
-                        raise ConnectionError('ping not sent; websocket closed')
-                    # REV-3: 첫 ping 송신 시각 기록(초기 pong 타임아웃 기준점). 최초 1회만.
-                    if self._first_ping_sent_time == 0:
-                        self._first_ping_sent_time = time.time()
-                    print('keepalive: sent ping')
-                except Exception as e:
-                    print(f'keepalive: error {e}, preparing for reconnect')
-                    await self._safe_close(ws)
-                    await self._mark_waiting_for_reconnect()
-                    print(
-                        'keepalive: connection error, waiting for client to reconnect...')
-                    # 재연결 대기 루프로 전환
-                    await asyncio.sleep(5)
-                    continue
+                if not await self._send_ping(conn):
+                    await self._drop_conn(conn, detected_by="keepalive_timeout")
+                    return
+                if conn.first_ping_sent_time == 0:
+                    conn.first_ping_sent_time = time.time()
+                print('keepalive: sent ping', conn.client_id)
         except asyncio.CancelledError:
-            print('keepalive: cancelled')
+            print('keepalive: cancelled', conn.client_id)
         except Exception as e:
-            print(f'keepalive: unexpected error {e}')
+            print(f'keepalive: unexpected error {e}', conn.client_id)
 
-    async def on_pong(self) -> None:
-        """클라이언트로부터 pong을 받으면 호출"""
-        self._last_pong_time = time.time()
-        if not self._first_pong_received:
-            self._first_pong_received = True
-            print('keepalive: first pong received!')
+    async def on_pong(self, ws: Optional[WebSocket] = None) -> None:
+        """클라이언트로부터 pong(또는 임의의 프레임)을 받으면 호출.
+
+        ``ws`` 는 어느 청취자가 살아있음을 알린 것인지 가른다 — 소켓이 N개인
+        지금 이게 없으면 한 명의 pong 이 전원을 살아있는 것으로 만든다.
+        """
+        if ws is None:
+            return
+        conn = self._conns.get(ws)
+        if conn is None:
+            return
+        conn.last_pong_time = time.time()
+        if not conn.first_pong_received:
+            conn.first_pong_received = True
+            print('keepalive: first pong received!', conn.client_id)
