@@ -1,17 +1,18 @@
 FROM node:22-bullseye
 
+# yt-dlp / streamlink 는 초기 유튜브 수집 시절의 잔재라 제거했다. 둘 다 이미
+# 죽어 있었다 — bullseye 의 시스템 파이썬이 3.9 라 yt-dlp 는 실행 즉시
+# ImportError(3.10+ 요구), streamlink 는 저장소 고정판 2.0.0(현재 7.x).
+# 매 빌드마다 깨진 것을 받아오고 있었고, 설치돼 있다는 사실이 "쓸 수 있다"는
+# 오해를 만든다. 유튜브 수집은 IP 차단으로 기각됐다 —
+# 근거와 되살릴 때의 주의사항은 docs/youtube-ingest-rejected.md.
 RUN apt-get update && apt-get install -y \
-    python3 \
     ffmpeg \
     jq \
     curl \
     git \
     ca-certificates \
-    streamlink \
     && rm -rf /var/lib/apt/lists/*
-
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
--o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp
 
 RUN set -eux; \
     ARCH="$(dpkg --print-architecture)"; \
