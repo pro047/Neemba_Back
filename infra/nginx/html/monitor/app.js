@@ -935,8 +935,10 @@
     // 순단 이력 탭 (WU5 — §4-7 ws_blips, REST 조회만·라이브 이벤트 없음(결정 1))
     // ====================================================================
     const blipsState = {
-        offset: 0,
-        nextOffset: null,
+        /** 지금 요청할 위치. null 이면 첫 페이지. */
+        cursor: null,
+        /** 서버가 알려준 다음 위치. null 이면 더 볼 것이 없다. */
+        nextCursor: null,
         loading: false,
     };
     function fmtDurationMs(ms) {
@@ -976,25 +978,30 @@
             return;
         blipsState.loading = true;
         if (reset) {
-            // offset 만 되돌리면 fetch 실패 시 nextOffset 이 옛 위치로 남는다 — 표는
-            // 비었는데 [더 보기]가 그 위치를 요청해 앞 페이지가 통째로 빠진 목록이
-            // 그려진다. 순단 이력은 "몇 번 끊겼나" 를 세는 용도라 누락이 곧 오판이다.
-            blipsState.offset = 0;
-            blipsState.nextOffset = null;
+            // 위치를 되돌릴 때는 cursor·nextCursor 를 함께 비운다. 한쪽만 되돌리면
+            // fetch 실패 시 표는 비었는데 [더 보기]가 옛 위치를 요청해 앞 페이지가
+            // 통째로 빠진 목록이 그려진다 — 순단 이력은 "몇 번 끊겼나" 를 세는
+            // 용도라 누락이 곧 오판이다.
+            blipsState.cursor = null;
+            blipsState.nextCursor = null;
             $("blips-more").hidden = true;
             clear($("blips-rows"));
         }
         $("blips-status").textContent = "불러오는 중…";
-        const url = `${API}/ws-blips?limit=50&offset=${blipsState.offset}`;
+        // 커서는 base64 라 '=' 패딩이 붙는다 — 쿼리 값으로 그대로 두지 않고 인코딩한다.
+        const url = `${API}/ws-blips?limit=50` +
+            (blipsState.cursor != null
+                ? `&cursor=${encodeURIComponent(blipsState.cursor)}`
+                : "");
         fetchJson(url)
             .then((data) => {
             const body = $("blips-rows");
             (data.items ?? []).forEach((b) => body.appendChild(blipRow(b)));
-            blipsState.nextOffset = data.nextOffset != null ? data.nextOffset : null;
-            $("blips-more").hidden = blipsState.nextOffset == null;
+            blipsState.nextCursor = data.nextCursor != null ? data.nextCursor : null;
+            $("blips-more").hidden = blipsState.nextCursor == null;
             $("blips-status").textContent =
                 body.children.length + "건" +
-                    (blipsState.nextOffset != null ? " (더 있음)" : "");
+                    (blipsState.nextCursor != null ? " (더 있음)" : "");
         })
             .catch((err) => {
             $("blips-status").textContent = "오류: " + err.message;
@@ -1005,8 +1012,8 @@
     }
     wire("blips-refresh", "click", () => loadBlips(true));
     wire("blips-more", "click", () => {
-        if (blipsState.nextOffset != null) {
-            blipsState.offset = blipsState.nextOffset;
+        if (blipsState.nextCursor != null) {
+            blipsState.cursor = blipsState.nextCursor;
             loadBlips(false);
         }
     });
