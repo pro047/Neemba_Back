@@ -44,6 +44,14 @@ const rtmpAuthEnabled = new Gauge({
   registers: [register],
 });
 
+// "manual" and "superseded" no longer have a producer as of 멀티 청취자 P1:
+// D4 demoted POST /sessions/stop to a no-op (a listener pressing 정지 must not
+// kill someone else's broadcast) and D1 turned start into an idempotent join,
+// so nothing supersedes a live session. Both labels stay so the existing time
+// series keeps its shape — dropping a label makes prom-client omit the line
+// entirely, which the sidecar cannot tell apart from a scrape failure.
+// Every teardown now arrives as "publisher_done". If "manual" or "superseded"
+// ever increments again, a teardown path came back that P1 was meant to remove.
 export type SessionStopReason = "manual" | "publisher_done" | "superseded";
 
 const SESSION_STOP_REASONS: SessionStopReason[] = [

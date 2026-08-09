@@ -23,9 +23,19 @@ export type SessionLanguages = {
 export type SessionStartResult = {
   sessionId: string;
   webSocketUrl: string;
+  // True when the caller joined a broadcast that was already running instead of
+  // starting one (P1 D1). The Flutter app ignores unknown response fields
+  // (mvp/lib/type.dart), so this ships without an app release.
+  joined: boolean;
+  // The live session's actual languages, which are NOT necessarily the ones the
+  // caller asked for — a joiner gets what the broadcast is already producing.
+  sourceLang: string;
+  targetLang: string;
 };
 
-export type StopOutcome = "stopped" | "mismatch";
+// P1 D4: no outcome tears a session down any more. "ignored" means the request
+// named the live session and was deliberately not acted on.
+export type StopOutcome = "ignored" | "mismatch";
 
 export type SessionLifecycleDeps = {
   newSessionId: () => string;
@@ -49,6 +59,24 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
   let pipeline: PipelineHandle | null = null;
   let publisherClientId: string | null = null;
   let graceTimer: NodeJS.Timeout | null = null;
+  // What a joiner is handed (P1 D1). Written only once the session is fully up,
+  // and cleared everywhere currentSessionId is cleared — a url that outlives its
+  // session would hand the next listener a socket to a dead broadcast.
+  let currentWebSocketUrl: string | null = null;
+  let currentLanguages: SessionLanguages | null = null;
+  // Two devices pressing [시작] within the same second is the ordinary P1 case,
+  // not a rare race: without this the second call finds currentSessionId set but
+  // no url yet, falls through, and starts a second pipeline that orphans the
+  // first. Joiners wait on the in-flight start instead.
+  let startInFlight: Promise<SessionStartResult> | null = null;
+
+  const forgetSession = (): void => {
+    currentSessionId = null;
+    pipeline = null;
+    publisherClientId = null;
+    currentWebSocketUrl = null;
+    currentLanguages = null;
+  };
 
   const cancelAutoStop = (): void => {
     if (!graceTimer) return;
@@ -61,12 +89,11 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     if (!sessionId) return;
 
     const handle = pipeline;
-    // Release the identity BEFORE the first await. A manual stop landing while
-    // the grace timer is already tearing down must find nothing left to close,
-    // otherwise both run the sequence and python gets two stop calls.
-    currentSessionId = null;
-    pipeline = null;
-    publisherClientId = null;
+    // Release the identity BEFORE the first await. A second teardown landing
+    // while this one is in flight must find nothing left to close, otherwise
+    // both run the sequence and python gets two stop calls. The join cache goes
+    // with it — a joiner must never receive a url for a session being torn down.
+    forgetSession();
     cancelAutoStop();
     deps.onSessionIdChanged(null);
     deps.recordStop(reason);
@@ -106,51 +133,94 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     graceTimer = timer;
   };
 
+  const beginSession = async (
+    languages: SessionLanguages
+  ): Promise<SessionStartResult> => {
+    const sessionId = deps.newSessionId();
+    currentSessionId = sessionId;
+    // Forget the previous broadcast's publisher. A stale id here would make
+    // the ordering guard below reject the new session's publish_done, and
+    // the failure mode of that is the exact bug this feature fixes — a
+    // session nobody ever closes. When in doubt the guard must let the
+    // teardown through, so an unknown publisher is null, never a leftover.
+    publisherClientId = null;
+    deps.onSessionIdChanged(sessionId);
+
+    try {
+      const { webSocketUrl } = await deps.startPythonSession({
+        sessionId,
+        ...languages,
+      });
+      const handle = await deps.startPipeline({
+        sourceLanguage: languages.sourceLang,
+        targetLanguage: languages.targetLang,
+      });
+      // A teardown can land anywhere in the two awaits above — on_publish_done
+      // arrives before the start finishes and the grace timer fires. teardown
+      // has no way to cancel this call (forgetSession cannot unmake a promise),
+      // so the check belongs here, against the id this call owns. Assigning
+      // `pipeline` past that point would leave a live ffmpeg behind a null
+      // currentSessionId: nothing can reach it to stop it, and P1 D4 removed
+      // the manual stop that used to be the way out.
+      if (currentSessionId !== sessionId) {
+        await handle.stop();
+        throw new Error(`session ${sessionId} was torn down while starting`);
+      }
+      pipeline = handle;
+      // Publish the join cache only now — everything a joiner needs exists.
+      currentWebSocketUrl = webSocketUrl;
+      currentLanguages = languages;
+      return { sessionId, webSocketUrl, joined: false, ...languages };
+    } catch (err) {
+      // Same clear as teardown, minus the stop calls: nothing was started, so
+      // leaving a url behind would publish a session that does not exist.
+      forgetSession();
+      deps.onSessionIdChanged(null);
+      throw err;
+    }
+  };
+
   return {
     async start(languages: SessionLanguages): Promise<SessionStartResult> {
-      if (currentSessionId) {
-        try {
-          await teardown("superseded");
-        } catch (err) {
-          // Starting the new session matters more than reporting that the old
-          // one resisted; python's own startup sweep closes the leftover row.
-          console.error("previous session teardown failed", err);
-        }
+      // P1 D1: 멱등 join. 라이브 세션이 있으면 teardown 없이 그 세션을 돌려준다.
+      // 청취자 앱의 [시작] 이 유일한 진입점이라(mvp/lib/rtmp_translation_tab.dart)
+      // 예전에는 두 번째 청취자가 teardown("superseded") 로 ffmpeg·STT 까지
+      // 재시작시켰다 — 방송 자체가 끊겼다는 뜻이다.
+      if (currentSessionId && currentWebSocketUrl && currentLanguages) {
+        console.log(
+          `session ${currentSessionId}: join (requested ${languages.sourceLang}->${languages.targetLang}, live ${currentLanguages.sourceLang}->${currentLanguages.targetLang})`
+        );
+        return {
+          sessionId: currentSessionId,
+          webSocketUrl: currentWebSocketUrl,
+          joined: true,
+          ...currentLanguages,
+        };
       }
 
-      const sessionId = deps.newSessionId();
-      currentSessionId = sessionId;
-      // Forget the previous broadcast's publisher. A stale id here would make
-      // the ordering guard below reject the new session's publish_done, and
-      // the failure mode of that is the exact bug this feature fixes — a
-      // session nobody ever closes. When in doubt the guard must let the
-      // teardown through, so an unknown publisher is null, never a leftover.
-      publisherClientId = null;
-      deps.onSessionIdChanged(sessionId);
+      if (startInFlight) {
+        const result = await startInFlight;
+        return { ...result, joined: true };
+      }
 
+      startInFlight = beginSession(languages);
       try {
-        const { webSocketUrl } = await deps.startPythonSession({
-          sessionId,
-          ...languages,
-        });
-        pipeline = await deps.startPipeline({
-          sourceLanguage: languages.sourceLang,
-          targetLanguage: languages.targetLang,
-        });
-        return { sessionId, webSocketUrl };
-      } catch (err) {
-        currentSessionId = null;
-        pipeline = null;
-        publisherClientId = null;
-        deps.onSessionIdChanged(null);
-        throw err;
+        return await startInFlight;
+      } finally {
+        startInFlight = null;
       }
     },
 
+    // P1 D4: 세션을 닫지 않는다. join 한 청취자가 [정지]
+    // (mvp/lib/rtmp_translation_tab.dart:286)를 누르면 남의 방송이 죽기
+    // 때문이다. 종료는 on_publish_done + grace 단일 경로가 맡는다. 수동 회수가
+    // 필요하면 python 의 POST /internal/sessions/stop 을 직접 친다.
     async stopBySessionId(sessionId: string): Promise<StopOutcome> {
       if (!currentSessionId || sessionId !== currentSessionId) return "mismatch";
-      await teardown("manual");
-      return "stopped";
+      console.log(
+        `session ${sessionId}: stop ignored (P1 D4 — teardown is on_publish_done only)`
+      );
+      return "ignored";
     },
 
     // on_publish, but only once the key check passed: an unauthenticated
