@@ -15,8 +15,9 @@ BLIPS_LIMIT_MAX = 200
 # --- SQL -------------------------------------------------------------------
 
 _INSERT_BLIP_SQL = (
-    "INSERT INTO app.ws_blips (session_id, close_code, close_reason, detected_by) "
-    "VALUES ($1, $2, $3, $4) "
+    "INSERT INTO app.ws_blips "
+    "(session_id, client_id, close_code, close_reason, detected_by) "
+    "VALUES ($1, $2, $3, $4, $5) "
     "RETURNING id"
 )
 
@@ -39,7 +40,7 @@ _ABANDON_BLIP_SQL = (
 )
 
 _BLIP_COLS = (
-    "id, session_id, disconnected_at, reconnected_at, duration_ms, "
+    "id, session_id, client_id, disconnected_at, reconnected_at, duration_ms, "
     "flushed_count, lost_count, close_code, close_reason, detected_by"
 )
 
@@ -50,14 +51,24 @@ async def insert_blip(
     pool,
     *,
     session_id: str,
+    client_id: str | None = None,
     close_code: int | None = None,
     close_reason: str | None = None,
     detected_by: str,
 ) -> int | None:
-    """Record a disconnect and return the new blip id."""
+    """Record a disconnect and return the new blip id.
+
+    ``client_id`` identifies which of the session's sockets dropped (P1 D5);
+    NULL is legal and means "not attributed to a socket".
+    """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            _INSERT_BLIP_SQL, session_id, close_code, close_reason, detected_by
+            _INSERT_BLIP_SQL,
+            session_id,
+            client_id,
+            close_code,
+            close_reason,
+            detected_by,
         )
     return row["id"] if row is not None else None
 

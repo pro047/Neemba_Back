@@ -26,6 +26,16 @@ from src.repository.implementation.translation_repository import (
 )
 
 
+async def _attach(hub, ws, session_id: str, **kwargs):
+    """라이브 세션에 청취자를 붙인다 — 프로덕션의 start → /ws 순서 그대로.
+
+    ``attach`` 는 화이트리스트라 ``register_session`` 되지 않은 sessionId 를
+    거절한다. 청취자 수를 세려면 붙을 세션이 먼저 라이브여야 한다.
+    """
+    await hub.register_session(session_id, kwargs.get("target_lang"))
+    return await hub.attach(ws, session_id, **kwargs)
+
+
 @pytest.fixture(autouse=True)
 def _restore_metrics_snapshot():
     # 이 파일의 테스트들은 모듈 전역 게이지 스냅샷을 건드린다. 되돌리지 않으면
@@ -148,6 +158,55 @@ async def test_DB_조회가_실패해도_나머지_상태_필드는_응답해야
     assert res.nats_connected is True        # 나머지는 그대로 응답
     assert res.ws_client_connected is False
     assert res.node_up is False
+
+
+async def test_붙어있는_청취자_수가_상태_개요에_나와야_한다(monkeypatch):
+    # P1: 세션당 소켓이 N개가 됐다. wsClientConnected 는 1명이든 5명이든 true 라
+    # '기기 2대 중 1대가 빠졌다' 를 못 본다 — 8/9 검증 1번(기기 2대 동시 수신)의
+    # 판정 근거가 이 숫자다. pool=None 으로 DB 경로는 열화시켜 격리한다.
+    from starlette.websockets import WebSocketState
+
+    from src.ws.websocket import WebSocketHub
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.client_state = WebSocketState.CONNECTED
+            self.application_state = WebSocketState.CONNECTING
+
+        async def accept(self) -> None:
+            self.application_state = WebSocketState.CONNECTED
+
+        async def send_json(self, _data) -> None: ...
+        async def close(self, code: int = 1000) -> None:
+            self.application_state = WebSocketState.DISCONNECTED
+
+    async def _node_unreachable(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(main, "fetch_node_gauges", _node_unreachable)
+
+    hub = WebSocketHub()
+    ws1, ws2 = _FakeWS(), _FakeWS()
+    await _attach(hub, ws1, "s1")
+    await _attach(hub, ws2, "s1")
+
+    class _Request:
+        app = SimpleNamespace(state=SimpleNamespace(hub=hub))
+
+    try:
+        res = await main.monitor_status(_Request(), pool=None)
+
+        assert res.listeners == 2
+        assert res.ws_client_connected is True
+
+        # 한 명이 빠지면 wsClientConnected 는 그대로 true 이고 숫자만 준다 —
+        # 이 구분이 없으면 이탈이 보이지 않는다.
+        await hub.handle_client_disconnect("s1", ws1)
+        res = await main.monitor_status(_Request(), pool=None)
+        assert res.listeners == 1
+        assert res.ws_client_connected is True
+    finally:
+        await hub.detach("s1")
 
 
 async def test_JetStream_준비가_실패하면_NATS_연결_플래그가_False여야_한다(monkeypatch):

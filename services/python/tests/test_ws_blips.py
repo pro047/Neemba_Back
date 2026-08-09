@@ -17,6 +17,7 @@ repository 는 Phase 5 와 같은 fake-pool 패턴(SQL·바인드 파라미터 �
 import asyncio
 import contextlib
 
+import pytest
 from starlette.websockets import WebSocketState
 
 from src.repository.implementation import ws_blip_repository as wb
@@ -90,6 +91,7 @@ async def test_insert_blip_binds_params_and_returns_id():
     blip_id = await wb.insert_blip(
         pool,
         session_id="s1",
+        client_id="c1",
         close_code=1006,
         close_reason="net down",
         detected_by="client_disconnect",
@@ -97,7 +99,9 @@ async def test_insert_blip_binds_params_and_returns_id():
     assert blip_id == 7
     assert "INSERT INTO app.ws_blips" in pool.last_sql
     assert "RETURNING id" in pool.last_sql
-    assert pool.last_args == ("s1", 1006, "net down", "client_disconnect")
+    # P1 D5: client_id 가 session_id 다음 자리다. 순서가 밀리면 close_reason 에
+    # detected_by 가 들어가는 조용한 오염이 된다.
+    assert pool.last_args == ("s1", "c1", 1006, "net down", "client_disconnect")
 
 
 async def test_insert_blip_allows_null_close_code():
@@ -107,7 +111,8 @@ async def test_insert_blip_allows_null_close_code():
         pool, session_id="s1", detected_by="keepalive_timeout"
     )
     assert blip_id == 1
-    assert pool.last_args == ("s1", None, None, "keepalive_timeout")
+    # client_id 미지정도 legal — P1 이전에 기록된 행과 같은 모양(NULL)이다.
+    assert pool.last_args == ("s1", None, None, None, "keepalive_timeout")
 
 
 # --- repository: close_blip -------------------------------------------------
@@ -153,6 +158,8 @@ async def test_list_blips_orders_newest_first():
     sql = pool.last_sql
     assert "FROM app.ws_blips" in sql
     assert "ORDER BY disconnected_at DESC, id DESC" in sql
+    # D5: 조회에도 실려야 세션당 N행을 사람이 구분한다 (쓰기 전용이면 무용지물)
+    assert "client_id" in sql
     assert pool.last_args == (50, 0)
 
 
@@ -232,12 +239,19 @@ class FakeRecorder:
         self._next_id = 0
 
     async def record_disconnect(
-        self, session_id, *, close_code=None, close_reason=None, detected_by
+        self,
+        session_id,
+        *,
+        client_id=None,
+        close_code=None,
+        close_reason=None,
+        detected_by,
     ):
         self._next_id += 1
         self.disconnects.append({
             "id": self._next_id,
             "session_id": session_id,
+            "client_id": client_id,
             "close_code": close_code,
             "close_reason": close_reason,
             "detected_by": detected_by,
@@ -260,12 +274,26 @@ async def _drain(n: int = 10) -> None:
         await asyncio.sleep(0)
 
 
+async def _attach(hub: WebSocketHub, ws, session_id: str, **kwargs):
+    """라이브 세션에 청취자를 붙인다 — 프로덕션의 start → /ws 순서 그대로.
+
+    ``attach`` 는 화이트리스트라 ``register_session`` 되지 않은 sessionId 를
+    거절한다(라이브가 아닌 세션이 재접속만으로 되살아나는 것을 막는다). 순단
+    시나리오는 전부 '방송 중인 세션' 위에서 벌어지므로 등록을 먼저 한다.
+    거절 자체를 보는 테스트는 ``hub.attach`` 를 직접 부른다.
+    """
+    await hub.register_session(session_id, kwargs.get("target_lang"))
+    return await hub.attach(ws, session_id, **kwargs)
+
+
 async def _teardown(hub: WebSocketHub) -> None:
-    task = hub._keepalive_task
-    if task and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    # P1: keepalive 는 허브당 1개가 아니라 소켓당 1개다.
+    for conn in list(hub._conns.values()):
+        task = conn.keepalive_task
+        if task and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def test_client_disconnect_records_blip_with_close_code():
@@ -274,7 +302,7 @@ async def test_client_disconnect_records_blip_with_close_code():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    client_id = await _attach(hub, ws, "s1")
     await _drain()
 
     ws.client_disconnect()
@@ -283,9 +311,11 @@ async def test_client_disconnect_records_blip_with_close_code():
     )
     await _drain()
 
+    # D5: 행이 '어느 소켓의 순단인지' 를 들고 있어야 세션당 N행이 구분된다.
     assert rec.disconnects == [{
         "id": 1,
         "session_id": "s1",
+        "client_id": client_id,
         "close_code": 1001,
         "close_reason": "going away",
         "detected_by": "client_disconnect",
@@ -293,38 +323,76 @@ async def test_client_disconnect_records_blip_with_close_code():
     await _teardown(hub)
 
 
-async def test_reconnect_closes_blip_with_flush_and_lost_counts():
-    """같은 세션이 재접속하면 blip 이 flushed(=방류 예정 pending 건수)·lost
-    건수와 함께 종결돼야 한다."""
+async def test_reconnect_closes_blip_with_lost_count():
+    """재접속하면 blip 이 종결되고, 순단 동안의 자막은 lost 로 집계돼야 한다.
+
+    P1 D3 이전에는 이 문장들이 pending 에 쌓였다가 방류돼 ``flushed_count``
+    였다. 백로그를 들어낸 지금은 같은 문장이 그대로 유실이므로 같은 수가
+    ``lost_count`` 로 넘어온다 — 계측이 사라진 게 아니라 칸이 바뀐 것이다.
+    ``flushed_count`` 는 방류할 백로그가 없어 항상 0 이다.
+    """
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
 
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
     await _drain()
 
-    # 끊김 동안 번역 2건이 pending 에 쌓임
+    # 끊김 동안 번역 2건 — 받을 소켓이 없으므로 이 순단의 유실이다
     await hub.broadcast_to_session("s1", {"sentence": "m1"})
     await hub.broadcast_to_session("s1", {"sentence": "m2"})
 
     ws2 = FakeWS()
-    await hub.attach(ws2, "s1")
+    await _attach(hub, ws2, "s1")
     await _drain()
 
-    assert rec.reconnects == [{"blip_id": 1, "flushed_count": 2, "lost_count": 0}]
+    assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 2}]
     await _teardown(hub)
 
 
+async def test_listener_still_attached_does_not_count_as_lost():
+    """청취자가 남아 자막을 받고 있으면 다른 소켓의 순단에 유실을 적으면 안 된다.
+
+    P1 에서 새로 생긴 구분이다 — 소켓이 1개일 때는 '끊김 = 아무도 못 받음'
+    이었지만, 이제 한 명이 끊겨도 나머지가 받고 있으면 그 문장은 유실이 아니다.
+    """
+    rec = FakeRecorder()
+    hub = WebSocketHub(blip_recorder=rec)
+    ws1, ws2 = FakeWS(), FakeWS()
+    await _attach(hub, ws1, "s1")
+    await _attach(hub, ws2, "s1")
+    await _drain()
+
+    ws1.client_disconnect()
+    await hub.handle_client_disconnect("s1", ws1, close_code=1006)
+    await _drain()
+
+    await hub.broadcast_to_session("s1", {"sentence": "m1"})
+    await _drain()
+    assert ws2.sent == ["m1"]
+
+    ws3 = FakeWS()
+    await _attach(hub, ws3, "s1")
+    await _drain()
+
+    assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 0}]
+    await _teardown(hub)
+
+
+@pytest.mark.skip(
+    reason="P1 D3: 백로그(_pending) 제거로 캡 자체가 없어짐. P3(백로그 커서)에서 "
+           "링버퍼가 돌아오면 복원 — 계획 docs/multi-listener-p1-plan.md §9"
+)
 async def test_pending_overflow_during_blip_counts_lost():
     """blip 동안 pending 캡 초과로 버린 건수는 lost_count 로 집계돼야 한다."""
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     hub._max_pending = 2
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
 
     ws.client_disconnect()
@@ -335,20 +403,25 @@ async def test_pending_overflow_during_blip_counts_lost():
         await hub.broadcast_to_session("s1", {"sentence": f"m{i}"})
 
     ws2 = FakeWS()
-    await hub.attach(ws2, "s1")
+    await _attach(hub, ws2, "s1")
     await _drain()
 
     assert rec.reconnects == [{"blip_id": 1, "flushed_count": 2, "lost_count": 2}]
     await _teardown(hub)
 
 
-async def test_different_session_leaves_blip_unreconnected():
-    """다른 세션이 슬롯을 차지하면 이전 blip 은 종결 없이 미복귀로 남아야 한다
-    (결정 2: reconnected_at NULL 잔존)."""
+async def test_different_session_never_closes_another_sessions_blip():
+    """다른 세션의 접속은 남의 열린 blip 을 건드리면 안 된다.
+
+    P1 이전에는 슬롯이 하나라 s2 의 접속이 s1 의 슬롯을 빼앗고, 그 과정에서
+    s1 의 blip 이 미복귀로 마감됐다. 이제 두 세션이 공존하므로 s1 의 blip 은
+    **열린 채로 남아** 자기 세션의 재접속이나 종료를 기다려야 한다.
+    (결정 2: reconnected_at NULL 잔존 = 미복귀)
+    """
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
 
     ws.client_disconnect()
@@ -356,9 +429,16 @@ async def test_different_session_leaves_blip_unreconnected():
     await _drain()
 
     ws2 = FakeWS()
-    await hub.attach(ws2, "s2")
+    await _attach(hub, ws2, "s2")
     await _drain()
 
+    # s2 의 접속은 s1 의 blip 을 닫지도(reconnect) 마감하지도(abandon) 않는다
+    assert rec.reconnects == []
+    assert rec.abandons == []
+
+    # s1 이 끝나야 비로소 미복귀로 마감된다
+    await hub.detach("s1")
+    await _drain()
     assert rec.reconnects == []
     assert rec.abandons == [{"blip_id": 1, "lost_count": 0}]
     await _teardown(hub)
@@ -370,7 +450,7 @@ async def test_detach_releases_slot_so_next_session_records_its_blip():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -378,7 +458,7 @@ async def test_detach_releases_slot_so_next_session_records_its_blip():
 
     await hub.detach("s1")  # 재접속 없이 종료 (stop 호출)
     ws2 = FakeWS()
-    await hub.attach(ws2, "s2")
+    await _attach(hub, ws2, "s2")
     await _drain()
     ws2.client_disconnect()
     await hub.handle_client_disconnect("s2", ws2, close_code=1006)
@@ -394,7 +474,7 @@ async def test_detach_marks_open_blip_as_never_recovered():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -416,7 +496,7 @@ async def test_next_session_reconnect_does_not_close_previous_blip():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -425,13 +505,13 @@ async def test_next_session_reconnect_does_not_close_previous_blip():
     await _drain()
 
     ws2 = FakeWS()
-    await hub.attach(ws2, "s2")  # 새 세션 첫 접속
+    await _attach(hub, ws2, "s2")  # 새 세션 첫 접속
     await _drain()
     ws2.client_disconnect()  # s2 자신의 순단
     await hub.handle_client_disconnect("s2", ws2, close_code=1006)
     await _drain()
     ws3 = FakeWS()
-    await hub.attach(ws3, "s2")  # s2 의 재접속
+    await _attach(hub, ws3, "s2")  # s2 의 재접속
     await _drain()
 
     # s2 의 재접속은 자기 blip(2)만 닫는다 — s1 의 blip 1 은 미복귀로 남는다
@@ -446,7 +526,7 @@ async def test_multiple_blips_in_one_session_each_get_a_row():
     hub = WebSocketHub(blip_recorder=rec)
     for _ in range(3):
         ws = FakeWS()
-        await hub.attach(ws, "s1")
+        await _attach(hub, ws, "s1")
         await _drain()
         ws.client_disconnect()
         await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -457,23 +537,29 @@ async def test_multiple_blips_in_one_session_each_get_a_row():
     await _teardown(hub)
 
 
-async def test_late_reconnect_after_keepalive_gave_up_closes_blip():
-    """keepalive 가 재연결 대기를 포기한 뒤 온 재접속도 blip 을 종결해야 한다."""
+async def test_reconnect_closes_blip_after_keepalive_loop_is_gone():
+    """살피던 keepalive 가 이미 끝난 뒤에 온 재접속도 blip 을 종결해야 한다.
+
+    P1 이전에는 keepalive 가 300초 뒤 재연결 대기를 포기하는 상태가 있었고,
+    그 뒤의 재접속이 blip 을 닫는지가 §11 F-1 의 쟁점이었다. 소켓별 _Conn 이
+    된 지금은 대기 상태 자체가 없고 죽은 소켓의 루프는 그냥 끝난다 — 그래도
+    '열린 blip 은 세션이 살아있는 한 재접속을 기다린다' 는 약속은 같다.
+    """
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
     await _drain()
 
-    # keepalive 300초 타임아웃이 대기를 접은 상태 재현
-    hub._reconnect_waiting = False
-    hub._reconnect_waiting_since = 0
+    # 그 소켓을 살피던 루프가 완전히 끝난 상태 재현
+    assert all(c.keepalive_task is None or c.keepalive_task.done()
+               for c in hub._conns.values())
 
     ws2 = FakeWS()
-    await hub.attach(ws2, "s1")
+    await _attach(hub, ws2, "s1")
     await _drain()
 
     assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 0}]
@@ -486,16 +572,17 @@ async def test_keepalive_detected_blip_has_no_close_code():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    client_id = await _attach(hub, ws, "s1")
     await _drain()
 
     # keepalive 루프가 pong 타임아웃 시 호출하는 중앙 경로
-    await hub._mark_waiting_for_reconnect()
+    await hub._drop_conn(hub._conns[ws], detected_by="keepalive_timeout")
     await _drain()
 
     assert rec.disconnects == [{
         "id": 1,
         "session_id": "s1",
+        "client_id": client_id,
         "close_code": None,
         "close_reason": None,
         "detected_by": "keepalive_timeout",
@@ -503,22 +590,26 @@ async def test_keepalive_detected_blip_has_no_close_code():
     await _teardown(hub)
 
 
-async def test_stale_disconnect_does_not_record_blip():
-    """이미 새 소켓으로 교체된 뒤 도착한 늦은 끊김 통지는 blip 을 열지 않아야 한다."""
+async def test_duplicate_disconnect_notice_does_not_record_a_second_blip():
+    """이미 정리된 소켓의 늦은/중복 끊김 통지는 blip 을 또 열면 안 된다.
+
+    P1 이전에는 '새 소켓으로 교체된 뒤의 옛 소켓 통지' 가 이 경로였다. 이제
+    소켓이 공존하므로 옛 소켓의 통지는 stale 이 아니라 정당한 통지다 —
+    stale 인 것은 **같은 소켓의 두 번째 통지**뿐이다 (main.py 의 끊김 통지와
+    keepalive 감지가 겹칠 수 있다).
+    """
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
 
-    ws2 = FakeWS()
-    await hub.attach(ws2, "s1")
+    ws.client_disconnect()
+    await hub.handle_client_disconnect("s1", ws, close_code=1006)
+    await hub.handle_client_disconnect("s1", ws, close_code=1006)
     await _drain()
 
-    await hub.handle_client_disconnect("s1", ws, close_code=1006)  # stale ws
-    await _drain()
-
-    assert rec.disconnects == []
+    assert len(rec.disconnects) == 1
     await _teardown(hub)
 
 
@@ -526,15 +617,18 @@ async def test_hub_without_recorder_still_works():
     """recorder 미주입(테스트·구버전 조립)이어도 hub 동작은 그대로여야 한다."""
     hub = WebSocketHub()
     ws = FakeWS()
-    await hub.attach(ws, "s1")
+    await _attach(hub, ws, "s1")
     await _drain()
 
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
 
     ws2 = FakeWS()
-    await hub.attach(ws2, "s1")
+    await _attach(hub, ws2, "s1")
     await _drain()
 
-    assert hub.client is ws2
+    assert hub.listener_count() == 1
+    await hub.broadcast_to_session("s1", {"sentence": "m1"})
+    await _drain()
+    assert ws2.sent == ["m1"]
     await _teardown(hub)

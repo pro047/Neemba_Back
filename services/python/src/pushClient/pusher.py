@@ -61,13 +61,19 @@ class Pusher:
         confidence: float | None = None,
     ) -> None:
         # 1) Client delivery — hot path, must not be blocked by capture.
-        # session_id gates the hub slot: stale sessions are dropped there.
-        # A missing session_id can never match the slot owner, so it drops too.
-        await self.hub.broadcast_to_session(session_id or '', payload={
-            "sequence": sequence,
-            "sentence": push_text,
-            "isFinal": True,
-        })
+        # session_id gates the hub: translations for a session that is not live
+        # are dropped there. A missing session_id can never be live, so it drops.
+        # target_lang picks the language channel (P1 D2); under P1 a session has
+        # exactly one, and the hub falls back to it when this value is absent.
+        await self.hub.broadcast_to_session(
+            session_id or '',
+            payload={
+                "sequence": sequence,
+                "sentence": push_text,
+                "isFinal": True,
+            },
+            target_lang=target_lang,
+        )
 
         # 2) Monitoring capture — fire-and-forget, isolated. Only when we have
         #    enough context (source text + session) to store a pair.
