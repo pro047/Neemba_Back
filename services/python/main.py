@@ -258,8 +258,9 @@ class WsBlipListResponse(BaseModel):
 
     items: list[WsBlip]
     limit: int
-    offset: int
-    next_offset: int | None = Field(default=None, alias="nextOffset")
+    # (disconnected_at, id) 키셋 토큰. offset 이었을 때는 보는 사이에 새 순단이
+    # 앞에 끼면 페이지 경계가 밀려 행이 중복·누락됐다.
+    next_cursor: str | None = Field(default=None, alias="nextCursor")
 
 
 class NodeStatus(BaseModel):
@@ -434,21 +435,28 @@ async def monitor_translations_search(
 async def monitor_ws_blips(
     session_id: str | None = Query(default=None, alias="sessionId"),
     limit: int | None = Query(default=None),
-    offset: int | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     pool=Depends(get_db_pool),
 ):
-    """/ws 순단(blip) 이력, disconnected_at 최신순, OFFSET 페이지네이션 (§4-7)."""
+    """/ws 순단(blip) 이력, disconnected_at 최신순, (disconnected_at, id) 키셋 (§4-7).
+
+    커서는 translations 검색과 같은 opaque 토큰 규약이다 — 클라이언트는 받은
+    문자열을 그대로 되돌려주기만 하고, 깨진 토큰은 422 다(조용히 1페이지로
+    되감으면 사용자는 목록이 왜 처음으로 돌아갔는지 알 길이 없다).
+    """
     limit = mq.clamp_limit(
         limit, default=wb.BLIPS_LIMIT_DEFAULT, maximum=wb.BLIPS_LIMIT_MAX
     )
-    offset = mq.clamp_offset(offset)
-    rows, next_offset = await wb.list_blips(
-        pool, session_id=session_id, limit=limit, offset=offset
+    try:
+        cur = mq.decode_search_cursor(cursor)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail="invalid cursor") from e
+
+    rows, next_cursor = await wb.list_blips(
+        pool, session_id=session_id, limit=limit, cursor=cur
     )
     items = [WsBlip(**dict(r)) for r in rows]
-    return WsBlipListResponse(
-        items=items, limit=limit, offset=offset, nextOffset=next_offset
-    )
+    return WsBlipListResponse(items=items, limit=limit, nextCursor=next_cursor)
 
 
 @app.get('/api/monitor/status', response_model=MonitorStatusResponse)

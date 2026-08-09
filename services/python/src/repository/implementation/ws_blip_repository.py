@@ -7,6 +7,15 @@ DB failures. Every value reaches SQL as a bound parameter (``$n``).
 """
 from __future__ import annotations
 
+from datetime import datetime
+
+# (disconnected_at, id) 키셋 커서는 translations 검색과 같은 인코딩을 쓴다 —
+# 토큰이 base64(JSON {"t","i"}) 라 컬럼 이름에 중립적이고, 프런트도 같은 opaque
+# 규약(문자열을 그대로 되돌려준다)을 이미 쓰고 있다.
+from src.repository.implementation.monitor_query_repository import (
+    encode_search_cursor,
+)
+
 # --- limits (route-level clamp, sessions 와 동일 규약) ----------------------
 
 BLIPS_LIMIT_DEFAULT = 50
@@ -96,28 +105,43 @@ async def list_blips(
     *,
     session_id: str | None = None,
     limit: int = BLIPS_LIMIT_DEFAULT,
-    offset: int = 0,
-) -> tuple[list, int | None]:
+    cursor: tuple[datetime, int] | None = None,
+) -> tuple[list, str | None]:
     """List blips newest-first, optionally for one session.
 
-    OFFSET-paginated like ``list_sessions``: returns ``(rows, next_offset)``
-    where ``next_offset`` is ``offset + limit`` when a full page came back.
+    Keyset-paginated on ``(disconnected_at, id)`` to match ``ORDER BY
+    disconnected_at DESC, id DESC``, the same shape ``search_translations``
+    uses. Returns ``(rows, next_cursor)`` (encoded token or ``None``).
+
+    OFFSET paging was wrong here, not merely slow: a blip recorded while the
+    operator is reading shifts every later page by one, so the next page
+    repeats a row or skips one. Blips cluster *during* an outage — exactly
+    when the history is being read to count "how many times did it drop".
     """
+    conditions: list[str] = []
     params: list = []
-    where = ""
+
+    def add(value) -> str:
+        params.append(value)
+        return f"${len(params)}"
+
     if session_id is not None:
-        params.append(session_id)
-        where = f"WHERE session_id = ${len(params)} "
-    params.append(limit)
-    limit_p = f"${len(params)}"
-    params.append(offset)
-    offset_p = f"${len(params)}"
+        conditions.append(f"session_id = {add(session_id)}")
+    if cursor is not None:
+        cur_t, cur_i = cursor
+        conditions.append(f"(disconnected_at, id) < ({add(cur_t)}, {add(cur_i)})")
+
+    where = ("WHERE " + " AND ".join(conditions) + " ") if conditions else ""
+    limit_p = add(limit)
     sql = (
         f"SELECT {_BLIP_COLS} FROM app.ws_blips {where}"
-        f"ORDER BY disconnected_at DESC, id DESC "
-        f"LIMIT {limit_p} OFFSET {offset_p}"
+        f"ORDER BY disconnected_at DESC, id DESC LIMIT {limit_p}"
     )
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
-    next_offset = offset + limit if len(rows) == limit else None
-    return list(rows), next_offset
+
+    next_cursor = None
+    if len(rows) == limit:
+        last = rows[-1]
+        next_cursor = encode_search_cursor(last["disconnected_at"], last["id"])
+    return list(rows), next_cursor

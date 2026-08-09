@@ -16,11 +16,13 @@ repository 는 Phase 5 와 같은 fake-pool 패턴(SQL·바인드 파라미터 �
 """
 import asyncio
 import contextlib
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastapi import HTTPException
 from starlette.websockets import WebSocketState
 
-from src.repository.implementation import ws_blip_repository as wb
+from src.repository.implementation import monitor_query_repository as mq, ws_blip_repository as wb
 from src.ws.blip_recorder import WsBlipRecorder
 from src.ws.websocket import WebSocketHub
 
@@ -151,34 +153,157 @@ async def test_abandon_blip_stamps_loss_without_reconnect():
 # --- repository: list_blips -------------------------------------------------
 
 
+_T0 = datetime(2026, 8, 9, 10, 0, 0, tzinfo=UTC)
+
+
 async def test_list_blips_orders_newest_first():
     """조회는 disconnected_at 최신순이어야 한다."""
     pool = _FakePool(rows=[_row(id=1)])
-    await wb.list_blips(pool, limit=50, offset=0)
+    await wb.list_blips(pool, limit=50)
     sql = pool.last_sql
     assert "FROM app.ws_blips" in sql
     assert "ORDER BY disconnected_at DESC, id DESC" in sql
     # D5: 조회에도 실려야 세션당 N행을 사람이 구분한다 (쓰기 전용이면 무용지물)
     assert "client_id" in sql
-    assert pool.last_args == (50, 0)
+    # OFFSET 이 남아 있으면 커서와 위치 기반이 섞여 페이지가 또 밀린다
+    assert "OFFSET" not in sql
+    assert pool.last_args == (50,)
 
 
 async def test_list_blips_filters_by_session():
     """sessionId 필터는 바인드 파라미터로 적용돼야 한다."""
     pool = _FakePool(rows=[])
-    await wb.list_blips(pool, session_id="s1", limit=10, offset=5)
+    await wb.list_blips(pool, session_id="s1", limit=10)
     assert "WHERE session_id = $1" in pool.last_sql
-    assert pool.last_args == ("s1", 10, 5)
+    assert pool.last_args == ("s1", 10)
 
 
-async def test_list_blips_next_offset_on_full_page():
-    """꽉 찬 페이지면 next_offset, 아니면 None 이어야 한다 (sessions 와 동일 규약)."""
-    pool = _FakePool(rows=[_row(id=i) for i in range(2)])
-    _, next_offset = await wb.list_blips(pool, limit=2, offset=0)
-    assert next_offset == 2
-    pool2 = _FakePool(rows=[_row(id=1)])
-    _, next_offset2 = await wb.list_blips(pool2, limit=2, offset=0)
-    assert next_offset2 is None
+async def test_list_blips_cursor_is_a_tuple_comparison_alongside_the_session_filter():
+    """커서는 (disconnected_at, id) 튜플 비교여야 하고 sessionId 필터와 AND 로
+    함께 걸려야 한다 (한쪽만 걸리면 남의 세션 행이 섞여 들어온다)."""
+    pool = _FakePool(rows=[])
+    await wb.list_blips(pool, session_id="s1", limit=10, cursor=(_T0, 42))
+    sql = pool.last_sql
+    assert "WHERE session_id = $1 AND (disconnected_at, id) < ($2, $3)" in sql
+    assert pool.last_args == ("s1", _T0, 42, 10)
+
+
+async def test_list_blips_next_cursor_on_full_page():
+    """꽉 찬 페이지면 마지막 행 위치를 인코딩한 커서를, 아니면 None 을 줘야 한다."""
+    rows = [_row(id=i, disconnected_at=_T0 + timedelta(seconds=i)) for i in range(2)]
+    pool = _FakePool(rows=rows)
+    _, next_cursor = await wb.list_blips(pool, limit=2)
+    assert next_cursor is not None
+    # opaque 토큰이지만 왕복은 서버 몫이다 — 디코드가 마지막 행을 정확히 가리켜야
+    # 다음 페이지가 그 지점부터 이어진다.
+    assert mq.decode_search_cursor(next_cursor) == (rows[-1]["disconnected_at"], 1)
+
+    pool2 = _FakePool(rows=[_row(id=1, disconnected_at=_T0)])
+    _, next_cursor2 = await wb.list_blips(pool2, limit=2)
+    assert next_cursor2 is None
+
+
+# --- pagination against a real DB (conftest pg_pool) ------------------------
+
+
+async def _seed_blip(pool, *, session_id: str, at: datetime) -> int:
+    """disconnected_at 을 명시해 정렬을 결정적으로 만든다 (server_default now() 는
+    같은 마이크로초에 겹칠 수 있어 순서가 흔들린다)."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO app.ws_blips (session_id, disconnected_at, detected_by) "
+            "VALUES ($1, $2, 'client_disconnect') RETURNING id",
+            session_id,
+            at,
+        )
+
+
+async def test_blip_recorded_between_pages_does_not_duplicate_or_skip_rows(pg_pool):
+    """1페이지를 보는 사이에 새 순단이 기록돼도 2페이지는 1페이지 행을 되풀이하거나
+    건너뛰어서는 안 된다.
+
+    페이지 사이의 INSERT 가 이 테스트의 대조군이다 — 그게 없으면 OFFSET 구현도
+    똑같이 통과해서 아무것도 증명하지 못한다. 순단은 장애 중에 몰려 발생하므로
+    이 삽입은 인위적인 상황이 아니라 이력을 볼 이유가 있는 상황 그 자체다.
+    """
+    ids = [
+        await _seed_blip(pg_pool, session_id="s1", at=_T0 + timedelta(seconds=i))
+        for i in range(4)
+    ]
+
+    page1, next_cursor = await wb.list_blips(pg_pool, limit=2)
+    await _seed_blip(pg_pool, session_id="s1", at=_T0 + timedelta(seconds=99))
+    page2, _ = await wb.list_blips(
+        pg_pool, limit=2, cursor=mq.decode_search_cursor(next_cursor)
+    )
+
+    seen = [r["id"] for r in page1] + [r["id"] for r in page2]
+    assert len(seen) == len(set(seen)), f"중복: {seen}"
+    # 삽입 시점 기준 스냅샷 — 커서 뒤의 4행이 정확히 한 번씩, 최신순으로.
+    assert seen == list(reversed(ids))
+
+
+async def test_blips_sharing_a_timestamp_survive_the_page_boundary(pg_pool):
+    """disconnected_at 이 같은 행들이 페이지 경계에 걸려도 하나도 빠지지 않아야 한다.
+
+    P1 D5 이후 세션 하나에 소켓이 N개다 — 네트워크가 끊기면 그 소켓들이 같은
+    순간에 blip 을 남기고, disconnected_at 의 기본값 now() 는 트랜잭션 시각이라
+    값이 정확히 겹칠 수 있다. 커서가 시각만 보면 그 동률 묶음이 통째로 사라진다.
+    """
+    ids = [await _seed_blip(pg_pool, session_id="s1", at=_T0) for _ in range(4)]
+
+    page1, next_cursor = await wb.list_blips(pg_pool, limit=2)
+    page2, _ = await wb.list_blips(
+        pg_pool, limit=2, cursor=mq.decode_search_cursor(next_cursor)
+    )
+
+    seen = [r["id"] for r in page1] + [r["id"] for r in page2]
+    assert seen == list(reversed(ids)), f"동률 타임스탬프에서 유실: {seen}"
+
+
+async def test_last_page_reports_no_next_cursor(pg_pool):
+    """더 볼 것이 없으면 next_cursor 가 None 이어야 한다 ([더 보기] 를 숨기는 근거)."""
+    for i in range(3):
+        await _seed_blip(pg_pool, session_id="s1", at=_T0 + timedelta(seconds=i))
+    _, next_cursor = await wb.list_blips(pg_pool, limit=2)
+    _, last_cursor = await wb.list_blips(
+        pg_pool, limit=2, cursor=mq.decode_search_cursor(next_cursor)
+    )
+    assert last_cursor is None
+
+
+# --- route: cursor contract -------------------------------------------------
+
+
+async def test_route_rejects_a_malformed_cursor_with_422():
+    """깨진 커서는 422 여야 한다 — 조용히 1페이지로 되감으면 사용자는 목록이 왜
+    처음으로 돌아갔는지 알 수 없다 (translations 검색과 같은 규약)."""
+    import main
+
+    # 라우트를 직접 부르므로 인자를 전부 명시한다 — 생략하면 FastAPI 가 채우는
+    # 대신 Query 객체가 그대로 함수 본문에 들어간다 (test_monitor_status 와 달리
+    # 이 라우트는 Query 기본값을 쓴다).
+    with pytest.raises(HTTPException) as exc:
+        await main.monitor_ws_blips(
+            session_id=None, limit=None, cursor="not-a-cursor", pool=None
+        )
+    assert exc.value.status_code == 422
+
+
+async def test_route_returns_next_cursor_not_next_offset(pg_pool):
+    """응답 계약은 nextCursor 다. nextOffset 이 남아 있으면 프런트가 옛 키를 읽어
+    조용히 1페이지만 반복해 보여준다."""
+    import main
+
+    for i in range(2):
+        await _seed_blip(pg_pool, session_id="s1", at=_T0 + timedelta(seconds=i))
+    res = await main.monitor_ws_blips(
+        session_id=None, limit=1, cursor=None, pool=pg_pool
+    )
+    body = res.model_dump(by_alias=True)
+    assert "nextOffset" not in body
+    assert "offset" not in body
+    assert isinstance(body["nextCursor"], str)
 
 
 # --- recorder isolation -----------------------------------------------------
