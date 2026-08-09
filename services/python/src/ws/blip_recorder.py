@@ -17,15 +17,21 @@ class WsBlipRecorder:
         self,
         session_id: str,
         *,
+        client_id: str | None = None,
         close_code: int | None = None,
         close_reason: str | None = None,
         detected_by: str,
     ) -> int | None:
-        """Insert an open blip row; return its id (None if the write failed)."""
+        """Insert an open blip row; return its id (None if the write failed).
+
+        ``client_id`` is the hub's per-socket id (P1 D5) — a session now holds
+        N sockets, so ``session_id`` alone no longer says which one dropped.
+        """
         try:
             return await wb.insert_blip(
                 self._pool,
                 session_id=session_id,
+                client_id=client_id,
                 close_code=close_code,
                 close_reason=close_reason,
                 detected_by=detected_by,

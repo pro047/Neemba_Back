@@ -122,6 +122,9 @@ export function createRtmpRouter(lifecycle: SessionLifecycle): express.Router {
     }
 
     try {
+      // P1 D1: 라이브 세션이 있으면 join 이고, 응답은 joined=true 와 **그 세션의
+      // 실제 언어**를 싣는다 (요청한 언어가 아니다 — 방송은 이미 한 언어로 돌고
+      // 있다). 앱은 모르는 필드를 무시하므로(mvp/lib/type.dart) 앱 배포 없이 나간다.
       const result = await lifecycle.start(body.data);
       return res.status(202).json(result);
     } catch (err) {
@@ -137,12 +140,16 @@ export function createRtmpRouter(lifecycle: SessionLifecycle): express.Router {
     }
 
     try {
+      // P1 D4: 어느 경로든 200 이고 방송은 유지된다. 앱의 [정지] 는 이제 그저
+      // 로컬 UI 상태를 되돌리는 버튼이다 — 400 을 돌려주면 남의 방송을 못 껐다는
+      // 이유로 사용자에게 에러가 뜬다.
       const outcome = await lifecycle.stopBySessionId(body.data.sessionId);
       if (outcome === "mismatch") {
-        console.warn(`Session ID mismatch: requested ${body.data.sessionId}`);
-        return res.status(400).json({ error: "Session ID mismatch" });
+        console.warn(
+          `session stop: ${body.data.sessionId} is not the live session (ignored)`
+        );
       }
-      return res.status(200).json({ ok: true });
+      return res.status(200).json({ ok: true, stopped: false, outcome });
     } catch (err) {
       console.error("Error stopping session:", err);
       return res.status(500).json({ error: "Failed to stop session" });

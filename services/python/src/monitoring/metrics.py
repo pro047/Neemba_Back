@@ -9,7 +9,13 @@ from prometheus_client import Counter, Gauge
 
 _active_session = Gauge(
     'neemba_hub_active_session',
-    '1 while a translation session occupies the hub slot',
+    '1 while a translation session is live in the hub',
+)
+# P1: 세션당 소켓이 N개가 됐다. active_session 이 1 이어도 듣는 사람이 0명일
+# 수 있고 그 둘은 다른 장애다 — 게이지를 나눠야 예배 중에 구분이 된다.
+_listeners = Gauge(
+    'neemba_hub_listeners',
+    'Listener websockets currently attached to the hub',
 )
 _last_broadcast = Gauge(
     'neemba_hub_last_broadcast_timestamp_seconds',
@@ -41,6 +47,7 @@ _status_db_failed = Counter(
 # 불변(hub·consumer 공유 모듈) — 추가 비용은 dict 대입뿐.
 _snapshot: dict = {
     'active_session': False,
+    'listeners': 0,
     'nats_connected': False,
     'last_broadcast_ts': None,  # time.time() epoch seconds, None = 브로드캐스트 이력 없음
 }
@@ -54,6 +61,11 @@ def get_snapshot() -> dict:
 def set_active_session(active: bool) -> None:
     _active_session.set(1 if active else 0)
     _snapshot['active_session'] = active
+
+
+def set_listeners(count: int) -> None:
+    _listeners.set(count)
+    _snapshot['listeners'] = count
 
 
 def record_broadcast(timestamp: float) -> None:

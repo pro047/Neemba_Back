@@ -240,6 +240,9 @@ class WsBlip(BaseModel):
 
     id: int
     session_id: str = Field(alias="sessionId")
+    # P1 D5: 세션당 소켓이 N개라 session_id 만으로는 행의 주인을 못 가린다.
+    # 이 컬럼 이전에 기록된 행은 NULL.
+    client_id: str | None = Field(default=None, alias="clientId")
     disconnected_at: datetime = Field(alias="disconnectedAt")
     reconnected_at: datetime | None = Field(default=None, alias="reconnectedAt")
     duration_ms: int | None = Field(default=None, alias="durationMs")
@@ -278,6 +281,9 @@ class MonitorStatusResponse(BaseModel):
     # 조용히 null 이 나가는 대신 ValidationError 로 즉시 드러나야 한다.
     active_sessions: int | None = Field(alias="activeSessions")
     ws_client_connected: bool = Field(alias="wsClientConnected")
+    # P1: 지금 붙어 있는 청취자 소켓 수. wsClientConnected 는 1명이든 5명이든
+    # true 라 '2대 중 1대가 빠졌다' 를 못 본다. default 0 = 허브 미기동.
+    listeners: int = 0
     nats_connected: bool = Field(alias="natsConnected")
     # None = 이 프로세스에서 브로드캐스트 이력 없음 (기동 직후 등).
     last_broadcast_ago_sec: float | None = Field(
@@ -472,6 +478,9 @@ async def monitor_status(request: Request, pool=Depends(get_db_pool)):
 
     hub: WebSocketHub | None = getattr(request.app.state, "hub", None)
     ws_connected = hub.is_client_connected() if hub is not None else False
+    # P1: wsClientConnected 는 '한 명이라도 붙어 있나' 라서 2명이 1명이 된 것을
+    # 못 잡는다. 예배 중 기기 이탈은 이 숫자로만 보인다.
+    listeners = hub.listener_count() if hub is not None else 0
 
     snap = metrics.get_snapshot()
     last_ts = snap["last_broadcast_ts"]
@@ -493,6 +502,7 @@ async def monitor_status(request: Request, pool=Depends(get_db_pool)):
     return MonitorStatusResponse(
         activeSessions=active,
         wsClientConnected=ws_connected,
+        listeners=listeners,
         natsConnected=bool(snap["nats_connected"]),
         lastBroadcastAgoSec=ago,
         nodeUp=gauges is not None,
@@ -506,6 +516,11 @@ async def start_session(req: StartRequest, request: Request):
     print('base url', base_ws_url)
     webSocket_url = f"{base_ws_url}?sessionId={req.session_id}"
     print('ws url', webSocket_url)
+
+    # P1: 세션의 언어 채널을 청취자보다 먼저 등록한다. 첫 소켓이 붙는 시점에
+    # 채널이 정해져 있어야 브로드캐스트가 갈 곳을 안다 (D2).
+    hub: WebSocketHub = request.app.state.hub
+    await hub.register_session(req.session_id, req.target_lang)
 
     # Create the session row up front so ended_at always has a target on stop.
     # Retried (WU2) because a lost row here means the session may never appear
@@ -598,7 +613,7 @@ async def websocket_endpoint(ws: WebSocket):
 
     hub: WebSocketHub = ws.app.state.hub
 
-    # wss://.../ws?sessionId={id} 의 쿼리에서 슬롯 주인을 식별한다.
+    # wss://.../ws?sessionId={id} 의 쿼리로 붙을 세션을 고른다.
     # sessionId 없는 접속은 라우팅 대상이 없으므로 거절(handshake close).
     session_id = ws.query_params.get("sessionId")
     if not session_id:
@@ -606,15 +621,27 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close(code=1008)
         return
 
-    print(">>> hub at endpoint:", id(hub), "ws:", id(ws), "session:", session_id)
+    # P1: 청취자 여러 명이 같은 sessionId 로 붙는다. 소켓을 구분할 값이 필요한데
+    # (D5 순단 행의 주인) 앱은 아직 아무것도 안 보내므로 서버가 발급한다.
+    # clientId/lang 쿼리는 앱이 보내기 시작하면(P2) 코드 변경 없이 쓰이는 훅이다.
+    client_id = await hub.attach(
+        ws,
+        session_id,
+        target_lang=ws.query_params.get("lang"),
+        client_id=ws.query_params.get("clientId"),
+    )
+    if client_id is None:
+        # 라이브가 아닌 세션 — 허브가 이미 4404 로 닫았다. 여기서 등재를
+        # 허용하면 종료된 세션이 재접속만으로 되살아난다.
+        return
 
-    await hub.attach(ws, session_id)
+    print(">>> hub at endpoint:", id(hub), "ws:", id(ws),
+          "session:", session_id, "client:", client_id)
 
     try:
-        await hub.broadcast_to_session(session_id, {
-            "sentence": "Connect!",
-            "isFinal": True
-        })
+        # 접속 인사는 이 소켓에만. 브로드캐스트로 보내면 이미 듣고 있던
+        # 청취자 전원의 화면에 남의 접속 인사가 자막으로 뜬다.
+        await hub.send_to_socket(ws, "Connect!")
 
         while True:
             raw_text = await ws.receive_text()
@@ -632,23 +659,23 @@ async def websocket_endpoint(ws: WebSocket):
 
             # pong 타입: 클라이언트가 주기적으로 보내는 pong (keepalive)
             if message_type == "pong":
-                await hub.on_pong()
+                await hub.on_pong(ws)
                 continue
             # ping 타입: 클라이언트가 보내면 pong으로 응답
             if message_type == "ping":
                 await ws.send_json({"type": "pong"})
-                await hub.on_pong()
+                await hub.on_pong(ws)
                 continue
             # 다른 메시지도 활동으로 간주해 keepalive 갱신
-            await hub.on_pong()
+            await hub.on_pong(ws)
 
             # 다른 메시지 타입은 여기서 처리 (현재는 없음)
             # 실제 데이터 메시지는 여기서 처리됨
 
     except WebSocketDisconnect as e:
-        # §4-3(원인 1): hub 에 즉시 통지해 죽은 소켓을 슬롯에서 비운다.
-        # 그래야 이후 번역이 send 시도 대신 pending 으로 큐잉돼 유실되지 않는다.
-        # detach 는 pending 을 비우므로 여기서 쓰면 안 된다 — 재접속 flush 로 방류.
+        # §4-3(원인 1): hub 에 즉시 통지해 이 소켓만 명부에서 내린다. 통지가
+        # 늦으면 다음 keepalive 틱(최대 30초)까지 죽은 소켓에 send 를 시도한다.
+        # detach 를 쓰면 안 된다 — 그건 세션의 모든 소켓을 닫고 세션을 지운다.
         # §4-7: close code 가 원인 판별의 핵심 — 1001(클라 정상 종료: 절전/
         # 백그라운드) vs 1006(비정상 단절: 네트워크). ws_blips 로도 기록된다.
         print(f'main : websocket disconnected code={e.code} reason={e.reason!r}')
@@ -656,8 +683,14 @@ async def websocket_endpoint(ws: WebSocket):
             session_id, ws, close_code=e.code, close_reason=e.reason or None
         )
     except Exception as e:
+        # 여기도 '소켓 1개가 죽었다' 이지 '방송이 끝났다' 가 아니다. detach 를
+        # 부르면 예외 하나에 그 세션의 청취자 전원이 끊기고 세션이 지워져,
+        # 이후 번역이 전부 stale drop 된다 — P1 이 없애려던 증상 그대로다.
+        # close frame 이 없으므로 code/reason 없이 열고 detected_by 로 구분한다.
         print(f'main : websocket error: {e}')
-        await hub.detach(session_id)
+        await hub.handle_client_disconnect(
+            session_id, ws, detected_by="ws_error"
+        )
 
 
 @app.websocket("/ws/monitor")
