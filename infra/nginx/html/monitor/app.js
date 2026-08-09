@@ -976,7 +976,12 @@
             return;
         blipsState.loading = true;
         if (reset) {
+            // offset 만 되돌리면 fetch 실패 시 nextOffset 이 옛 위치로 남는다 — 표는
+            // 비었는데 [더 보기]가 그 위치를 요청해 앞 페이지가 통째로 빠진 목록이
+            // 그려진다. 순단 이력은 "몇 번 끊겼나" 를 세는 용도라 누락이 곧 오판이다.
             blipsState.offset = 0;
+            blipsState.nextOffset = null;
+            $("blips-more").hidden = true;
             clear($("blips-rows"));
         }
         $("blips-status").textContent = "불러오는 중…";
