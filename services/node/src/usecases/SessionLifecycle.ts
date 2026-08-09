@@ -108,14 +108,8 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     await deps.stopPythonSession(sessionId);
   };
 
-  const scheduleAutoStop = (clientId: string | null): void => {
+  const scheduleAutoStop = (): void => {
     if (!currentSessionId) return;
-    // A reconnecting OBS opens its new socket (and fires on_publish) before
-    // nginx notices the old one died, so the stale publish_done can arrive
-    // AFTER the publisher is already back. Re-arming on it would auto-stop a
-    // live broadcast one grace window later.
-    if (publisherClientId && clientId && clientId !== publisherClientId) return;
-
     cancelAutoStop();
     const armedFor = currentSessionId;
     const timer = setTimeout(() => {
@@ -138,12 +132,12 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
   ): Promise<SessionStartResult> => {
     const sessionId = deps.newSessionId();
     currentSessionId = sessionId;
-    // Forget the previous broadcast's publisher. A stale id here would make
-    // the ordering guard below reject the new session's publish_done, and
-    // the failure mode of that is the exact bug this feature fixes — a
-    // session nobody ever closes. When in doubt the guard must let the
-    // teardown through, so an unknown publisher is null, never a leftover.
-    publisherClientId = null;
+    // publisherClientId is deliberately NOT cleared here. The normal order of
+    // events is OBS first, app [시작] second, so clearing would forget a
+    // publisher that is live right now — and hand the free slot to whatever
+    // publishes next, whose publish_done then ends the running broadcast.
+    // The slot is emptied by publisherDone, which is the only event that
+    // actually says a publisher left; teardown clears it via forgetSession.
     deps.onSessionIdChanged(sessionId);
 
     try {
@@ -223,16 +217,35 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
       return "ignored";
     },
 
-    // on_publish, but only once the key check passed: an unauthenticated
-    // publish attempt must not be able to extend a session it cannot start.
+    // on_publish, but only once the stream-name and key checks passed: an
+    // unauthenticated publish attempt must not be able to extend a session it
+    // cannot start.
     publisherReturned(clientId: string | null): void {
-      publisherClientId = clientId;
+      // First writer wins. A second OBS on the same stream name is rejected by
+      // nginx ("Already publishing"), but the hook fires BEFORE the rejection
+      // and that clientid's on_publish_done follows ~1ms later (measured on the
+      // dev stack, 2026-08-09). Overwriting the slot would let that pair arm the
+      // grace timer and auto-stop a broadcast that never stopped — reproduced,
+      // active_session went 1 → 0 with the real publisher still sending.
+      if (!publisherClientId) publisherClientId = clientId;
       cancelAutoStop();
       pipeline?.notifyPublisherReturned();
     },
 
     publisherDone(clientId: string | null): void {
-      scheduleAutoStop(clientId);
+      // Someone else's exit says nothing about this broadcast: it is either the
+      // rejected duplicate above, or the late publish_done of a connection that
+      // already died and was replaced. Neither may arm the timer.
+      if (publisherClientId && clientId && clientId !== publisherClientId) {
+        return;
+      }
+      // Empty the slot even with no session running. A broadcast that starts
+      // and stops before the app is opened (a pre-service OBS test) would
+      // otherwise leave its id behind, and the real broadcast's publish_done
+      // would then be discarded as a mismatch — a session nothing can close,
+      // which is the failure P1 D4 left without a manual way out.
+      publisherClientId = null;
+      scheduleAutoStop();
     },
 
     currentSession(): string | null {
