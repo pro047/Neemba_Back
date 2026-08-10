@@ -1,7 +1,6 @@
 import express from "express";
 import { pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
-import { removeSessionId, setSessionId } from "../ports/sessionStore.js";
 import { GoogleAuth } from "google-auth-library";
 import {
   micRuntimeStore,
@@ -198,7 +197,6 @@ async function stopExistingMicSession(
   }
 
   const activeRuntime = runtimeStore.get(activeSessionId);
-  removeSessionId();
 
   if (activeRuntime) {
     await activeRuntime.stop();
@@ -235,8 +233,6 @@ export function createStartMicSessionHandler({
         targetLang,
       });
 
-      setSessionId(sessionId);
-
       try {
         const runtime = await micPipelineFactory(sessionId, {
           sourceLang,
@@ -245,7 +241,6 @@ export function createStartMicSessionHandler({
         runtimeStore.set(sessionId, runtime);
         runtimeStore.setActiveSessionId(sessionId);
       } catch (error) {
-        removeSessionId();
         await pythonClient.stopSession(sessionId).catch(() => undefined);
         throw error;
       }
@@ -361,7 +356,6 @@ export async function stopMicSession(
     runtimeStore.delete(sessionId);
   }
 
-  removeSessionId();
   await pythonClient.stopSession(sessionId);
 }
 

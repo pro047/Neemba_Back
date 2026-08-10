@@ -3,7 +3,6 @@ import { z } from "zod";
 import { DEFAULT_RTMP_PULL_URL, pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
 import { runPipelines } from "../runPipeLines.js";
-import { removeSessionId, setSessionId } from "../ports/sessionStore.js";
 import { incSessionStopped, setRtmpAuthEnabled } from "../monitoring/metrics.js";
 import {
   createSessionLifecycle,
@@ -234,8 +233,6 @@ const defaultLifecycle = createSessionLifecycle({
     });
     if (!r.ok) throw new Error(`python session stop failed: ${r.status}`);
   },
-  onSessionIdChanged: (sessionId) =>
-    sessionId ? setSessionId(sessionId) : removeSessionId(),
   recordStop: incSessionStopped,
   graceMs: publishDoneGraceMs,
 });
