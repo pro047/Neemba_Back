@@ -120,10 +120,18 @@ assert set(COUNTER_OPTIONS) <= {name for name, _, _ in COUNTER_RULES}
 # 통과할 수 없고, 방송당 많아야 1회라 쿨다운이 침묵시킬 이유가 없다.
 # 메트릭 키에 라벨이 붙어 있는 건 fetch_metrics 가 exposition 라인을 통째로
 # 키로 쓰기 때문이다 (node metrics.ts 가 이 문자열을 고정한다).
+#
+# 문구가 "운영자 stop 미호출" 이었던 건 수동 stop 이 주 경로이던 시절의 서술이다.
+# P1 D4(release #82) 로 POST /api/sessions/stop 이 세션을 닫지 않게 되면서
+# on_publish_done + 유예가 **유일한** 종료 경로가 됐다. 이제 이 알림은 이상
+# 신호가 아니라 정상 종료 그 자체이고, 운영자가 봐야 할 것은 발화가 아니라
+# **부재**다 — 예배가 끝났는데 이게 안 오면 세션이 안 닫힌 것이고, 회수 수단은
+# POST /internal/sessions/stop 직접 호출뿐이다.
 INFO_COUNTER_RULES = [
     ('session_auto_stopped',
      'neemba_session_stopped_total{reason="publisher_done"}',
-     'ℹ️ 방송 종료 감지 — 세션 자동 종료 {delta:.0f}회 (운영자 stop 미호출)'),
+     'ℹ️ 방송 종료 — 세션 자동 종료 {delta:.0f}회 (정상 경로. '
+     '예배 후 이 알림이 없으면 세션이 안 닫힌 것)'),
 ]
 
 

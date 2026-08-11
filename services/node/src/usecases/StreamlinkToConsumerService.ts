@@ -7,7 +7,8 @@ let signalListenersRegistered = false;
 export class StreamlinkToConsumerService {
   constructor(
     private readonly ffmpeg: AudioTranscoder,
-    private readonly orchestra: AudioConsumerPort
+    private readonly orchestra: AudioConsumerPort,
+    private readonly sessionId: string
   ) {}
 
   async run(): Promise<() => Promise<void>> {
@@ -19,7 +20,21 @@ export class StreamlinkToConsumerService {
       stop: stopTranscoder,
     } = this.ffmpeg.startTranscoder();
 
-    const streamStop = await this.orchestra.start(pcmReadable);
+    let streamStop: () => Promise<void>;
+    try {
+      streamStop = await this.orchestra.start(pcmReadable, {
+        sessionId: this.sessionId,
+      });
+    } catch (err) {
+      // start() threw before handing back its stop closure, so nobody else
+      // can reach this transcoder — clean it up here or the ffmpeg child
+      // keeps pulling the RTMP url forever (one orphan per failed start).
+      try {
+        inputWritable.end();
+      } catch {}
+      await Promise.resolve(stopTranscoder());
+      throw err;
+    }
 
     let alreadyStopped = false;
 

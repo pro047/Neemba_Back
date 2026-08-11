@@ -4,13 +4,13 @@ import type { AudioTranscoder } from "../ports/ports.js";
 import { PassThrough } from "node:stream";
 import type { Readable, Writable } from "node:stream";
 import { incFfmpegStale } from "../monitoring/metrics.js";
+import { DEFAULT_RTMP_PULL_URL } from "../config.js";
 
 // "No publisher yet" (OBS not live) is a legitimate indefinite state, so
 // restarts never give up — they back off exponentially to stop the 10s
 // restart churn, and reset to the base delay once real progress arrives.
 const DEFAULT_RESTART_BASE_DELAY_MS = 10_000;
 const DEFAULT_RESTART_MAX_DELAY_MS = 60_000;
-const DEFAULT_RTMP_PULL_URL = "rtmp://neemba.app:1935/live/translation";
 
 type RestartBackoffOptions = {
   restartBaseDelayMs?: number;

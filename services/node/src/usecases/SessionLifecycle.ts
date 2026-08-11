@@ -39,7 +39,11 @@ export type StopOutcome = "ignored" | "mismatch";
 
 export type SessionLifecycleDeps = {
   newSessionId: () => string;
-  startPipeline: (languages: {
+  // sessionId rides along so the pipeline can pass it down as explicit
+  // AudioConsumerContext — the orchestrator has no other way to learn it now
+  // that the shared session slot is gone (mic-rtmp-session-slot-plan D1-A).
+  startPipeline: (args: {
+    sessionId: string;
     sourceLanguage: string;
     targetLanguage: string;
   }) => Promise<PipelineHandle>;
@@ -47,7 +51,6 @@ export type SessionLifecycleDeps = {
     params: SessionLanguages & { sessionId: string }
   ) => Promise<{ webSocketUrl: string }>;
   stopPythonSession: (sessionId: string) => Promise<void>;
-  onSessionIdChanged: (sessionId: string | null) => void;
   recordStop: (reason: SessionStopReason) => void;
   graceMs: () => number;
 };
@@ -95,7 +98,6 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     // with it — a joiner must never receive a url for a session being torn down.
     forgetSession();
     cancelAutoStop();
-    deps.onSessionIdChanged(null);
     deps.recordStop(reason);
 
     try {
@@ -108,14 +110,8 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     await deps.stopPythonSession(sessionId);
   };
 
-  const scheduleAutoStop = (clientId: string | null): void => {
+  const scheduleAutoStop = (): void => {
     if (!currentSessionId) return;
-    // A reconnecting OBS opens its new socket (and fires on_publish) before
-    // nginx notices the old one died, so the stale publish_done can arrive
-    // AFTER the publisher is already back. Re-arming on it would auto-stop a
-    // live broadcast one grace window later.
-    if (publisherClientId && clientId && clientId !== publisherClientId) return;
-
     cancelAutoStop();
     const armedFor = currentSessionId;
     const timer = setTimeout(() => {
@@ -138,20 +134,22 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
   ): Promise<SessionStartResult> => {
     const sessionId = deps.newSessionId();
     currentSessionId = sessionId;
-    // Forget the previous broadcast's publisher. A stale id here would make
-    // the ordering guard below reject the new session's publish_done, and
-    // the failure mode of that is the exact bug this feature fixes — a
-    // session nobody ever closes. When in doubt the guard must let the
-    // teardown through, so an unknown publisher is null, never a leftover.
-    publisherClientId = null;
-    deps.onSessionIdChanged(sessionId);
+    // publisherClientId is deliberately NOT cleared here. The normal order of
+    // events is OBS first, app [시작] second, so clearing would forget a
+    // publisher that is live right now — and hand the free slot to whatever
+    // publishes next, whose publish_done then ends the running broadcast.
+    // The slot is emptied by publisherDone, which is the only event that
+    // actually says a publisher left; teardown clears it via forgetSession.
 
+    let pythonStarted = false;
     try {
       const { webSocketUrl } = await deps.startPythonSession({
         sessionId,
         ...languages,
       });
+      pythonStarted = true;
       const handle = await deps.startPipeline({
+        sessionId,
         sourceLanguage: languages.sourceLang,
         targetLanguage: languages.targetLang,
       });
@@ -172,10 +170,22 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
       currentLanguages = languages;
       return { sessionId, webSocketUrl, joined: false, ...languages };
     } catch (err) {
-      // Same clear as teardown, minus the stop calls: nothing was started, so
-      // leaving a url behind would publish a session that does not exist.
+      // stillOwned distinguishes "the pipeline failed" from "a teardown claimed
+      // this session mid-start": teardown already ran stopPythonSession, and a
+      // second stop for the same id is a non-2xx error log.
+      const stillOwned = currentSessionId === sessionId;
       forgetSession();
-      deps.onSessionIdChanged(null);
+      if (pythonStarted && stillOwned) {
+        // Without this, a pipeline failure after a successful python start
+        // leaves an orphan python session nothing can reach — active_session
+        // sticks at 1 and the alerting fires until a manual /internal stop.
+        await deps.stopPythonSession(sessionId).catch((stopErr) =>
+          console.error(
+            `session ${sessionId}: python stop after failed start failed`,
+            stopErr
+          )
+        );
+      }
       throw err;
     }
   };
@@ -223,16 +233,35 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
       return "ignored";
     },
 
-    // on_publish, but only once the key check passed: an unauthenticated
-    // publish attempt must not be able to extend a session it cannot start.
+    // on_publish, but only once the stream-name and key checks passed: an
+    // unauthenticated publish attempt must not be able to extend a session it
+    // cannot start.
     publisherReturned(clientId: string | null): void {
-      publisherClientId = clientId;
+      // First writer wins. A second OBS on the same stream name is rejected by
+      // nginx ("Already publishing"), but the hook fires BEFORE the rejection
+      // and that clientid's on_publish_done follows ~1ms later (measured on the
+      // dev stack, 2026-08-09). Overwriting the slot would let that pair arm the
+      // grace timer and auto-stop a broadcast that never stopped — reproduced,
+      // active_session went 1 → 0 with the real publisher still sending.
+      if (!publisherClientId) publisherClientId = clientId;
       cancelAutoStop();
       pipeline?.notifyPublisherReturned();
     },
 
     publisherDone(clientId: string | null): void {
-      scheduleAutoStop(clientId);
+      // Someone else's exit says nothing about this broadcast: it is either the
+      // rejected duplicate above, or the late publish_done of a connection that
+      // already died and was replaced. Neither may arm the timer.
+      if (publisherClientId && clientId && clientId !== publisherClientId) {
+        return;
+      }
+      // Empty the slot even with no session running. A broadcast that starts
+      // and stops before the app is opened (a pre-service OBS test) would
+      // otherwise leave its id behind, and the real broadcast's publish_done
+      // would then be discarded as a mismatch — a session nothing can close,
+      // which is the failure P1 D4 left without a manual way out.
+      publisherClientId = null;
+      scheduleAutoStop();
     },
 
     currentSession(): string | null {

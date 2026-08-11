@@ -5,7 +5,6 @@ import type {
   AudioConsumerPort,
   StopStreaming,
 } from "../ports/audioConsumerPort.js";
-import { getSessionId } from "../ports/sessionStore.js";
 import { setSttPaused } from "../monitoring/metrics.js";
 import type { ISegmentManager } from "../ports/segment.js";
 import type { IInterfaceOrchestra } from "../ports/interimOrchestra.js";
@@ -54,10 +53,13 @@ export class StreamOrchestrator implements AudioConsumerPort {
     pcmReadable: Readable,
     context?: AudioConsumerContext
   ): Promise<StopStreaming> {
-    const sessionId = context?.sessionId ?? getSessionId();
+    // No fallback on purpose: the shared session slot let mic start/stop
+    // silently redirect RTMP captions (docs/mic-rtmp-session-slot-plan.md §3).
+    // Every caller must own its sessionId and pass it explicitly.
+    const sessionId = context?.sessionId;
 
     if (!sessionId) {
-      throw new Error("sessionId required for mic streaming");
+      throw new Error("sessionId required: pass AudioConsumerContext.sessionId");
     }
 
     const sessionSegmentId = this.segmentManager.next(sessionId);
