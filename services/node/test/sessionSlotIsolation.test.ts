@@ -86,7 +86,7 @@ function createMicHarness(sessionId: string) {
   const start = createStartMicSessionHandler({
     pythonClient,
     runtimeStore,
-    ttsSynthesizer: { synthesize: vi.fn() },
+    scheduleConnectTeardown: () => {},
     micPipelineFactory: async () => ({
       inputWritable: new PassThrough(),
       stop: async () => {},
