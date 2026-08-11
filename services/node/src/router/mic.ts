@@ -1,7 +1,9 @@
 import express from "express";
+import { PassThrough } from "node:stream";
 import { pythonHost } from "../config.js";
 import { v4 as uuidv4 } from "uuid";
 import { GoogleAuth } from "google-auth-library";
+import { scheduleMicTeardown } from "../micTeardown.js";
 import {
   micRuntimeStore,
   type MicRuntime,
@@ -49,6 +51,7 @@ type CreateMicRouterDependencies = {
     }
   ) => Promise<MicRuntime>;
   sessionIdFactory?: () => string;
+  scheduleConnectTeardown?: (sessionId: string) => void;
 };
 
 type MicTtsRequest = {
@@ -186,32 +189,42 @@ type MicHandlerDependencies = {
   sessionIdFactory: () => string;
 };
 
-async function stopExistingMicSession(
-  runtimeStore: SessionRuntimeStore,
-  pythonClient: PythonSessionClient
-): Promise<void> {
-  const activeSessionId = runtimeStore.getActiveSessionId();
+const DEFAULT_MIC_MAX_SESSIONS = 5;
 
-  if (!activeSessionId) {
-    return;
-  }
-
-  const activeRuntime = runtimeStore.get(activeSessionId);
-
-  if (activeRuntime) {
-    await activeRuntime.stop();
-  }
-
-  runtimeStore.delete(activeSessionId);
-  await pythonClient.stopSession(activeSessionId);
+// Not a user quota — the expected concurrent listeners are ~2. This is the
+// cost-abuse ceiling: /api/mic/start is unauthenticated and each session is
+// a billed Google STT stream, so without a cap one script could spin up
+// streams without bound. Read per call so tests and container env both apply
+// (same reason RTMP_PUBLISH_KEY is).
+function micMaxSessions(): number {
+  const raw = Number(process.env.MIC_MAX_SESSIONS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MIC_MAX_SESSIONS;
 }
+
+// How long a started session may wait for its first audio socket. The ghost
+// teardown in micWebSocket.ts only arms on socket close — a session whose
+// socket NEVER connects (curl abuse, app died before opening the WS) has no
+// close event, so without this deadline it would hold a cap slot and a billed
+// STT stream until the process restarts.
+const MIC_CONNECT_GRACE_MS = 15_000;
+
+type StartMicSessionDependencies = Pick<
+  MicHandlerDependencies,
+  "pythonClient" | "runtimeStore" | "micPipelineFactory" | "sessionIdFactory"
+> & {
+  // Required, not optional: a wiring that forgets it silently recreates the
+  // never-connected-socket leak (same rule as the orchestrator's mandatory
+  // AudioConsumerContext).
+  scheduleConnectTeardown: (sessionId: string) => void;
+};
 
 export function createStartMicSessionHandler({
   pythonClient,
   runtimeStore,
   micPipelineFactory,
   sessionIdFactory,
-}: MicHandlerDependencies): RequestHandler {
+  scheduleConnectTeardown,
+}: StartMicSessionDependencies): RequestHandler {
   return async (req, res) => {
     const sessionId = sessionIdFactory();
     const sourceLang = req.body?.sourceLang ?? "ko-KR";
@@ -222,11 +235,24 @@ export function createStartMicSessionHandler({
     console.log(sourceLang);
     console.log(targetLang);
 
-    try {
-      await stopExistingMicSession(runtimeStore, pythonClient).catch((error) => {
-        console.error("failed to stop previous mic session", error);
-      });
+    // Reject before touching python: a denied start must leave zero traces.
+    if (runtimeStore.count() >= micMaxSessions()) {
+      console.warn(
+        `mic start rejected: ${runtimeStore.count()} sessions already running (max ${micMaxSessions()})`
+      );
+      return res.status(429).json({ error: "Too many active mic sessions" });
+    }
 
+    // Reserve the slot in the same tick as the check above. Concurrent starts
+    // interleave only at awaits, so without this placeholder N simultaneous
+    // requests all read the same count and blow past the cap together. The
+    // error path below releases the reservation via delete().
+    runtimeStore.set(sessionId, {
+      inputWritable: new PassThrough(),
+      stop: async () => {},
+    });
+
+    try {
       const pythonSession = await pythonClient.startSession({
         sessionId,
         sourceLang,
@@ -239,11 +265,15 @@ export function createStartMicSessionHandler({
           targetLang,
         });
         runtimeStore.set(sessionId, runtime);
-        runtimeStore.setActiveSessionId(sessionId);
       } catch (error) {
         await pythonClient.stopSession(sessionId).catch(() => undefined);
         throw error;
       }
+
+      // Armed BEFORE the 202 goes out: the app cannot open the socket until
+      // it has the response, so the connect that cancels this timer can never
+      // race ahead of the arming.
+      scheduleConnectTeardown(sessionId);
 
       return res.status(202).json({
         sessionId,
@@ -388,14 +418,25 @@ export function createMicRouter({
     return runDefaultMicPipeline(sessionId, streamLanguages);
   },
   sessionIdFactory = uuidv4,
+  scheduleConnectTeardown,
 }: CreateMicRouterDependencies = {}) {
   const router = express.Router();
+  const connectTeardown =
+    scheduleConnectTeardown ??
+    ((sessionId: string) =>
+      scheduleMicTeardown(sessionId, {
+        runtimeStore,
+        stop: (id) => stopMicSession(id, { pythonClient, runtimeStore }),
+        graceMs: MIC_CONNECT_GRACE_MS,
+        reason:
+          "mic session started but no audio socket connected — tearing down",
+      }));
   const startHandler = createStartMicSessionHandler({
     pythonClient,
     runtimeStore,
-    ttsSynthesizer,
     micPipelineFactory,
     sessionIdFactory,
+    scheduleConnectTeardown: connectTeardown,
   });
   const stopHandler = createStopMicSessionHandler({
     pythonClient,

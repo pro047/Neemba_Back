@@ -46,6 +46,7 @@ describe("mic router", () => {
     const handler = createStartMicSessionHandler({
       pythonClient,
       runtimeStore,
+      scheduleConnectTeardown: vi.fn(),
       micPipelineFactory: async (sessionId) => {
         expect(sessionId).toBe("session-1");
         return runtime;
@@ -80,6 +81,7 @@ describe("mic router", () => {
     const handler = createStartMicSessionHandler({
       pythonClient,
       runtimeStore,
+      scheduleConnectTeardown: vi.fn(),
       micPipelineFactory: vi.fn(async (_sessionId) => {
         throw new Error("should not run");
       }),
@@ -106,6 +108,7 @@ describe("mic router", () => {
     const handler = createStartMicSessionHandler({
       pythonClient,
       runtimeStore,
+      scheduleConnectTeardown: vi.fn(),
       micPipelineFactory: vi.fn(async (_sessionId) => {
         throw new Error("pipeline failed");
       }),
@@ -120,48 +123,6 @@ describe("mic router", () => {
     expect(pythonClient.stopSession).toHaveBeenCalledWith("session-1");
   });
 
-  it("stops the previous active mic session before starting a new one", async () => {
-    const runtimeStore = createSessionRuntimeStore();
-    const previousRuntime: MicRuntime = {
-      inputWritable: new (await import("node:stream")).PassThrough(),
-      stop: vi.fn(async () => {}),
-    };
-    const nextRuntime: MicRuntime = {
-      inputWritable: new (await import("node:stream")).PassThrough(),
-      stop: vi.fn(async () => {}),
-    };
-    runtimeStore.set("session-old", previousRuntime);
-    runtimeStore.setActiveSessionId("session-old");
-
-    const pythonClient: PythonSessionClient = {
-      startSession: vi.fn(async () => ({
-        sessionId: "session-new",
-        webSocketUrl: "ws://localhost:3000/api/mic",
-      })),
-      stopSession: vi.fn(async () => {}),
-    };
-
-    const handler = createStartMicSessionHandler({
-      pythonClient,
-      runtimeStore,
-      micPipelineFactory: async (sessionId) => {
-        expect(sessionId).toBe("session-new");
-        return nextRuntime;
-      },
-      sessionIdFactory: () => "session-new",
-    });
-    const response = createMockResponse();
-
-    await handler({ body: {} } as never, response as never, vi.fn());
-
-    expect(previousRuntime.stop).toHaveBeenCalled();
-    expect(pythonClient.stopSession).toHaveBeenCalledWith("session-old");
-    expect(runtimeStore.get("session-old")).toBeUndefined();
-    expect(runtimeStore.get("session-new")).toBe(nextRuntime);
-    expect(runtimeStore.getActiveSessionId()).toBe("session-new");
-    expect(response.statusCode).toBe(202);
-  });
-
   it("POST /api/mic/stop stops runtime, removes it, and calls Python stop", async () => {
     const runtimeStore = createSessionRuntimeStore();
     const runtime: MicRuntime = {
@@ -169,7 +130,6 @@ describe("mic router", () => {
       stop: vi.fn(async () => {}),
     };
     runtimeStore.set("session-1", runtime);
-    runtimeStore.setActiveSessionId("session-1");
 
     const pythonClient: PythonSessionClient = {
       startSession: vi.fn(async () => ({
