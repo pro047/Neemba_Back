@@ -39,7 +39,11 @@ export type StopOutcome = "ignored" | "mismatch";
 
 export type SessionLifecycleDeps = {
   newSessionId: () => string;
-  startPipeline: (languages: {
+  // sessionId rides along so the pipeline can pass it down as explicit
+  // AudioConsumerContext — the orchestrator has no other way to learn it now
+  // that the shared session slot is gone (mic-rtmp-session-slot-plan D1-A).
+  startPipeline: (args: {
+    sessionId: string;
     sourceLanguage: string;
     targetLanguage: string;
   }) => Promise<PipelineHandle>;
@@ -47,7 +51,6 @@ export type SessionLifecycleDeps = {
     params: SessionLanguages & { sessionId: string }
   ) => Promise<{ webSocketUrl: string }>;
   stopPythonSession: (sessionId: string) => Promise<void>;
-  onSessionIdChanged: (sessionId: string | null) => void;
   recordStop: (reason: SessionStopReason) => void;
   graceMs: () => number;
 };
@@ -95,7 +98,6 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     // with it — a joiner must never receive a url for a session being torn down.
     forgetSession();
     cancelAutoStop();
-    deps.onSessionIdChanged(null);
     deps.recordStop(reason);
 
     try {
@@ -138,14 +140,16 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     // publishes next, whose publish_done then ends the running broadcast.
     // The slot is emptied by publisherDone, which is the only event that
     // actually says a publisher left; teardown clears it via forgetSession.
-    deps.onSessionIdChanged(sessionId);
 
+    let pythonStarted = false;
     try {
       const { webSocketUrl } = await deps.startPythonSession({
         sessionId,
         ...languages,
       });
+      pythonStarted = true;
       const handle = await deps.startPipeline({
+        sessionId,
         sourceLanguage: languages.sourceLang,
         targetLanguage: languages.targetLang,
       });
@@ -166,10 +170,22 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
       currentLanguages = languages;
       return { sessionId, webSocketUrl, joined: false, ...languages };
     } catch (err) {
-      // Same clear as teardown, minus the stop calls: nothing was started, so
-      // leaving a url behind would publish a session that does not exist.
+      // stillOwned distinguishes "the pipeline failed" from "a teardown claimed
+      // this session mid-start": teardown already ran stopPythonSession, and a
+      // second stop for the same id is a non-2xx error log.
+      const stillOwned = currentSessionId === sessionId;
       forgetSession();
-      deps.onSessionIdChanged(null);
+      if (pythonStarted && stillOwned) {
+        // Without this, a pipeline failure after a successful python start
+        // leaves an orphan python session nothing can reach — active_session
+        // sticks at 1 and the alerting fires until a manual /internal stop.
+        await deps.stopPythonSession(sessionId).catch((stopErr) =>
+          console.error(
+            `session ${sessionId}: python stop after failed start failed`,
+            stopErr
+          )
+        );
+      }
       throw err;
     }
   };

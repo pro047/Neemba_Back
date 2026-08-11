@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createMicTtsHandler,
   createStartMicSessionHandler,
@@ -6,7 +6,6 @@ import {
   type MicTtsSynthesizer,
   type PythonSessionClient,
 } from "../src/router/mic.js";
-import { removeSessionId } from "../src/ports/sessionStore.js";
 import {
   createSessionRuntimeStore,
   type MicRuntime,
@@ -30,10 +29,6 @@ function createMockResponse() {
 }
 
 describe("mic router", () => {
-  afterEach(() => {
-    removeSessionId();
-  });
-
   it("POST /api/mic/start returns 202 and stores runtime", async () => {
     const runtimeStore = createSessionRuntimeStore();
     const runtime: MicRuntime = {

@@ -2,22 +2,28 @@ import { FfmpegTranscoder } from "./adapters/FfmpegTranscoder.js";
 import { StreamlinkToConsumerService } from "./usecases/StreamlinkToConsumerService.js";
 import { createStreamOrchestrator } from "./createStreamOrchestrator.js";
 
-type PipelineLanguages = {
-  sourceLanguage?: string;
-  targetLanguage?: string;
+type PipelineArgs = {
+  sessionId: string;
+  sourceLanguage: string;
+  targetLanguage: string;
 };
 
-export async function runPipelines(
-  languages: PipelineLanguages = {}
-): Promise<{
+export async function runPipelines({
+  sessionId,
+  sourceLanguage,
+  targetLanguage,
+}: PipelineArgs): Promise<{
   stop: () => Promise<void>;
   notifyPublisherReturned: () => void;
 }> {
   const ffmpeg = new FfmpegTranscoder();
-  const orchestrator = await createStreamOrchestrator(languages);
+  const orchestrator = await createStreamOrchestrator({
+    sourceLanguage,
+    targetLanguage,
+  });
 
   // 유즈 케이스 실행
-  const service = new StreamlinkToConsumerService(ffmpeg, orchestrator);
+  const service = new StreamlinkToConsumerService(ffmpeg, orchestrator, sessionId);
 
   const serviceStop = await service.run();
 

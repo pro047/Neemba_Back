@@ -23,7 +23,6 @@ function buildLifecycle(overrides: Partial<SessionLifecycleDeps> = {}) {
     startPipeline: vi.fn(async () => pipeline),
     startPythonSession: vi.fn(async () => ({ webSocketUrl: "ws://python" })),
     stopPythonSession: vi.fn(async () => {}),
-    onSessionIdChanged: vi.fn(),
     recordStop: vi.fn(),
     graceMs: () => GRACE_MS,
     ...overrides,
@@ -420,5 +419,38 @@ describe("세션 자동 종료 — publisher 종료 유예", () => {
 
     // Assert
     expect(deps.stopPythonSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("파이프라인 시작이 실패하면 이미 시작된 python 세션을 닫아야 한다", async () => {
+    // Arrange: python start 는 성공했는데 ffmpeg/STT 쪽이 실패하는 경우.
+    // forgetSession 만 하고 나가면 python 의 active_session 이 1로 고착된
+    // 고아 세션이 남는다 — 닫을 id 를 아는 유일한 시점이 여기다.
+    const { lifecycle, deps } = buildLifecycle({
+      startPipeline: vi.fn(async () => {
+        throw new Error("ffmpeg spawn failed");
+      }),
+    });
+
+    // Act & Assert
+    await expect(lifecycle.start(languages)).rejects.toThrow(
+      "ffmpeg spawn failed"
+    );
+    expect(deps.stopPythonSession).toHaveBeenCalledExactlyOnceWith("session-1");
+  });
+
+  it("python 세션 시작 자체가 실패하면 python stop 을 부르지 않아야 한다", async () => {
+    // Arrange: 시작된 게 없으니 닫을 것도 없다 — 존재하지 않는 세션에 stop 을
+    // 보내면 non-2xx 로 에러 로그만 쌓인다.
+    const { lifecycle, deps } = buildLifecycle({
+      startPythonSession: vi.fn(async () => {
+        throw new Error("python unreachable");
+      }),
+    });
+
+    // Act & Assert
+    await expect(lifecycle.start(languages)).rejects.toThrow(
+      "python unreachable"
+    );
+    expect(deps.stopPythonSession).not.toHaveBeenCalled();
   });
 });
