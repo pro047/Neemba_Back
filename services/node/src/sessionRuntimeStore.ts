@@ -3,19 +3,19 @@ export type MicRuntime = {
   stop: () => Promise<void>;
 };
 
+// Mic sessions are fully independent (one listener = one session = one STT
+// stream), so this is a plain per-session map — the single activeSessionId
+// slot died with the kill-and-replace start behavior it existed for.
 export interface SessionRuntimeStore {
   set(sessionId: string, runtime: MicRuntime): void;
   get(sessionId: string): MicRuntime | undefined;
   delete(sessionId: string): void;
-  setActiveSessionId(sessionId: string | undefined): void;
-  getActiveSessionId(): string | undefined;
-  getActiveRuntime(): MicRuntime | undefined;
+  count(): number;
   clear(): void;
 }
 
 class InMemorySessionRuntimeStore implements SessionRuntimeStore {
   private readonly runtimes = new Map<string, MicRuntime>();
-  private activeSessionId: string | undefined;
 
   set(sessionId: string, runtime: MicRuntime): void {
     this.runtimes.set(sessionId, runtime);
@@ -27,30 +27,14 @@ class InMemorySessionRuntimeStore implements SessionRuntimeStore {
 
   delete(sessionId: string): void {
     this.runtimes.delete(sessionId);
-    if (this.activeSessionId === sessionId) {
-      this.activeSessionId = undefined;
-    }
   }
 
-  setActiveSessionId(sessionId: string | undefined): void {
-    this.activeSessionId = sessionId;
-  }
-
-  getActiveSessionId(): string | undefined {
-    return this.activeSessionId;
-  }
-
-  getActiveRuntime(): MicRuntime | undefined {
-    if (!this.activeSessionId) {
-      return undefined;
-    }
-
-    return this.runtimes.get(this.activeSessionId);
+  count(): number {
+    return this.runtimes.size;
   }
 
   clear(): void {
     this.runtimes.clear();
-    this.activeSessionId = undefined;
   }
 }
 

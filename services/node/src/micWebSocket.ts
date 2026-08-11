@@ -5,6 +5,11 @@ import {
   type SessionRuntimeStore,
 } from "./sessionRuntimeStore.js";
 import { createMicSessionStopper } from "./router/mic.js";
+import {
+  cancelMicTeardown,
+  micPendingTeardowns,
+  scheduleMicTeardown,
+} from "./micTeardown.js";
 
 // A socket that closes without /mic/stop leaves the Google STT stream (and
 // its 285s rotation timer) running — and billing — forever. After this grace
@@ -14,7 +19,6 @@ const DEFAULT_TEARDOWN_GRACE_MS = 10_000;
 // emits "close", so teardown would never fire. Ping this often; if a full
 // interval passes with no pong the socket is declared dead and terminated.
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
-const defaultPendingTeardowns = new Map<string, NodeJS.Timeout>();
 
 type AttachMicSocketDependencies = {
   runtimeStore?: SessionRuntimeStore;
@@ -57,22 +61,20 @@ export function attachMicSocketHandlers(
     runtimeStore = micRuntimeStore,
     stopSession,
     teardownGraceMs = DEFAULT_TEARDOWN_GRACE_MS,
-    pendingTeardowns = defaultPendingTeardowns,
+    pendingTeardowns = micPendingTeardowns,
     heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
   }: AttachMicSocketDependencies = {}
 ): void {
   const attachedSessionId = resolveSessionId(requestUrl);
 
-  // Reconnect within the grace window: keep the session alive.
-  if (attachedSessionId) {
-    const pending = pendingTeardowns.get(attachedSessionId);
-    if (pending) {
-      clearTimeout(pending);
-      pendingTeardowns.delete(attachedSessionId);
-      console.log(
-        `mic ws reconnected, teardown cancelled: ${attachedSessionId}`
-      );
-    }
+  // A (re)connect within a grace window keeps the session alive — this
+  // cancels both the awaiting-first-socket timer armed by /mic/start and the
+  // reconnect timer armed by a previous socket's close.
+  if (
+    attachedSessionId &&
+    cancelMicTeardown(attachedSessionId, pendingTeardowns)
+  ) {
+    console.log(`mic ws connected, teardown cancelled: ${attachedSessionId}`);
   }
 
   // Protocol-level heartbeat. The client's WS stack auto-replies pong (no app
@@ -96,22 +98,14 @@ export function attachMicSocketHandlers(
     clearInterval(heartbeat);
     if (!attachedSessionId) return;
     if (!runtimeStore.get(attachedSessionId)) return;
-    if (pendingTeardowns.has(attachedSessionId)) return;
 
-    const stop = stopSession ?? createMicSessionStopper(runtimeStore);
-    const timer = setTimeout(() => {
-      pendingTeardowns.delete(attachedSessionId);
-      // /mic/stop may have landed during the grace window.
-      if (!runtimeStore.get(attachedSessionId)) return;
-      console.warn(
-        `mic ws closed without stop — tearing down ghost session: ${attachedSessionId}`
-      );
-      stop(attachedSessionId).catch((err) =>
-        console.error("ghost session teardown failed", err)
-      );
-    }, teardownGraceMs);
-    timer.unref?.();
-    pendingTeardowns.set(attachedSessionId, timer);
+    scheduleMicTeardown(attachedSessionId, {
+      runtimeStore,
+      stop: stopSession ?? createMicSessionStopper(runtimeStore),
+      graceMs: teardownGraceMs,
+      reason: "mic ws closed without stop — tearing down ghost session",
+      pendingTeardowns,
+    });
   });
 
   socket.on("message", (message: RawData, isBinary: boolean) => {
@@ -157,9 +151,10 @@ export function createMicWebSocketServer({
   teardownGraceMs,
 }: CreateMicWebSocketServerDependencies): WebSocketServer {
   const ws = new WebSocketServer({ server, path });
-  // One map per server so every connection of a session shares the same
-  // pending-teardown state (a reconnect must find the timer to cancel it).
-  const pendingTeardowns = new Map<string, NodeJS.Timeout>();
+  // The process-wide map, NOT a per-server one: /mic/start arms its
+  // awaiting-first-socket timer there, and only a connection routed through
+  // this server can cancel it.
+  const pendingTeardowns = micPendingTeardowns;
 
   ws.on("connection", (socket, request) => {
     attachMicSocketHandlers(socket, request.url, {
