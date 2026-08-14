@@ -118,7 +118,7 @@ curl -s -u monitor:<PW> $DOM/api/monitor/sessions | head -c 300; echo
 
 **Chrome / Firefox / Safari 각각** 수행:
 
-1. 시크릿(프라이빗) 창에서 `https://neemba.app/monitor/` 접속 → Basic 인증 다이얼로그에 `monitor` / `<PW>` 입력.
+1. 시크릿(프라이빗) 창에서 `https://monitor.neemba.app/` 접속(2026-08-14 서브도메인 분리, 구 경로는 301) → Basic 인증 다이얼로그에 `monitor` / `<PW>` 입력.
 2. 페이지 로드 후 DevTools → **Network → WS** 필터.
 3. **라이브(진행중) 세션** 하나 선택 → 라이브 토글 → 프론트가 `wss://neemba.app/ws/monitor?sessionId=...` 연결 시도.
 4. **확인 A**: 해당 WS 항목이 **101 Switching Protocols** (app.js 무수정 상태로 연결 성공).

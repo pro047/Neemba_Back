@@ -74,15 +74,19 @@ Node STT → NATS(transcript.session.{id}) → Python consumer
 | | mic 경로 (메인) | RTMP 경로 (레거시) |
 |---|---|---|
 | 엔드포인트 | `POST /api/mic/stop` | `POST /api/sessions/stop` |
-| 핸들러 | `router/mic.ts:145-173` | `router/rtmp.ts:73-109` |
-| 세션 저장 | In-memory Map (`sessionRuntimeStore.ts`), 다중 세션 | 모듈 전역변수, 단일 세션 |
+| 핸들러 | `router/mic.ts` `stopMicSession` (~:372) | `router/rtmp.ts` (P1 D4: stop 은 무시, 종료는 on_publish_done 경로) |
+| 세션 저장 | In-memory Map (`sessionRuntimeStore.ts`), 다중 세션 | `SessionLifecycle` 인스턴스 상태, 단일 세션 |
 
-### mic/stop 시퀀스 (`router/mic.ts:158-166`)
+**정정(2026-08-14)**: "모듈 전역변수" 였던 `ports/sessionStore.ts` 는 세션 슬롯
+분리(PR #87)로 **삭제**됐다. RTMP 는 `SessionLifecycle.currentSessionId`(인스턴스
+상태), 마이크는 세션별 Map — 두 경로 사이 공유 상태 0. 아래 시퀀스의
+`removeSessionId()` 단계도 같은 PR 에서 사라졌다.
+
+### mic/stop 시퀀스 (`router/mic.ts` `stopMicSession`)
 1. `runtimeStore.get(sessionId)`
 2. `runtime.stop()` — 파이프라인 teardown (stopFlag, 타이머 취소, NATS `drain()`/`closed()`, Google STT `stream.end()`, FFmpeg SIGTERM→2s→SIGKILL)
 3. `runtimeStore.delete(sessionId)`
-4. `removeSessionId()`
-5. **`POST {PYTHON_HOST}/internal/sessions/stop` body `{sessionId}`** ← 크로스 서비스 "세션 종료" 신호
+4. **`POST {PYTHON_HOST}/internal/sessions/stop` body `{sessionId}`** ← 크로스 서비스 "세션 종료" 신호
 
 ### 모니터링 관점 핵심
 - **"세션 종료" 신호의 종점 = Python `/internal/sessions/stop`.** 세션 종료시각 기록 / 라이브→이력 전환 / 모니터 WS 종료 이벤트를 **여기서** 처리.
