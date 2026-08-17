@@ -47,6 +47,13 @@ DEFAULT_TARGET_LANG = "en-US"
 # 정확한 값을 실어 보낸다.
 CLOSE_SESSION_NOT_FOUND = 4404
 
+# 세션이 끝나서 서버가 먼저 닫는 소켓의 close code. 4404 와 갈라두는 이유는 두
+# 가지다. 로그에서 '처음부터 없던 세션' 과 '방금 끝난 세션' 이 구분되고, 무엇보다
+# **클라이언트가 재접속 한 번 없이 이 프레임만으로 만료를 안다** — 기본값 1000 은
+# 정상 종료와 네트워크 순단이 같은 값이라, 붙어보고 4404 를 받기 전에는 재시도를
+# 멈춰야 할지 판단할 수 없었다. 클라이언트 동작은 4404 와 같다(재시도 중단).
+CLOSE_SESSION_ENDED = 4410
+
 _PING_INTERVAL_SECONDS = 30
 _PONG_TIMEOUT_SECONDS = 60
 
@@ -291,7 +298,11 @@ class WebSocketHub:
         # 허브 전체(_lock)를 얼린다 — 소켓이 N개가 된 지금은 그게 전면 정지다.
         if conns:
             await asyncio.gather(
-                *(self._safe_close(c) for c in conns), return_exceptions=True
+                *(
+                    self._safe_close(c, close_code=CLOSE_SESSION_ENDED)
+                    for c in conns
+                ),
+                return_exceptions=True,
             )
         for conn in conns:
             self._cancel_keepalive(conn)
@@ -333,6 +344,9 @@ class WebSocketHub:
             self._open_blip_locked(conn, close_code, close_reason, detected_by)
             metrics.set_listeners(len(self._conns))
         self._cancel_keepalive(conn)
+        # 기본 1000 그대로 — 여기서 CLOSE_SESSION_ENDED 를 쓰면 안 된다. 소켓
+        # 하나가 keepalive 로 떨어졌을 뿐 세션은 살아 있고, 그 청취자는 재접속을
+        # **해야 하는** 쪽이다. 만료 코드를 주면 정확히 반대로 재시도를 멈춘다.
         await self._safe_close(conn)
         print('hub: listener dropped', conn.client_id,
               'session:', conn.session_id, 'by:', detected_by)
@@ -462,7 +476,7 @@ class WebSocketHub:
             if not self._is_connected(conn.ws):
                 await self._drop_conn(conn, detected_by="send_failed")
 
-    async def _safe_close(self, conn: _Conn) -> None:
+    async def _safe_close(self, conn: _Conn, *, close_code: int = 1000) -> None:
         # REV-4(에러A): close 도 send 와 같은 게이트로 직렬화한다. starlette 의
         # send_text/send_json/close 는 모두 같은 ASGI send 채널을 쓰므로,
         # _send_text 가 send 를 await 하는 '도중' 게이트 밖에서 close 가 끼어들면
@@ -473,7 +487,7 @@ class WebSocketHub:
         try:
             async with conn.send_gate:
                 if conn.ws.application_state == WebSocketState.CONNECTED:
-                    await conn.ws.close()
+                    await conn.ws.close(code=close_code)
         except Exception:
             pass
 

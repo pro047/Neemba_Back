@@ -19,6 +19,16 @@ type PythonStartResponse = {
   webSocketUrl: string;
 };
 
+// python's stop is idempotent: `ended` is true only for the call that actually
+// transitioned the session. Passing it through lets a client tell "I just
+// ended it" from "it was already gone" — an offline Stop that lands late gets
+// 200 either way, so the status code alone cannot say.
+type PythonStopResponse = {
+  ok: boolean;
+  ended: boolean;
+  translationCount: number;
+};
+
 type TtsSynthesisResult = {
   audioContent: string;
   audioMimeType: string;
@@ -32,7 +42,7 @@ export interface PythonSessionClient {
     sourceLang: string;
     targetLang: string;
   }): Promise<PythonStartResponse>;
-  stopSession(sessionId: string): Promise<void>;
+  stopSession(sessionId: string): Promise<PythonStopResponse>;
 }
 
 export interface MicTtsSynthesizer {
@@ -86,6 +96,8 @@ function createPythonSessionClient(host: string): PythonSessionClient {
       if (!response.ok) {
         throw new Error(`Failed to stop python session: ${response.status}`);
       }
+
+      return (await response.json()) as PythonStopResponse;
     },
   };
 }
@@ -359,9 +371,19 @@ export function createStopMicSessionHandler({
     }
 
     try {
-      await stopMicSession(sessionId, { pythonClient, runtimeStore });
+      const stopped = await stopMicSession(sessionId, {
+        pythonClient,
+        runtimeStore,
+      });
 
-      return res.status(200).json({ ok: true });
+      // `ended: false` with a 200 means the session was already gone — a late
+      // offline Stop. The client needs that apart from a stop it actually
+      // performed, and the status code is 200 in both cases.
+      return res.status(200).json({
+        ok: true,
+        ended: stopped.ended,
+        translationCount: stopped.translationCount,
+      });
     } catch (err) {
       return res.status(500).json({ error: "Failed to stop mic session" });
     }
@@ -378,7 +400,7 @@ export async function stopMicSession(
     pythonClient: PythonSessionClient;
     runtimeStore: SessionRuntimeStore;
   }
-): Promise<void> {
+): Promise<PythonStopResponse> {
   const runtime = runtimeStore.get(sessionId);
 
   if (runtime) {
@@ -386,14 +408,18 @@ export async function stopMicSession(
     runtimeStore.delete(sessionId);
   }
 
-  await pythonClient.stopSession(sessionId);
+  return pythonClient.stopSession(sessionId);
 }
 
 export function createMicSessionStopper(
   runtimeStore: SessionRuntimeStore = micRuntimeStore
 ): (sessionId: string) => Promise<void> {
   const pythonClient = createPythonSessionClient(PY_HOST);
-  return (sessionId) => stopMicSession(sessionId, { pythonClient, runtimeStore });
+  // Teardown callers have no client to report `ended` to — drop it here rather
+  // than widening their signature.
+  return async (sessionId) => {
+    await stopMicSession(sessionId, { pythonClient, runtimeStore });
+  };
 }
 
 export function createMicRouter({
@@ -426,7 +452,9 @@ export function createMicRouter({
     ((sessionId: string) =>
       scheduleMicTeardown(sessionId, {
         runtimeStore,
-        stop: (id) => stopMicSession(id, { pythonClient, runtimeStore }),
+        stop: async (id) => {
+          await stopMicSession(id, { pythonClient, runtimeStore });
+        },
         graceMs: MIC_CONNECT_GRACE_MS,
         reason:
           "mic session started but no audio socket connected — tearing down",
