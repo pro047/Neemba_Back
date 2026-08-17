@@ -22,7 +22,12 @@ type StreamLanguages = {
   targetLanguage?: string;
 };
 
+// sessionId must be the SAME id the caller later passes to
+// orchestrator.start(pcm, {sessionId}): the queue-depth hook below labels the
+// buffer gauge with this id, while start()'s failure/stop paths remove the
+// series under its own id — a mismatch would leak the series forever.
 export async function createStreamOrchestrator(
+  sessionId: string,
   languages: StreamLanguages = {}
 ): Promise<StreamOrchestrator> {
   const auth = new GoogleAuth({
@@ -57,9 +62,13 @@ export async function createStreamOrchestrator(
     undefined,
     {
       onDropped: incPublishBufferDropped,
-      onQueueSize: setPublishBufferSize,
+      onQueueSize: (size) => setPublishBufferSize(sessionId, size),
     }
   );
+  // Seeding at 0 happens in StreamOrchestrator.start(), not here: assembly is
+  // not a teardown-covered scope (a throw between this factory and start()
+  // would leave a series nothing can remove), so seed and remove both live
+  // inside start()'s try/catch.
   const segmentManager = new SegmentManager();
   const switcher = new StreamSwitcher((segmentId) => {
     console.log("stream switcher : current segmentId = ", segmentId);

@@ -155,6 +155,66 @@ def test_STT가_일시정지_상태면_심장박동_경보가_뜨지_않아야_�
     assert any('송출 중단' in a for a in alerts)
 
 
+# --- sessionId 라벨드 stt_paused (게이지 라벨화 계획) --------------------------
+# node 가 세션별 시리즈를 노출하면 fetch_metrics 는 exposition 라인 통째로
+# 키를 잡으므로 samples 의 키가 'neemba_stt_paused{sessionId="..."}' 가 된다.
+
+def _stt_series(session_id):
+    return f'neemba_stt_paused{{sessionId="{session_id}"}}'
+
+
+def labelled(paused_by_session, **over):
+    s = samples(**over)
+    del s['neemba_stt_paused']
+    for session_id, value in paused_by_session.items():
+        s[_stt_series(session_id)] = value
+    return s
+
+
+def test_일부_세션만_일시정지면_심장박동_경보를_억제하지_않아야_한다():
+    # 마이크 세션 하나가 오디오를 잃어도 RTMP 세션이 살아 있으면 번역은
+    # 나와야 정상이다 — 전 세션이 멈춘 게 아니면 침묵은 장애다.
+    partial = labelled(
+        {'rtmp': 0.0, 'mic': 1.0},
+        neemba_hub_last_broadcast_timestamp_seconds=T0 - 300)
+
+    _, alerts = evaluate({}, partial, now=T0)
+
+    assert any('심장박동' in a for a in alerts)
+
+
+def test_모든_세션이_일시정지면_심장박동_경보를_억제해야_한다():
+    # 전 세션 무오디오 = 방송 종료 수순. 번역이 없는 게 당연하다.
+    all_paused = labelled(
+        {'rtmp': 1.0, 'mic': 1.0},
+        neemba_hub_last_broadcast_timestamp_seconds=T0 - 300)
+
+    _, alerts = evaluate({}, all_paused, now=T0)
+
+    assert not any('심장박동' in a for a in alerts)
+
+
+def test_stt_시리즈가_하나도_없으면_심장박동_억제가_없어야_한다():
+    # 라벨드 게이지는 세션이 없으면 시리즈가 0줄이다. 세션이 활성인데 첫
+    # 번역이 영영 안 오는 경우를 빈 시리즈의 공허참(all)으로 삼키면 안 된다.
+    no_series = labelled(
+        {}, neemba_hub_last_broadcast_timestamp_seconds=T0 - 300)
+
+    _, alerts = evaluate({}, no_series, now=T0)
+
+    assert any('심장박동' in a for a in alerts)
+
+
+def test_어느_세션이든_일시정지면_송출_중단_정보_알림이_떠야_한다():
+    partial = labelled(
+        {'rtmp': 0.0, 'mic': 1.0},
+        neemba_hub_last_broadcast_timestamp_seconds=T0 - 10)
+
+    _, alerts = evaluate({}, partial, now=T0)
+
+    assert any('송출 중단' in a for a in alerts)
+
+
 def test_ffmpeg_정체는_유예_안에서는_보고하지_않아야_한다():
     state, _ = evaluate({}, fresh(T0), now=T0)
 
@@ -179,6 +239,36 @@ def test_유예_중_STT가_멈추면_ffmpeg_정체를_폐기해야_한다():
     # 오디오가 돌아와도 폐기된 delta 가 되살아나면 안 된다
     state, alerts = evaluate(
         state, fresh(T0 + 300, neemba_ffmpeg_stale_total=4.0), now=T0 + 300)
+    assert not any('ffmpeg' in a for a in alerts)
+
+
+def test_유예_중_다른_세션만_일시정지면_ffmpeg_정체를_폐기하지_않아야_한다():
+    # 계획 §4 함정: any-of 억제였다면 마이크 세션의 pause 가 RTMP 세션의
+    # 진짜 수신 정체 경보까지 삼킨다. 전 세션 pause 일 때만 방송 종료로 본다.
+    state, _ = evaluate({}, fresh(T0), now=T0)
+    state, _ = evaluate(
+        state, fresh(T0 + 60, neemba_ffmpeg_stale_total=4.0), now=T0 + 60)
+
+    partial = labelled(
+        {'rtmp': 0.0, 'mic': 1.0},
+        neemba_hub_last_broadcast_timestamp_seconds=T0 + 180 - 10,
+        neemba_ffmpeg_stale_total=4.0)
+    state, alerts = evaluate(state, partial, now=T0 + 180)
+
+    assert any('ffmpeg' in a for a in alerts)
+
+
+def test_유예_중_모든_세션이_일시정지면_ffmpeg_정체를_폐기해야_한다():
+    state, _ = evaluate({}, fresh(T0), now=T0)
+    state, _ = evaluate(
+        state, fresh(T0 + 60, neemba_ffmpeg_stale_total=4.0), now=T0 + 60)
+
+    all_paused = labelled(
+        {'rtmp': 1.0, 'mic': 1.0},
+        neemba_hub_last_broadcast_timestamp_seconds=T0 + 120 - 10,
+        neemba_ffmpeg_stale_total=4.0)
+    state, alerts = evaluate(state, all_paused, now=T0 + 120)
+
     assert not any('ffmpeg' in a for a in alerts)
 
 

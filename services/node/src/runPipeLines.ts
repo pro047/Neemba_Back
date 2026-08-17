@@ -17,7 +17,7 @@ export async function runPipelines({
   notifyPublisherReturned: () => void;
 }> {
   const ffmpeg = new FfmpegTranscoder();
-  const orchestrator = await createStreamOrchestrator({
+  const orchestrator = await createStreamOrchestrator(sessionId, {
     sourceLanguage,
     targetLanguage,
   });

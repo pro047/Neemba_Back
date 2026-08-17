@@ -52,6 +52,10 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
   ) {}
 
   private notify(): void {
+    // Post-stop the terminal 0 report has already gone out (see stop()) and
+    // the session's labelled gauge series may already be removed — a late
+    // drain-loop notify here would resurrect it as a permanent stale series.
+    if (this.stopped) return;
     this.hooks.onQueueSize?.(this.queue.length);
   }
 
@@ -71,6 +75,11 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
   }
 
   async stop(): Promise<void> {
+    // Idempotent because the terminal report below deliberately bypasses
+    // notify()'s guard: a second stop would re-fire onQueueSize(0) after the
+    // session's series was removed and resurrect it as a permanent stale one.
+    // Today only the callers' own stop guards prevent that.
+    if (this.stopped) return;
     this.stopped = true;
     if (this.queue.length > 0) {
       this.recordDropped(this.queue.length);
@@ -79,7 +88,9 @@ export class RetryingTranscriptPublisher implements TranscriptPublisherPort {
       );
       this.queue.length = 0;
     }
-    this.notify();
+    // Direct call, bypassing notify()'s stopped guard: this is the one
+    // intentional terminal 0 report of the buffer's lifetime.
+    this.hooks.onQueueSize?.(0);
     await this.inner.stop?.();
   }
 
