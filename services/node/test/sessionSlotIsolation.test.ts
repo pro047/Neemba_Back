@@ -81,7 +81,7 @@ function createMicHarness(sessionId: string) {
       sessionId,
       webSocketUrl: "ws://localhost/api/mic",
     })),
-    stopSession: vi.fn(async () => {}),
+    stopSession: vi.fn(async () => STOPPED_RESPONSE),
   };
   const start = createStartMicSessionHandler({
     pythonClient,
@@ -178,6 +178,10 @@ function createRtmpHarness(duringPythonStart: () => Promise<void>) {
     },
   };
 }
+
+// python /internal/sessions/stop 의 응답 모양. `ended` 는 이 호출이 세션을
+// 실제로 끝냈는지를 나타내며 /mic/stop 이 그대로 통과시킨다.
+const STOPPED_RESPONSE = { ok: true, ended: true, translationCount: 0 };
 
 describe("마이크·RTMP 세션 슬롯 분리", () => {
   it("RTMP 시작 중 마이크 start 가 끼어들어도 RTMP 자막은 자기 sessionId 로 발행되어야 한다", async () => {

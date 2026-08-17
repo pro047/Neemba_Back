@@ -57,7 +57,7 @@ function createHarness(sessionIds: string[]) {
       sessionId,
       webSocketUrl: `ws://localhost/api/mic?sessionId=${sessionId}`,
     })),
-    stopSession: vi.fn(async () => {}),
+    stopSession: vi.fn(async () => STOPPED_RESPONSE),
   };
   const queue = [...sessionIds];
   const startHandler = createStartMicSessionHandler({
@@ -104,6 +104,10 @@ function createHarness(sessionIds: string[]) {
     },
   };
 }
+
+// python /internal/sessions/stop 의 응답 모양. `ended` 는 이 호출이 세션을
+// 실제로 끝냈는지를 나타내며 /mic/stop 이 그대로 통과시킨다.
+const STOPPED_RESPONSE = { ok: true, ended: true, translationCount: 0 };
 
 describe("마이크 다중 세션 — 완전 독립", () => {
   afterEach(() => {
