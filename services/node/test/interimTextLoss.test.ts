@@ -66,6 +66,23 @@ describe("InterimChunkOrchestrator — first utterance", () => {
     // The empty interim must not reset state: no duplicated "안녕하세요".
     expect(publishedTexts()).toEqual(["안녕하세요", " 반가워요"]);
   });
+
+  // dispose() cleared only the silence timer, so a trailing publish could
+  // land on an already-stopped buffer. That span is booked as a drop, and the
+  // sidecar's buffer_dropped rule has no grace period — a normal teardown
+  // surfaced as a "NATS blip" alert.
+  it("dispose 이후에는 트레일링 타이머가 발화하지 않아야 한다", async () => {
+    // Arrange: a non-final interim arms the 200ms trailing timer
+    await orchestrator.onSttResult(sttResult("안녕하세요 여러분"));
+    const publishedBeforeDispose = published.length;
+
+    // Act
+    await orchestrator.dispose();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // Assert
+    expect(published.length).toBe(publishedBeforeDispose);
+  });
 });
 
 describe("GoogleSttV2Adapter — final after low-stability interim", () => {
