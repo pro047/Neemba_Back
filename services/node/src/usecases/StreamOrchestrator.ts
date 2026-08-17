@@ -5,7 +5,11 @@ import type {
   AudioConsumerPort,
   StopStreaming,
 } from "../ports/audioConsumerPort.js";
-import { setSttPaused } from "../monitoring/metrics.js";
+import {
+  removeSessionMetrics,
+  setPublishBufferSize,
+  setSttPaused,
+} from "../monitoring/metrics.js";
 import type { ISegmentManager } from "../ports/segment.js";
 import type { IInterfaceOrchestra } from "../ports/interimOrchestra.js";
 import type { StreamSwitcher } from "../stream/StreamSwitcher.js";
@@ -62,6 +66,34 @@ export class StreamOrchestrator implements AudioConsumerPort {
       throw new Error("sessionId required: pass AudioConsumerContext.sessionId");
     }
 
+    // Seed the session's series at 0 so consumers can tell "session running,
+    // not paused" apart from "no such session". Both gauges are seeded here,
+    // inside the try/catch that removes them: seeding anywhere outside a
+    // teardown-covered scope leaks a series no path can delete.
+    setSttPaused(sessionId, false);
+    setPublishBufferSize(sessionId, 0);
+
+    try {
+      return await this._startWithSession(pcmReadable, sessionId);
+    } catch (err) {
+      // start() threw before handing back its stop closure, so no teardown
+      // path will ever run — do it here. stopFlag first: a gRPC stream opened
+      // before the throw still delivers its error callback, which would
+      // otherwise rotate (and bill) a replacement stream and repaint the
+      // gauges we are about to remove. dispose() before remove for the same
+      // ordering reason as the stop closure below.
+      this.stopFlag = true;
+      this._clearRestartTimer();
+      this.interimOrchestra.dispose();
+      removeSessionMetrics(sessionId);
+      throw err;
+    }
+  }
+
+  private async _startWithSession(
+    pcmReadable: Readable,
+    sessionId: string
+  ): Promise<StopStreaming> {
     const sessionSegmentId = this.segmentManager.next(sessionId);
 
     const session = createSentenceSession(
@@ -108,7 +140,7 @@ export class StreamOrchestrator implements AudioConsumerPort {
           // proof as a transcript, so reset the counter and revive STT.
           this.paused = false;
           this.consecutiveErrorRotations = 0;
-          setSttPaused(false);
+          setSttPaused(sessionId, false);
           console.log(`Stt resuming: audio returned (session ${sessionId})`);
           await this._rotateStream(sessionId, session, "resume").catch(
             () => undefined
@@ -120,16 +152,19 @@ export class StreamOrchestrator implements AudioConsumerPort {
 
     return async () => {
       this.stopFlag = true;
-      // Only the pcm pump above cleared this gauge, so a session that ended
-      // while paused left neemba_stt_paused stuck at 1 forever — there is no
-      // audio coming back to a stopped session. A stopped session is not a
-      // paused one; report 0 before anything below can throw.
       this.paused = false;
-      setSttPaused(false);
       this._clearRestartTimer();
       await this.rotationInFlight?.catch(() => undefined);
       session.stop(sessionId);
+      // dispose() stops the retry buffer, whose terminal onQueueSize(0)
+      // fires synchronously inside this call — so removing the series AFTER
+      // it cannot be undone by that report (late async reports are guarded
+      // in RetryingTranscriptPublisher.notify).
       this.interimOrchestra.dispose();
+      // Remove, don't zero: a stopped session must vanish from /metrics
+      // entirely, or dead uuid labels pile up per session (cardinality
+      // leak). Placed before shutdown() so a throw there can't skip it.
+      removeSessionMetrics(sessionId);
       await this.switcher.shutdown();
       console.log("stream stopped");
     };
@@ -169,7 +204,7 @@ export class StreamOrchestrator implements AudioConsumerPort {
             `Stt paused: ${this.consecutiveErrorRotations} consecutive errors with no audio — pausing rotation until audio returns (session ${sessionId})`
           );
           this.paused = true;
-          setSttPaused(true);
+          setSttPaused(sessionId, true);
           this._clearRestartTimer();
           return;
         }

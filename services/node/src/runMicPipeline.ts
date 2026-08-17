@@ -38,14 +38,12 @@ export async function runMicPipeline({
   };
 }
 
+// sessionId is required now: the orchestrator factory labels the session's
+// gauge series with it, and start() would reject an absent id anyway.
 export async function runDefaultMicPipeline(
-  sessionId?: string,
+  sessionId: string,
   languages: StreamLanguages = {}
 ): Promise<MicRuntime> {
-  const orchestrator = await createStreamOrchestrator(languages);
-  return runMicPipeline(
-    sessionId == null
-      ? { consumer: orchestrator }
-      : { consumer: orchestrator, sessionId }
-  );
+  const orchestrator = await createStreamOrchestrator(sessionId, languages);
+  return runMicPipeline({ consumer: orchestrator, sessionId });
 }

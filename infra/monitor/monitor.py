@@ -32,22 +32,45 @@ def _is_active(samples: dict) -> bool:
     return samples.get(ACTIVE, 0.0) == 1.0
 
 
-def _stt_paused(samples: dict, now: float = 0.0) -> bool:
-    """node 가 '4연속 무오디오'를 판정해 STT 로테이션을 멈춘 상태.
+# stt_paused 는 세션별 sessionId 라벨 시리즈다 (마이크 다중 세션 이후).
+# fetch_metrics 가 exposition 라인을 통째로 키로 쓰므로 samples 키는
+# 'neemba_stt_paused{sessionId="..."}' 꼴 — 라벨 유무 모두 매칭한다
+# (라벨 없는 구버전 node 를 읽는 전환 창 호환).
 
-    송출이 끊겼다는 확정 신호라 '방송 종료(정상)'와 '수신 장애'를 가르는
-    유일한 관측값이다. 세션은 stop 호출 전까지 active 로 남으므로, 이 신호
-    없이는 예배가 끝난 것과 RTMP 가 막힌 것을 구분할 수 없다.
+def _stt_paused_values(samples: dict) -> list:
+    return [v for k, v in samples.items()
+            if k == STT_PAUSED or k.startswith(STT_PAUSED + '{')]
+
+
+def _any_stt_paused(samples: dict, now: float = 0.0) -> bool:
+    """어느 한 세션이라도 '4연속 무오디오'로 STT 로테이션이 멈춘 상태.
+
+    정보성 보고(송출 중단 알림)용 — 한 세션의 중단도 알릴 가치가 있다.
     """
-    return samples.get(STT_PAUSED, 0.0) == 1.0
+    return any(v == 1.0 for v in _stt_paused_values(samples))
+
+
+def _all_stt_paused(samples: dict, now: float = 0.0) -> bool:
+    """살아 있는 모든 세션이 오디오를 잃은 상태 = 방송 종료 수순.
+
+    '번역이 없는 게 당연한가'와 'ffmpeg 무진행이 방송 종료 탓인가'의 판정은
+    이쪽이다 — any-of 를 쓰면 마이크 한 세션의 pause 가 RTMP 세션의 진짜
+    장애 경보(심장박동·ffmpeg_stale)까지 삼킨다 (계획 §4 함정). 시리즈가
+    0개면(세션 없음/정리 직후) 공허참으로 삼키지 않고 False — 세션이
+    활성인데 첫 번역이 영영 안 오는 경우를 놓치지 않기 위해서다.
+    """
+    values = _stt_paused_values(samples)
+    return bool(values) and all(v == 1.0 for v in values)
 
 
 def _heartbeat_stale(samples: dict, now: float) -> bool:
     if not _is_active(samples):
         return False
-    # 오디오가 끊겨 STT 가 멈춘 상태면 번역이 없는 게 당연하다 — 장애가 아니라
-    # 송출 종료다. 여기서 걸러야 예배 종료 3분 뒤 심장박동 오탐이 안 뜬다.
-    if _stt_paused(samples):
+    # 전 세션이 오디오를 잃어 STT 가 멈춘 상태면 번역이 없는 게 당연하다 —
+    # 장애가 아니라 송출 종료다. 여기서 걸러야 예배 종료 3분 뒤 심장박동
+    # 오탐이 안 뜬다. (일부 세션만 pause 면 나머지가 번역을 내야 정상이므로
+    # 억제하지 않는다.)
+    if _all_stt_paused(samples):
         return False
     # last_broadcast==0(부팅 후 broadcast 없음)이면 gap 무한대로 간주 —
     # 세션이 열렸는데 첫 번역이 영영 안 오는 경우를 놓치지 않는다.
@@ -64,7 +87,7 @@ CONDITION_RULES = [
     # 사고다. 어느 쪽인지는 사람이 시간대를 보고 판단하는 게 맞아 정보성으로
     # 낮췄다. 오디오가 돌아오면 아래 공통 경로가 ✅ 복구를 보낸다.
     ('stt_paused',
-     lambda s, now: _is_active(s) and _stt_paused(s),
+     lambda s, now: _is_active(s) and _any_stt_paused(s),
      'always',
      'ℹ️ 송출 중단 — 오디오 유입이 끊겨 STT 일시정지 (방송 종료면 정상, '
      '방송 중이면 OBS·RTMP 확인). 오디오 복귀 시 자동 재개'),
@@ -108,8 +131,14 @@ COUNTER_RULES = [
 # 실측: stale 11:21:39 → paused 11:21:45 → 알림 11:21:46).
 COUNTER_STALE_GRACE_SECONDS = 90
 
+# suppress 가 _all_stt_paused 인 이유: ffmpeg 무진행은 RTMP 세션의 신호인데
+# 메트릭만으로는 어느 세션이 RTMP 인지 알 수 없다. any-of 면 마이크 세션의
+# pause 가 RTMP 의 진짜 정체 경보를 삼키므로, '전 세션 무오디오 = 방송 종료
+# 수순'일 때만 억제한다 (보수적 축소 — 계획 §4). 방송 종료 시 마이크 세션이
+# 유예(90s)보다 늦게 닫히면 stale 1회가 발화할 수 있다: 오탐이지만 침묵보다
+# 낫다고 판단.
 COUNTER_OPTIONS = {
-    'ffmpeg_stale': {'suppress': _stt_paused,
+    'ffmpeg_stale': {'suppress': _all_stt_paused,
                      'grace': COUNTER_STALE_GRACE_SECONDS},
 }
 

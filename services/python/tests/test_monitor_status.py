@@ -113,6 +113,80 @@ def test_parse_gauges_returns_empty_when_targets_absent():
     assert values == {}
 
 
+# --- sessionId 라벨드 시리즈 집계 (게이지 라벨화 계획 §2) ---------------------
+
+_LABELLED_METRICS_TEXT = """\
+# TYPE neemba_stt_paused gauge
+neemba_stt_paused{sessionId="aaa"} 0
+neemba_stt_paused{sessionId="bbb"} 1
+# TYPE neemba_publish_buffer_size gauge
+neemba_publish_buffer_size{sessionId="aaa"} 3
+neemba_publish_buffer_size{sessionId="bbb"} 7
+neemba_rtmp_auth_enabled 1
+"""
+
+
+def test_라벨드_시리즈는_max로_집계해야_한다():
+    # stt_paused 는 any-of(하나라도 1이면 1), buffer_size 는 세션 중 최댓값 —
+    # 둘 다 max 로 환원된다. 세션 B 의 0 이 A 의 1 을 덮으면 안 된다.
+    values = node_metrics.parse_gauges(_LABELLED_METRICS_TEXT)
+
+    assert values == {
+        'neemba_stt_paused': 1.0,
+        'neemba_publish_buffer_size': 7.0,
+        'neemba_rtmp_auth_enabled': 1.0,
+    }
+
+
+def test_게이지_패밀리는_노출됐는데_시리즈가_없으면_0이어야_한다():
+    # 라벨드 게이지는 세션이 없으면 시리즈가 0줄이다. # TYPE 라인이 있으면
+    # 게이지 자체는 존재하는 것이므로 '값 없음(null)'이 아니라 0 — 세션이
+    # 없다는 뜻이지 게이지가 없는 게 아니다.
+    text = ("# TYPE neemba_stt_paused gauge\n"
+            "# TYPE neemba_publish_buffer_size gauge\n")
+
+    values = node_metrics.parse_gauges(text)
+
+    assert values == {
+        'neemba_stt_paused': 0.0,
+        'neemba_publish_buffer_size': 0.0,
+    }
+
+
+def test_비유한_샘플이_섞이면_집계값도_비유한값이어야_한다():
+    # max 는 NaN 을 삼킨다 — max(0.0, nan) == 0.0 이라 '알 수 없음'이
+    # 자신 있는 '정상 0' 으로 둔갑한다(TYPE 시딩과 겹치면 항상 발생).
+    # 하나라도 비유한값이면 이름째 nan 으로 고정해 라우트가 null 을 내게 한다.
+    text = ('# TYPE neemba_stt_paused gauge\n'
+            'neemba_stt_paused{sessionId="aaa"} NaN\n')
+
+    values = node_metrics.parse_gauges(text)
+
+    assert node_metrics.gauge_bool(values['neemba_stt_paused']) is None
+
+
+def test_비유한_샘플_뒤에_정상_샘플이_와도_집계값은_비유한값이어야_한다():
+    # 라인 순서에 따라 결과가 달라지면 안 된다: max(nan, 1.0) 은 구현에 따라
+    # 1.0 을 돌려줘 NaN 이 조용히 사라진다.
+    text = ('# TYPE neemba_stt_paused gauge\n'
+            'neemba_stt_paused{sessionId="aaa"} NaN\n'
+            'neemba_stt_paused{sessionId="bbb"} 1\n')
+
+    values = node_metrics.parse_gauges(text)
+
+    assert node_metrics.gauge_bool(values['neemba_stt_paused']) is None
+
+
+def test_라벨_없는_게이지는_TYPE만_있을_때_시딩하지_않아야_한다():
+    # 라벨 없는 게이지는 TYPE 다음에 샘플이 반드시 온다. 잘린 응답에서까지
+    # 0.0 을 깔면 '미상' 이어야 할 rtmp 인증 상태를 '꺼짐' 으로 단정한다.
+    text = '# TYPE neemba_rtmp_auth_enabled gauge\n'
+
+    values = node_metrics.parse_gauges(text)
+
+    assert values == {}
+
+
 def test_비유한_게이지값이면_None을_반환해야_한다():
     # Prometheus 텍스트 형식은 NaN/+Inf 를 허용하고 prom-client 도 그대로
     # 내보낸다. 라우트가 맨 int() 를 쓰면 여기서 500 이 나므로, 변환은 반드시

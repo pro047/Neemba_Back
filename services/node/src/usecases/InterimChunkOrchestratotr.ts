@@ -174,6 +174,10 @@ export class InterimChunkOrchestrator implements IInterfaceOrchestra {
 
   async dispose() {
     if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    // Also the trailing timer: a publish that lands after the buffer stopped
+    // is booked as a drop, and the sidecar reads publish_buffer_dropped with
+    // no grace period — a normal session teardown would raise a NATS alert.
+    if (this.trailingTimer) clearTimeout(this.trailingTimer);
     await this.publisher.stop?.().catch(() => {});
     console.log("interim orchestra : dispose");
   }

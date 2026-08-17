@@ -4,9 +4,15 @@ import { Counter, Gauge, register } from "prom-client";
 // default register; app.ts merges it with its local registry when serving
 // /metrics, so instrumented modules never need the app instance.
 
+// sessionId-labelled: mic multi-session (PR #91) runs N orchestrators at
+// once, and a single process-global value was last-writer-wins — one
+// session's pause was masked by another session's resume. Each live session
+// owns its own series; removeSessionMetrics deletes it at teardown so dead
+// uuid labels don't accumulate forever (cardinality leak).
 const sttPaused = new Gauge({
   name: "neemba_stt_paused",
   help: "1 while STT rotation is paused waiting for audio to return",
+  labelNames: ["sessionId"] as const,
   registers: [register],
 });
 
@@ -28,13 +34,13 @@ const publishBufferDropped = new Counter({
   registers: [register],
 });
 
-// Instance-scoped gauge: with one live session at a time the last writer is
-// the current publisher. A late stop() from a replaced instance can still
-// zero it for one scrape — acceptable for a queue-depth gauge, unlike the
-// loss counter above.
+// sessionId-labelled for the same reason as sttPaused above: one retry
+// buffer exists per session, so concurrent sessions were overwriting each
+// other's queue depth through a single unlabelled value.
 const publishBufferSize = new Gauge({
   name: "neemba_publish_buffer_size",
   help: "Spans currently waiting in the publish retry buffer",
+  labelNames: ["sessionId"] as const,
   registers: [register],
 });
 
@@ -77,8 +83,8 @@ for (const reason of SESSION_STOP_REASONS) {
   sessionStopped.inc({ reason }, 0);
 }
 
-export const setSttPaused = (paused: boolean): void => {
-  sttPaused.set(paused ? 1 : 0);
+export const setSttPaused = (sessionId: string, paused: boolean): void => {
+  sttPaused.set({ sessionId }, paused ? 1 : 0);
 };
 
 export const incFfmpegStale = (): void => {
@@ -89,8 +95,16 @@ export const incPublishBufferDropped = (dropped: number): void => {
   publishBufferDropped.inc(dropped);
 };
 
-export const setPublishBufferSize = (size: number): void => {
-  publishBufferSize.set(size);
+export const setPublishBufferSize = (sessionId: string, size: number): void => {
+  publishBufferSize.set({ sessionId }, size);
+};
+
+// Called from every session teardown path (normal stop, ghost/never-connected
+// teardown, failed start). remove(), not reset(): reset() would wipe every
+// live session's series, not just this one's.
+export const removeSessionMetrics = (sessionId: string): void => {
+  sttPaused.remove({ sessionId });
+  publishBufferSize.remove({ sessionId });
 };
 
 export const setRtmpAuthEnabled = (enabled: boolean): void => {
