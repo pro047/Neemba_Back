@@ -66,7 +66,12 @@ function createHarness(sessionIds: string[]) {
     scheduleConnectTeardown: (sessionId) =>
       scheduleMicTeardown(sessionId, {
         runtimeStore,
-        stop: (id) => stopMicSession(id, { pythonClient, runtimeStore }),
+        // Discard the PythonStopResponse, as production does (router/mic.ts):
+        // teardown only needs the promise to settle. Returning it directly
+        // widens the fake past the real `stop` contract.
+        stop: async (id) => {
+          await stopMicSession(id, { pythonClient, runtimeStore });
+        },
         graceMs: 15_000,
         reason: "no audio socket connected (test)",
         pendingTeardowns,

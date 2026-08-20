@@ -172,14 +172,58 @@ buffer_size 는 세션별 값이 각각 의미 있으므로 합계가 아니라 
   최초 커밋, PR(develop). 커밋 전 재검증: node tsc + 137 passed /
   python 183 passed. 참고: 2026-08-16 주일 예배는 이 변경 미배포 상태로
   진행 — prod 는 무라벨 전역 게이지였음 (실전 검증 이월 확정)
-- [ ] release PR(develop→main) → CI/CD Deploy → `/health` 확인.
-  gh CLI 간헐 graphql timeout — CI 폴링은 재시도 내성 필수
-- [ ] §5 의 dev 스택 실측(`curl :3000/metrics` 를 watch-service.sh 에 물려
-  SESSION 섹션 확인)은 미실시 — 로컬 awk 합성 입력 검증으로 대체했다.
-  배포 후 prod 첫 tick 에서 라벨드 시리즈가 찍히는지 반드시 확인할 것
-- [ ] 실전 검증: RTMP + 마이크 동시 가동 예배에서 세션별 시리즈가 정직하게
-  보이는지 (§1 의 은폐 시나리오가 재현되지 않는지) — 2026-08-16 주일이
-  첫 실전 예정이었다. 배포가 예배 전에 안 됐다면 다음 송출로 이월
+- [x] release PR(develop→main) → CI/CD Deploy → `/health` 확인
+  (release #97, prod `771aff2`, 2026-08-17). gh CLI 간헐 graphql timeout —
+  CI 폴링은 재시도 내성 필수
+- [x] **동작 검증 완료 (2026-08-19, dev 스택 합성 세션 2개)** — 아래 §10
+- [ ] prod 첫 tick 에서 라벨드 시리즈가 실제로 찍히는지 (다음 송출 때
+  `watch-service` SESSION 섹션). **동작이 아니라 배포·수집 경로 확인용**이다
+
+## 10. 동작 검증 (2026-08-19, dev 스택)
+
+**예배를 기다릴 필요가 없었다.** 이 변경이 요구하는 것은 "동시 2세션" 이지
+"예배" 가 아니다 — 게이지를 세우는 곳은 `StreamOrchestrator.ts:73-74`·`:143`·
+`:207` 뿐이고 마이크(`runMicPipeline.ts:47`)와 RTMP(`runPipeLines.ts:20`)가
+**둘 다 `createStreamOrchestrator` 를 지나므로 게이지 경로는 세션 종류를 모른다.**
+`POST /api/mic/start` 는 무인증이고 body 도 선택이라(`router/mic.ts:233-244`)
+합성 마이크 세션 2개로 §1 의 은폐 시나리오를 그대로 잰다.
+
+**결정적 관측** — 한 스크레이프에 같은 게이지의 두 시리즈가 다른 값으로 공존:
+
+```
+neemba_stt_paused{sessionId="52259bbc…"} 1     ← 오디오 끊긴 세션
+neemba_stt_paused{sessionId="e5e5e43a…"} 0     ← 정상 회전 중인 세션
+```
+
+전역 게이지 하나로는 **출력 자체가 불가능한 형태**다. 이것이 §1 해소의 증거다.
+
+| 검증 | 결과 |
+|---|---|
+| 세션 2개가 독립 시리즈로 뜬다 | PASS |
+| 은폐 시나리오 — A=1 과 B=0 이 한 스크레이프에 공존 | PASS |
+| 종료 시 시리즈 제거 (cardinality 누수 없음) | PASS (0줄) |
+
+### 재현 절차 (스크립트는 하니스 방침상 리포 밖)
+
+1. **`docker stop monitor` 를 먼저 한다** — dev·prod 가 디스코드 웹훅을
+   공유해서 테스트 알림이 예배 채널로 샌다 (`handover-2026-08-02.md` §5)
+2. `docker exec -i node node < script.cjs` 로 컨테이너 안에서 돌린다.
+   `ws` 모듈과 전역 `fetch` 가 거기 있다
+3. `POST /api/mic/start` ×2 → 각 `sessionId` 로 `ws://localhost:3000/api/mic?sessionId=`
+   접속 → 3200바이트(100ms 분) 무음 PCM 을 100ms 간격으로 펌프
+4. **A 는 소켓을 열어둔 채 오디오만 끊는다.** 소켓을 닫으면 10초 유예 뒤
+   teardown 이라 검증 3번으로 넘어가 버려 은폐 시나리오를 못 잰다
+5. pause 는 **약 45초** 뒤에 걸린다 — `maxConsecutiveErrorRotations` 4회 초과가
+   조건이고(`StreamOrchestrator.ts:198-208`) 에러당 ~5초에 회전 오버헤드가 붙는다.
+   20초쯤에 포기하지 말 것
+
+### 함정 — 첫 스크레이프가 구코드를 보여줬다
+
+기준선을 재니 `neemba_stt_paused 0` 이 **무라벨로** 나왔다. 신코드는 세션 0개면
+0줄이다. 원인은 **`tsx watch` 가 macOS bind mount 를 못 잡는 것**으로,
+컨테이너가 `Up 10 days` 라 8/17 커밋을 한 번도 안 실행하고 있었다.
+`docker restart node` 후 정상. **무라벨 출력은 정확히 "라벨화 실패" 의 증상과
+같아서, 이걸 모르면 멀쩡한 코드를 결함으로 판정한다.**
 
 ## 9. 커밋 전 리뷰 반영 (2026-08-16)
 
