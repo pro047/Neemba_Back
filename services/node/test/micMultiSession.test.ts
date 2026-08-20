@@ -57,7 +57,7 @@ function createHarness(sessionIds: string[]) {
       sessionId,
       webSocketUrl: `ws://localhost/api/mic?sessionId=${sessionId}`,
     })),
-    stopSession: vi.fn(async () => {}),
+    stopSession: vi.fn(async () => STOPPED_RESPONSE),
   };
   const queue = [...sessionIds];
   const startHandler = createStartMicSessionHandler({
@@ -66,7 +66,12 @@ function createHarness(sessionIds: string[]) {
     scheduleConnectTeardown: (sessionId) =>
       scheduleMicTeardown(sessionId, {
         runtimeStore,
-        stop: (id) => stopMicSession(id, { pythonClient, runtimeStore }),
+        // Discard the PythonStopResponse, as production does (router/mic.ts):
+        // teardown only needs the promise to settle. Returning it directly
+        // widens the fake past the real `stop` contract.
+        stop: async (id) => {
+          await stopMicSession(id, { pythonClient, runtimeStore });
+        },
         graceMs: 15_000,
         reason: "no audio socket connected (test)",
         pendingTeardowns,
@@ -104,6 +109,10 @@ function createHarness(sessionIds: string[]) {
     },
   };
 }
+
+// python /internal/sessions/stop 의 응답 모양. `ended` 는 이 호출이 세션을
+// 실제로 끝냈는지를 나타내며 /mic/stop 이 그대로 통과시킨다.
+const STOPPED_RESPONSE = { ok: true, ended: true, translationCount: 0 };
 
 describe("마이크 다중 세션 — 완전 독립", () => {
   afterEach(() => {

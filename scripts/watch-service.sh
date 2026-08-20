@@ -68,6 +68,19 @@ a=$(docker logs --since "$SINCE" monitor 2>&1 | grep -E 'alerted' | tail -10)
 [ -n "$a" ] && { echo "-- monitor alerts"; echo "$a"; } || echo "monitor: no alerts"
 echo "nginx_5xx=$(docker logs --since "$SINCE" nginx 2>&1 | grep -cE '" 5[0-9]{2} ')"
 
+echo "### SOURCE"
+# Korean STT text before translation, logged by node on publish (js_pub.ts).
+# Two reasons to capture it every tick rather than grepping once afterwards:
+# a deploy recreates the container and takes its whole log with it, and the
+# 10m x 3 rotation drops the head of a long service. Tick output is the backup.
+#
+# These lines are interim DELTAS, not sentences: a proper noun can straddle
+# two of them ("나뮤" + "다"). Reassemble in order before reading them as words.
+src=$(docker logs --since "$SINCE" node 2>&1 | grep '^published :')
+sn=$(printf '%s' "$src" | grep -c .)
+echo "count=$sn"
+[ "$sn" -gt 0 ] && printf '%s\n' "$src" | tail -6 | sed 's/^/  /'
+
 echo "### TRANSLATIONS"
 # Translations are not in the DB — the public schema holds only
 # alembic_version, so broadcast text lives solely in the python container's

@@ -20,6 +20,12 @@ const DEFAULT_TEARDOWN_GRACE_MS = 10_000;
 // interval passes with no pong the socket is declared dead and terminated.
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 
+// Uplink counterpart of the hub's CLOSE_SESSION_NOT_FOUND (websocket.py): the
+// session this socket names is gone, so reconnecting cannot help. One code
+// across both links means the client needs a single rule — stop retrying —
+// instead of branching per endpoint.
+export const CLOSE_MIC_SESSION_NOT_FOUND = 4404;
+
 type AttachMicSocketDependencies = {
   runtimeStore?: SessionRuntimeStore;
   stopSession?: (sessionId: string) => Promise<void>;
@@ -67,6 +73,32 @@ export function attachMicSocketHandlers(
 ): void {
   const attachedSessionId = resolveSessionId(requestUrl);
 
+  // FIRST, before any path that can return: ws emits 'error' for a peer's
+  // protocol violation (unmasked frame, bad opcode, invalid close code), and an
+  // 'error' with no listener throws out of the EventEmitter and kills the
+  // process — every live session with it. A rejected socket can still do that
+  // between our close frame and the close handshake finishing.
+  socket.on("error", (error) => {
+    console.error("mic websocket error", error);
+  });
+
+  // Reject at connect time, not on the first audio frame. The old code let a
+  // dead session's socket sit open until audio arrived, so a client could not
+  // tell "reconnected" from "reconnected to nothing" without sending — and a
+  // client that never sends would hold the socket forever.
+  if (!attachedSessionId) {
+    socket.close(1008, "sessionId required");
+    return;
+  }
+
+  // Checked BEFORE cancelMicTeardown: a pending timer with no runtime means
+  // teardown already ran, and cancelling it would only lose the cleanup.
+  if (!runtimeStore.get(attachedSessionId)) {
+    console.warn(`mic ws rejected, no such session: ${attachedSessionId}`);
+    socket.close(CLOSE_MIC_SESSION_NOT_FOUND, "No active mic session");
+    return;
+  }
+
   // A (re)connect within a grace window keeps the session alive — this
   // cancels both the awaiting-first-socket timer armed by /mic/start and the
   // reconnect timer armed by a previous socket's close.
@@ -96,7 +128,6 @@ export function attachMicSocketHandlers(
 
   socket.on("close", () => {
     clearInterval(heartbeat);
-    if (!attachedSessionId) return;
     if (!runtimeStore.get(attachedSessionId)) return;
 
     scheduleMicTeardown(attachedSessionId, {
@@ -113,25 +144,20 @@ export function attachMicSocketHandlers(
       return;
     }
 
-    const sessionId = resolveSessionId(requestUrl);
-
-    if (!sessionId) {
-      socket.close(1008, "sessionId required");
-      return;
-    }
-
-    const runtime = runtimeStore.get(sessionId);
+    // attachedSessionId, not a re-resolve: the connect-time guard above
+    // already rejected a missing id, so there is no second chance for it to
+    // be absent here.
+    const runtime = runtimeStore.get(attachedSessionId);
 
     if (!runtime) {
-      socket.close(1011, "No active mic runtime");
+      // Same code as the connect-time rejection above: the session can also
+      // die mid-stream (teardown while this socket stayed open), and the
+      // client's response is identical either way.
+      socket.close(CLOSE_MIC_SESSION_NOT_FOUND, "No active mic session");
       return;
     }
 
     runtime.inputWritable.write(toBuffer(message));
-  });
-
-  socket.on("error", (error) => {
-    console.error("mic websocket error", error);
   });
 }
 

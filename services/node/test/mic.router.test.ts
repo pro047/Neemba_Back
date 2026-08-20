@@ -28,6 +28,10 @@ function createMockResponse() {
   return response;
 }
 
+// python /internal/sessions/stop 의 응답 모양. `ended` 는 이 호출이 세션을
+// 실제로 끝냈는지를 나타내며 /mic/stop 이 그대로 통과시킨다.
+const STOPPED_RESPONSE = { ok: true, ended: true, translationCount: 0 };
+
 describe("mic router", () => {
   it("POST /api/mic/start returns 202 and stores runtime", async () => {
     const runtimeStore = createSessionRuntimeStore();
@@ -40,7 +44,7 @@ describe("mic router", () => {
         sessionId: "session-1",
         webSocketUrl: "ws://localhost:3000/api/mic",
       })),
-      stopSession: vi.fn(async () => {}),
+      stopSession: vi.fn(async () => STOPPED_RESPONSE),
     };
 
     const handler = createStartMicSessionHandler({
@@ -75,7 +79,7 @@ describe("mic router", () => {
       startSession: vi.fn(async () => {
         throw new Error("python down");
       }),
-      stopSession: vi.fn(async () => {}),
+      stopSession: vi.fn(async () => STOPPED_RESPONSE),
     };
 
     const handler = createStartMicSessionHandler({
@@ -102,7 +106,7 @@ describe("mic router", () => {
         sessionId: "session-1",
         webSocketUrl: "ws://localhost:3000/api/mic",
       })),
-      stopSession: vi.fn(async () => {}),
+      stopSession: vi.fn(async () => STOPPED_RESPONSE),
     };
 
     const handler = createStartMicSessionHandler({
@@ -136,7 +140,7 @@ describe("mic router", () => {
         sessionId: "session-1",
         webSocketUrl: "ws://localhost:3000/api/mic",
       })),
-      stopSession: vi.fn(async () => {}),
+      stopSession: vi.fn(async () => STOPPED_RESPONSE),
     };
 
     const handler = createStopMicSessionHandler({
@@ -155,6 +159,36 @@ describe("mic router", () => {
     expect(runtime.stop).toHaveBeenCalled();
     expect(runtimeStore.get("session-1")).toBeUndefined();
     expect(pythonClient.stopSession).toHaveBeenCalledWith("session-1");
+    expect(response.body).toMatchObject({ ok: true, ended: true });
+  });
+
+  // An offline Stop that lands after the session already ended gets 200 too,
+  // so the status code alone cannot tell the client which one happened.
+  it("이미 끝난 세션을 stop 하면 200 이되 ended=false 로 알려야 한다", async () => {
+    const runtimeStore = createSessionRuntimeStore();
+    const pythonClient: PythonSessionClient = {
+      startSession: vi.fn(async () => ({
+        sessionId: "session-1",
+        webSocketUrl: "ws://localhost:3000/api/mic",
+      })),
+      stopSession: vi.fn(async () => ({
+        ok: true,
+        ended: false,
+        translationCount: 0,
+      })),
+    };
+
+    const handler = createStopMicSessionHandler({ pythonClient, runtimeStore });
+    const response = createMockResponse();
+
+    await handler(
+      { body: { sessionId: "session-1" } } as never,
+      response as never,
+      vi.fn()
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toMatchObject({ ok: true, ended: false });
   });
 
   it("returns 400 when sessionId is missing on stop", async () => {
@@ -164,7 +198,7 @@ describe("mic router", () => {
           sessionId: "session-1",
           webSocketUrl: "ws://localhost:3000/api/mic",
         })),
-        stopSession: vi.fn(async () => {}),
+        stopSession: vi.fn(async () => STOPPED_RESPONSE),
       },
       runtimeStore: createSessionRuntimeStore(),
     });

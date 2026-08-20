@@ -85,6 +85,21 @@ self._subscribers: dict[str, set[WebSocket]] = {}
   → 백로그 커서를 넣으려면 포맷을 JSON 으로 바꿔야 하고, 그 순간 앱 배포가
   필수가 된다 (D3 이 P1 에서 백로그를 빼는 이유).
 
+### blip 해석 주의 — P1 이 두 규약을 근사치로 만들었다 (2026-08-18 이관)
+
+**둘 다 의도된 재정의이고 고칠 대상이 아니다. 다만 모르고 읽으면 장애 조사를 오도한다.**
+
+- **`lost_count` 의 정의는 "아무도 못 받았다" 다.** `_count_lost_locked` 가 `targets`
+  가 빌 때만 호출되므로, **청취자가 2명 이상이면 D3 의 손해를 측정하지 못한다** —
+  1명이라도 남으면 `lost=[0]`, 전원 끊기면 `[5,5]`.
+  `test_listener_still_attached_does_not_count_as_lost` 가 이 동작을 고정한다.
+  소켓별 유실 집계는 P3 백로그가 들어와야 의미가 생긴다 (§9 P3)
+- **`_match_open_blip_locked` 가 세션 FIFO 매칭이라, A 가 끊긴 뒤 처음 접속하는 새
+  청취자 C 가 A 의 blip 을 "복귀" 로 닫는다.** 따라서 `reconnected_at NULL = 미복귀`
+  규약은 다중 청취자 세션에서 근사치이고, **모니터의 "미복귀" 뱃지**
+  (`infra/nginx/html/monitor/src/app.ts:1152-1153`)도 그렇다.
+  규약 본문은 `session-lifecycle-plan.md` §9 "완료 기준"
+
 ### `sequence` 는 커서로 쓸 수 없다 (P3 설계에 중요)
 
 `?since=<seq>` 재개를 검토했으나 **전제가 셋 다 깨진다.**
@@ -224,6 +239,29 @@ docker exec -w /app/services/python python sh -c \
   'alembic upgrade head && alembic downgrade -1 && alembic upgrade head'
 ```
 
+### e2e 재현 방법 (2026-08-09 실측 · 2026-08-18 이관)
+
+2026-08-09 에 로컬 dev 스택에서 전 경로를 태워 D1·D4·B-2 를 확인했다
+(`say` 로 만든 한국어 22초 → ffmpeg → RTMP → nginx-rtmp → node → STT → DeepL →
+청취자 소켓 3개). **하니스 방침상 스크립트는 리포에 없으므로**, 다시 짤 때
+필요한 사실만 남긴다. `services/python` 에서 `uv run python <파일>` 로 돌렸다.
+
+- **`/internal/*` 는 nginx 에 안 뚫려 있다.** 제어 호출은
+  `docker exec python python -c "...urllib..."` 로 컨테이너 안에서 친다
+- **청취자는 호스트에서** `ws://localhost:8080/ws?sessionId=...` 로 붙는다(nginx 경유)
+- **NATS 주입 포맷은 camelCase 이고 dataclass 필드명과 다르다** —
+  `sessionId`·`segmentId`·`sequence`·`transcriptText`·`targetLanguage`·`sourceLanguage`
+  (`consumer.py:158` `_parse_request`). **틀리면 `term()` 으로 조용히 버려지는데,
+  term 도 ack floor 를 올리기 때문에 정상 소비와 구분이 안 된다** —
+  `neemba_consumer_unparseable_total` 로만 드러난다. 실제로 이걸로 한 번 헤맸다
+- 수집 루프의 `recv` 타임아웃은 "조용한 구간"이지 종료 조건이 아니다. `while` 밖에서
+  잡으면 접속 인사 직후의 정적에 수집이 끝나 자막을 한 건도 못 본다
+- 게이지는 `docker exec python ... /metrics` 에서 `neemba_hub_active_session`,
+  `neemba_hub_listeners` 를 뽑는다
+- 실행 전에 §6 의 dev 스택 함정을 먼저 볼 것 —
+  특히 **디스코드 웹훅이 prod 와 공유**라 테스트 알림이 예배 채널로 샌다
+  (`handover-2026-08-02.md` §5)
+
 ---
 
 ## 7. 반드시 지킬 불변식 — 어기면 예배 중에 터진다
@@ -299,7 +337,11 @@ docker exec -w /app/services/python python sh -c \
 - `/ws?...&since=<마지막 seq>` — 없으면 백로그 없이 현재부터
 - **upstream 의 `sequence` 를 쓰지 말 것** (§2 — 중복·건너뜀·역행)
 - 링버퍼와 커서는 **언어 채널별**이다 (P2 이후)
-- D3 으로 skip 처리한 순단 테스트 4건을 여기서 되살린다
+- D3 으로 skip 처리한 회귀 테스트 **5건**을 여기서 되살린다 — `test_ws_disconnect_recovery.py`
+  4건(`_BACKLOG_DEFERRED` 마커)과 **`test_ws_blips.py:510` 1건**. 지우지 않고 P3
+  복원 사유 주석과 함께 보존돼 있다 (이전 판의 "4건" 은 `ws_blips` 쪽을 빠뜨린 수다)
+- **`lost_count` 도 여기서 의미를 되찾는다** — 소켓별 유실 집계가 들어와야 "그 사람이
+  놓친 자막" 을 잴 수 있다 (§2 의 blip 해석 주의 참조)
 
 ---
 
