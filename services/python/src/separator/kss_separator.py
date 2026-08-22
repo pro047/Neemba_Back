@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 
 
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from kss import Kss  # type: ignore
 
 from deepl import TextResult
 from src.dto.translationDto import TranslationRequestDto
+from src.monitoring import metrics
 
 
 @dataclass
@@ -200,12 +202,22 @@ class SentenceSeparator:
     async def _push_loop(self) -> None:
         while not self._stop:
             item = await self.sentence_queue.get()
+            metrics.set_sentence_queue_depth(self.sentence_queue.qsize())
             try:
                 # Translate to the segment's requested target language
                 # (falls back to en-US); recorded as the pair's target_lang.
                 target_language = item.target_lang or 'en-US'
-                translated = self.translator.translate(
-                    item.source_text, target_language=target_language)
+                started = time.perf_counter()
+                try:
+                    translated = self.translator.translate(
+                        item.source_text, target_language=target_language)
+                finally:
+                    # Timed in a finally so a failed round trip still lands in
+                    # the histogram: translate() is synchronous, so a DeepL
+                    # timeout is the longest the event loop ever stalls — the
+                    # exact tail this metric exists to expose.
+                    metrics.observe_translate_duration(
+                        time.perf_counter() - started)
                 await self.pusher.push_to_client(
                     translated,
                     item.sequence,
@@ -278,6 +290,10 @@ class SentenceSeparator:
                         target_lang=state.target_lang,
                         confidence=state.confidence,
                     ))
+            # Depth is sampled at both ends of the queue — here (arrival) and in
+            # _push_loop (drain). Only the producer side shows a burst that the
+            # single push task cannot keep up with.
+            metrics.set_sentence_queue_depth(self.sentence_queue.qsize())
             if not closed:
                 # The unfinished tail goes back in front of whatever arrived
                 # while the splitter was running.
