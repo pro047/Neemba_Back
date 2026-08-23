@@ -43,6 +43,10 @@ _status_db_failed = Counter(
     'neemba_monitor_status_db_failed_total',
     'DB query failures on GET /api/monitor/status (degraded to activeSessions:null)',
 )
+_duplicate_dropped = Counter(
+    'neemba_separator_duplicate_dropped_total',
+    'Sentences dropped as an STT replay of an already published span',
+)
 
 # 성능 계기 3종 (perf-test-plan.md §5). node 는 collectDefaultMetrics 로
 # nodejs_eventloop_lag_* 를 공짜로 내지만 python 에는 없고, 블로킹이 있는 곳은
@@ -135,6 +139,13 @@ def observe_translate_duration(seconds: float) -> None:
 
 def set_sentence_queue_depth(depth: int) -> None:
     _sentence_queue_depth.set(depth)
+
+
+def record_duplicate_dropped() -> None:
+    # 차단된 문장은 DB 에도 화면에도 남지 않는다 — 이 카운터가 유일한 흔적이고,
+    # 오차단을 사후에 세는 수단도 이것뿐이다. 138분당 1회 빈도라서 증분 0 은
+    # 실패가 아니다(무증분과 미작동은 오프라인 시뮬레이션이 구분한다).
+    _duplicate_dropped.inc()
 
 
 async def sample_event_loop_lag(
