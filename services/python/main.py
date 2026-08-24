@@ -120,6 +120,14 @@ async def lifespan(app: FastAPI):
         )
         app.state.separator_task.add_done_callback(_log_task_result)
 
+        # perf-test-plan.md §5: python 에는 node 의 nodejs_eventloop_lag_* 에
+        # 해당하는 지표가 없다. 이 태스크가 유일한 관측 수단이므로 consumer·
+        # separator 와 같은 수명(lifespan)에 묶고 아래 finally 에서 함께 취소한다.
+        app.state.loop_lag_task = asyncio.create_task(
+            metrics.sample_event_loop_lag()
+        )
+        app.state.loop_lag_task.add_done_callback(_log_task_result)
+
         logger.info(">>> lifespan : init done")
         print(f"--------ws : {app.state.get_ws_config} -------")
         print(">>> hub at lifespan:", id(app.state.hub))
@@ -134,11 +142,16 @@ async def lifespan(app: FastAPI):
             with contextlib.suppress(Exception):
                 await app.state.separator.stop()
 
-        for task in (getattr(app.state, "consumer_task", None), getattr(app.state, "separator_task", None)):
+        background_tasks = tuple(
+            getattr(app.state, name, None)
+            for name in ("consumer_task", "separator_task", "loop_lag_task")
+        )
+
+        for task in background_tasks:
             if task and not task.done():
                 task.cancel()
 
-        for task in (getattr(app.state, "consumer_task", None), getattr(app.state, "separator_task", None)):
+        for task in background_tasks:
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
