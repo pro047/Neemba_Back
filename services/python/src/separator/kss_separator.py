@@ -3,7 +3,9 @@ import re
 import time
 
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import List, Protocol
 
 from kss import Kss  # type: ignore
@@ -11,6 +13,59 @@ from kss import Kss  # type: ignore
 from deepl import TextResult
 from src.dto.translationDto import TranslationRequestDto
 from src.monitoring import metrics
+
+
+# --- duplicate re-send guard (handover §7, 8/23 design) -----------------------
+# A stalled STT stream makes Google replay an earlier span, and node's
+# computeDelta republishes all of it under fresh sequence numbers — which every
+# dedup layer downstream keys on, so none of them stop it. The guard cannot ask
+# "have we said this before" (preachers repeat themselves, refrains repeat by
+# design); it asks whether the stream is walking the published history IN ORDER.
+#
+# Thresholds are confirmed against the 30-day export by
+# scripts/simulate_runtime_dedup.py: the shortest sentence a real re-send
+# carried was 12 normalized chars and the weakest true match scored 0.94, so
+# both sit one notch inside. Loosening either only widens the false-positive
+# surface without dropping one more replayed sentence.
+DEDUP_MIN_CHARS = 10
+DEDUP_SIM_THRESHOLD = 0.90
+DEDUP_LOOKBACK_SEC = 300.0
+DEDUP_HISTORY_MAX = 200
+
+_NON_WORD = re.compile(r'[^0-9A-Za-z가-힣]')
+
+
+def _normalize(text: str) -> str:
+    """Strip everything the recognizer varies between passes (spacing, punctuation)."""
+    return _NON_WORD.sub('', text)
+
+
+def _similar(a: str, b: str) -> bool:
+    """difflib ratio against the threshold, with a length prune.
+
+    ratio() is bounded above by 2*min(len)/(len(a)+len(b)), so texts of very
+    different length are rejected without running the matcher. This runs inside
+    _push_loop, the single task the whole pipeline drains through, so the
+    comparison budget per sentence has to stay small.
+    """
+    la, lb = len(a), len(b)
+    if 2 * min(la, lb) < DEDUP_SIM_THRESHOLD * (la + lb):
+        return False
+    return SequenceMatcher(None, a, b).ratio() >= DEDUP_SIM_THRESHOLD
+
+
+@dataclass
+class DedupState:
+    """One session's published-sentence history and its replay cursor."""
+    # (absolute index, normalized text, monotonic clock) of published sentences.
+    history: deque[tuple[int, str, float]] = field(
+        default_factory=lambda: deque(maxlen=DEDUP_HISTORY_MAX))
+    next_index: int = 0
+    # History position the last match landed on. A replay advances it by one
+    # slot per sentence; anything else restarts the run.
+    cursor: int | None = None
+    # Monotonic clock of the last sentence judged for this session.
+    last_seen: float = 0.0
 
 
 @dataclass
@@ -129,6 +184,7 @@ class SentenceSeparator:
         )
         self.state_queue: asyncio.Queue[SegmentState] = asyncio.Queue()
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
+        self.dedup_history: dict[str, DedupState] = {}
 
         self._start = False
         self._stop = False
@@ -199,11 +255,84 @@ class SentenceSeparator:
         finally:
             self.queue.task_done()
 
+    def _is_replayed(self, item: PendingSentence) -> bool:
+        """Decide, on arrival, whether this sentence is a machine replay.
+
+            short sentence            -> publish (indistinguishable from speech)
+            no match in history       -> publish, record, run reset
+            match at position j       -> publish, cursor = j
+            match at cursor + 1       -> DROP, cursor advances
+            match, cursor not contiguous -> publish, run restarts at j
+
+        A dropped or matched sentence is never recorded: history holds
+        originals only, so a replay lines up against the span it copied instead
+        of against an earlier copy of itself. That is also why the FIRST
+        sentence of a replayed block gets through — one repeat is not evidence,
+        and catching it would need node's stall signal in the NATS payload.
+        """
+        norm = _normalize(item.source_text)
+        if len(norm) < DEDUP_MIN_CHARS:
+            return False
+
+        now = time.monotonic()
+        # close_session cannot be the only reclaim path: it pops the history
+        # while the session's last buffer tail is still on state_queue, and that
+        # tail reaches this method afterwards and recreates the entry. Sessions
+        # that die without a stop call (publisher gone, crash) never pop at all.
+        # Anything idle past the lookback can no longer match, so dropping it
+        # costs no detection.
+        for tracked_id, tracked in list(self.dedup_history.items()):
+            if (tracked_id != item.session_id
+                    and now - tracked.last_seen > DEDUP_LOOKBACK_SEC):
+                del self.dedup_history[tracked_id]
+
+        state = self.dedup_history.setdefault(item.session_id, DedupState())
+        state.last_seen = now
+        while state.history and now - state.history[0][2] > DEDUP_LOOKBACK_SEC:
+            state.history.popleft()
+
+        match: int | None = None
+        for index, prev_norm, _ in reversed(state.history):
+            if not _similar(prev_norm, norm):
+                continue
+            if match is None:
+                # Scanning newest first: a replay's original is the most recent
+                # match, since a matched sentence is never recorded and so the
+                # history keeps only the first utterance of anything repeated.
+                match = index
+            if state.cursor is not None and index == state.cursor + 1:
+                # Continuing the run beats a nearer coincidence.
+                match = index
+                break
+
+        if match is None:
+            state.history.append((state.next_index, norm, now))
+            state.next_index += 1
+            state.cursor = None
+            return False
+
+        replayed = state.cursor is not None and match == state.cursor + 1
+        state.cursor = match
+        return replayed
+
     async def _push_loop(self) -> None:
         while not self._stop:
             item = await self.sentence_queue.get()
             metrics.set_sentence_queue_depth(self.sentence_queue.qsize())
             try:
+                # Judged here rather than in _flush because rotation, timeout
+                # and stop all converge on sentence_queue — this is the single
+                # outlet — and it sits before translate, so a dropped sentence
+                # costs no DeepL call either.
+                if self._is_replayed(item):
+                    metrics.record_duplicate_dropped()
+                    # The only record a dropped sentence leaves: nothing reaches
+                    # the DB or the screen, so a false positive is undebuggable
+                    # without the text.
+                    print(f'separator: duplicate re-send dropped '
+                          f'(session={item.session_id} seq={item.sequence}): '
+                          f'{item.source_text[:40]!r}')
+                    continue
                 # Translate to the segment's requested target language
                 # (falls back to en-US); recorded as the pair's target_lang.
                 target_language = item.target_lang or 'en-US'
@@ -332,3 +461,9 @@ class SentenceSeparator:
             if state.buffer.strip():
                 state.force_closed = True
                 await self.state_queue.put(state)
+        # Reclaims the history immediately in the normal path; the idle sweep in
+        # _is_replayed is what actually bounds it, because the tail queued above
+        # can recreate this entry after the pop. Segment rotation must NOT clear
+        # it — the history is per session, and the replay that motivated all
+        # this crossed a rotation boundary.
+        self.dedup_history.pop(session_id, None)
