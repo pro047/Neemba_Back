@@ -62,7 +62,35 @@ node 만 재시작하면 python `active_session=1` 이 남아 이번엔 heartbea
 > **경로 주의**: 사이드카는 `infra/monitor/monitor.py` 다. `services/python/src/ws/monitor.py`
 > 는 **다른 파일**이고 이 절의 억제 로직과 무관하다.
 
-## 재발 방지 방향 (백로그 — 핸드오프 §2 큐)
+## 재발 방지 — **구현 완료 (2026-08-25)**
+
+아래 "방향" 절은 설계 시점의 기록이고, 확정된 것은 이 절이다.
+
+| 항목 | 확정값 | 근거 |
+|---|---|---|
+| 유예 | **30분** (`RTMP_NO_PUBLISHER_GRACE_SEC`) | 이 세션에는 실제 청취자가 붙어 있을 수 있다 — teardown 이 `hub.detach` 로 그 소켓을 `CLOSE_SESSION_ENDED`(4410) 로 끊고, 계약상 클라이언트는 **재시도하지 않는다**(핸드오프 §2-1). 예배 전에 앱을 켜는 정상 사용을 끊으면 안 된다. 8/24 사례는 90분이었으므로 30분도 2/3 단축이다 |
+| 취소 조건 | `on_publish` **또는** pcm 도착 | 아래 §회귀 위험 절 |
+| 만료 시 처리 | 창 안에 오디오 **있으면 재무장**, 없으면 종료 | 불리언 영구취소는 그 방송이 끝날 때 다시 갇힌다 |
+| 종료 사유 | `no_publisher` (신설) | `publisher_done` 재사용 시 사이드카의 "방송 종료" 알림이 방송 없던 세션까지 포함해 운영 휴리스틱이 무너진다 |
+| 사이드카 | `session_stopped_no_publisher` info 규칙 신설 | 없으면 운영자가 받는 유일한 신호가 `stt_paused` 시리즈 소멸로 인한 `✅ 복구` 인데, 그건 "오디오가 돌아왔다"로 읽혀 정반대다 |
+
+**`publisher_done` 타이머에도 오디오 검사를 적용했다.** "첫 writer 승리"
+가드(`SessionLifecycle.ts:289`)는 슬롯이 차 있을 때만 유효한데, node 재시작 뒤에는
+슬롯이 비어 있어 거절당할 중복 OBS 가 첫 writer 가 된다 — 그 clientid 의
+`on_publish` → `on_publish_done` 쌍이 살아 있는 방송에 120초 타이머를 건다.
+`:283-288` 주석이 "reproduced, active_session went 1 → 0 with the real publisher
+still sending" 으로 기록한 그 실패다. **이건 이번 변경이 만든 것이 아니라 원래
+열려 있던 경로다.** 정상 종료 경로의 비용에는 상한이 있다 — ffmpeg 가 EOF 직후
+버퍼를 토해내면 창이 한 번 더 돌고(120초 → 240초) 그다음 창에는 청크가 없다.
+
+**"업스트림이 없으면 pcm 은 0" 은 이 인시던트가 실측했다** — 90분간
+`stt_paused=1` 이 유지됐고, 청크가 하나라도 왔으면 pcm 펌프가 pause 를
+풀었을 것이다(`StreamOrchestrator.ts` `_startWithSession`).
+
+변경 파일: `SessionLifecycle.ts` · `StreamOrchestrator.ts` · `runPipeLines.ts` ·
+`router/rtmp.ts` · `monitoring/metrics.ts` · `infra/monitor/monitor.py` + 회귀 8건.
+
+## 재발 방지 방향 (설계 시점 기록)
 
 세션 시작 시점에 publisher 슬롯이 비어 있으면 그때도 grace 타이머를 arm 한다.
 기존 `publisherReturned` 가 타이머를 취소하므로 정상 순서(OBS 먼저)는 영향 없다.
