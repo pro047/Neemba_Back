@@ -154,11 +154,16 @@ function createRtmpHarness(duringPythonStart: () => Promise<void>) {
       );
       const stop = await service.run();
       stops.push(stop);
-      return { stop, notifyPublisherReturned: () => {} };
+      return {
+        stop,
+        notifyPublisherReturned: () => {},
+        lastAudioAt: () => orchestrator.lastAudioAt(),
+      };
     },
     stopPythonSession: async () => {},
     recordStop: () => {},
     graceMs: () => 60_000,
+    noPublisherGraceMs: () => 600_000,
   };
   const lifecycle = createSessionLifecycle(deps);
 

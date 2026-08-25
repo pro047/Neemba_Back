@@ -11,11 +11,16 @@ import {
 // that window — they are the reason this feature is not a two-line handler.
 
 const GRACE_MS = 120_000;
+const NO_PUBLISHER_GRACE_MS = 600_000;
 
 function buildLifecycle(overrides: Partial<SessionLifecycleDeps> = {}) {
+  // The pipeline reports when it last saw pcm. null = never — the shape a
+  // session takes when OBS never connected at all.
+  let lastAudioAt: number | null = null;
   const pipeline: PipelineHandle = {
     stop: vi.fn(async () => {}),
     notifyPublisherReturned: vi.fn(),
+    lastAudioAt: () => lastAudioAt,
   };
   let seq = 0;
   const deps: SessionLifecycleDeps = {
@@ -25,9 +30,17 @@ function buildLifecycle(overrides: Partial<SessionLifecycleDeps> = {}) {
     stopPythonSession: vi.fn(async () => {}),
     recordStop: vi.fn(),
     graceMs: () => GRACE_MS,
+    noPublisherGraceMs: () => NO_PUBLISHER_GRACE_MS,
     ...overrides,
   };
-  return { lifecycle: createSessionLifecycle(deps), deps, pipeline };
+  return {
+    lifecycle: createSessionLifecycle(deps),
+    deps,
+    pipeline,
+    markAudio: () => {
+      lastAudioAt = Date.now();
+    },
+  };
 }
 
 const languages = { sourceLang: "ko-KR", targetLang: "en-US" };
@@ -57,6 +70,31 @@ describe("세션 자동 종료 — publisher 종료 유예", () => {
     expect(lifecycle.currentSession()).toBe("session-1");
     expect(deps.stopPythonSession).not.toHaveBeenCalled();
     expect(pipeline.notifyPublisherReturned).toHaveBeenCalled();
+  });
+
+  // The "first writer wins" guard above only holds while the slot is full.
+  // After `docker restart node` (this incident's own recovery step) the slot is
+  // empty while a broadcast is live, so a duplicate OBS becomes the first
+  // writer: nginx fires on_publish before rejecting it, and that clientid's
+  // on_publish_done ~1ms later arms the timer for a broadcast nobody stopped.
+  // Audio is what tells the two apart.
+  it("오디오가 흐르는 동안에는 publish_done 유예가 만료돼도 세션을 유지해야 한다", async () => {
+    // Arrange: node 재시작 직후 — 슬롯이 빈 채로 방송이 이미 돌고 있다
+    const { lifecycle, deps, markAudio } = buildLifecycle();
+    await lifecycle.start(languages);
+    markAudio();
+
+    // Act: 거절당할 중복 OBS 의 on_publish → on_publish_done 쌍
+    lifecycle.publisherReturned("dup");
+    lifecycle.publisherDone("dup");
+    for (let i = 0; i < 3; i++) {
+      markAudio();
+      await vi.advanceTimersByTimeAsync(GRACE_MS);
+    }
+
+    // Assert
+    expect(lifecycle.currentSession()).toBe("session-1");
+    expect(deps.stopPythonSession).not.toHaveBeenCalled();
   });
 
   it("유예가 지나면 파이프라인 정리와 python stop 을 호출해야 한다", async () => {
@@ -306,6 +344,7 @@ describe("세션 자동 종료 — publisher 종료 유예", () => {
     const orphan: PipelineHandle = {
       stop: vi.fn(async () => {}),
       notifyPublisherReturned: vi.fn(),
+      lastAudioAt: () => null,
     };
     const { lifecycle, deps } = buildLifecycle({
       startPythonSession: vi.fn(async () => {
@@ -339,6 +378,7 @@ describe("세션 자동 종료 — publisher 종료 유예", () => {
     const pipeline: PipelineHandle = {
       stop: vi.fn(async () => {}),
       notifyPublisherReturned: vi.fn(),
+      lastAudioAt: () => null,
     };
     let attempts = 0;
     const { lifecycle, deps } = buildLifecycle({
@@ -452,5 +492,101 @@ describe("세션 자동 종료 — publisher 종료 유예", () => {
       "python unreachable"
     );
     expect(deps.stopPythonSession).not.toHaveBeenCalled();
+  });
+});
+
+// 2026-08-24 prod: a listener pressed [시작] with no broadcast running, OBS
+// never connected, and nothing could close the session — auto-stop arms only
+// on publisher_done and [정지] is a P1 D4 no-op. It alerted every 30 minutes
+// until the container was restarted by hand.
+// docs/incidents/2026-08-24-stuck-session-no-publisher.md
+describe("세션 자동 종료 — publisher 미접속 유예", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("publisher 없이 시작한 세션은 유예가 지나면 닫혀야 한다", async () => {
+    // Arrange: OBS 가 한 번도 붙지 않은 세션 — 8/24 실사례
+    const { lifecycle, deps } = buildLifecycle();
+    await lifecycle.start(languages);
+
+    // Act
+    await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS);
+
+    // Assert
+    expect(lifecycle.currentSession()).toBeNull();
+    expect(deps.stopPythonSession).toHaveBeenCalledExactlyOnceWith("session-1");
+    expect(deps.recordStop).toHaveBeenCalledWith("no_publisher");
+  });
+
+  it("OBS 가 먼저 켜진 정상 순서에서는 시작 유예를 걸지 않아야 한다", async () => {
+    // Arrange: publisherReturned 가 start 보다 먼저 = 슬롯이 차 있다
+    const { lifecycle, deps } = buildLifecycle();
+    lifecycle.publisherReturned("A");
+
+    // Act
+    await lifecycle.start(languages);
+    await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS * 2);
+
+    // Assert
+    expect(lifecycle.currentSession()).toBe("session-1");
+    expect(deps.stopPythonSession).not.toHaveBeenCalled();
+  });
+
+  it("유예 안에 on_publish 가 오면 시작 유예를 취소해야 한다", async () => {
+    // Arrange
+    const { lifecycle, deps } = buildLifecycle();
+    await lifecycle.start(languages);
+
+    // Act: 사람이 앱을 먼저 켜고 뒤늦게 OBS 를 켠 정상 경로
+    await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS - 1000);
+    lifecycle.publisherReturned("A");
+    await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS * 2);
+
+    // Assert
+    expect(lifecycle.currentSession()).toBe("session-1");
+    expect(deps.stopPythonSession).not.toHaveBeenCalled();
+  });
+
+  // The regression this whole block exists to prevent. on_publish fires once,
+  // at publish start — a publisher that was already live when node booted
+  // never announces itself, so `docker restart node` (this incident's own
+  // recovery step 2) followed by [시작] leaves the slot looking empty while
+  // audio flows. Cancelling on the webhook alone would kill a live broadcast.
+  it("오디오가 흐르면 on_publish 가 없어도 세션을 유지해야 한다", async () => {
+    // Arrange
+    const { lifecycle, deps, markAudio } = buildLifecycle();
+    await lifecycle.start(languages);
+
+    // Act: ffmpeg 가 재접속해 pcm 이 계속 들어온다 (on_publish 는 영영 없다)
+    for (let i = 0; i < 3; i++) {
+      markAudio();
+      await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS);
+    }
+
+    // Assert
+    expect(lifecycle.currentSession()).toBe("session-1");
+    expect(deps.stopPythonSession).not.toHaveBeenCalled();
+  });
+
+  it("오디오가 끊기면 다음 유예에서 세션을 닫아야 한다", async () => {
+    // Arrange: 위 시나리오의 방송이 실제로 끝난 경우. on_publish_done 도 못
+    // 받으므로(같은 재시작 경로) 재무장된 타이머가 유일한 회수 수단이다.
+    const { lifecycle, deps, markAudio } = buildLifecycle();
+    await lifecycle.start(languages);
+    markAudio();
+    await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS);
+    expect(lifecycle.currentSession()).toBe("session-1");
+
+    // Act: 오디오가 멈춘 채 한 유예가 더 지난다
+    await vi.advanceTimersByTimeAsync(NO_PUBLISHER_GRACE_MS);
+
+    // Assert
+    expect(lifecycle.currentSession()).toBeNull();
+    expect(deps.recordStop).toHaveBeenCalledWith("no_publisher");
   });
 });
