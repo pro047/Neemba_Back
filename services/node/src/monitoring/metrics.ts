@@ -58,12 +58,21 @@ const rtmpAuthEnabled = new Gauge({
 // entirely, which the sidecar cannot tell apart from a scrape failure.
 // Every teardown now arrives as "publisher_done". If "manual" or "superseded"
 // ever increments again, a teardown path came back that P1 was meant to remove.
-export type SessionStopReason = "manual" | "publisher_done" | "superseded";
+// "no_publisher" is the one deliberate exception (2026-08-24 incident): a
+// session opened while nothing was broadcasting, closed because audio never
+// arrived. Kept apart from "publisher_done" so the sidecar's "방송 종료"
+// notice keeps meaning a real broadcast ended.
+export type SessionStopReason =
+  | "manual"
+  | "publisher_done"
+  | "superseded"
+  | "no_publisher";
 
 const SESSION_STOP_REASONS: SessionStopReason[] = [
   "manual",
   "publisher_done",
   "superseded",
+  "no_publisher",
 ];
 
 // One labelled counter instead of three names: the point is the ratio between

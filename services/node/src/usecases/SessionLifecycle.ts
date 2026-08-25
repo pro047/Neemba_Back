@@ -13,6 +13,11 @@ import type { SessionStopReason } from "../monitoring/metrics.js";
 export type PipelineHandle = {
   stop: () => Promise<void>;
   notifyPublisherReturned: () => void;
+  // Wall-clock ms of the last pcm chunk the transcoder produced, or null if
+  // none ever arrived. This is the second proof that a publisher is alive:
+  // on_publish fires once at publish start, so a broadcast that was already
+  // running when this process booted never announces itself.
+  lastAudioAt: () => number | null;
 };
 
 export type SessionLanguages = {
@@ -53,6 +58,11 @@ export type SessionLifecycleDeps = {
   stopPythonSession: (sessionId: string) => Promise<void>;
   recordStop: (reason: SessionStopReason) => void;
   graceMs: () => number;
+  // Separate knob from graceMs: that one covers a publisher that dropped
+  // mid-broadcast (network flap), this one covers "the app was opened before
+  // OBS". Different orders of magnitude, and this one is safe to make generous
+  // because arriving audio re-arms it.
+  noPublisherGraceMs: () => number;
 };
 
 export type SessionLifecycle = ReturnType<typeof createSessionLifecycle>;
@@ -110,20 +120,52 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
     await deps.stopPythonSession(sessionId);
   };
 
-  const scheduleAutoStop = (): void => {
+  // "publisher_done": the publisher we knew about left. "no_publisher": the
+  // session was opened while the slot was empty and we are waiting to find out
+  // whether a broadcast shows up at all (2026-08-24 incident).
+  const scheduleAutoStop = (kind: "publisher_done" | "no_publisher"): void => {
     if (!currentSessionId) return;
     cancelAutoStop();
     const armedFor = currentSessionId;
+    const graceMs =
+      kind === "no_publisher" ? deps.noPublisherGraceMs() : deps.graceMs();
+    const armedAt = Date.now();
     const timer = setTimeout(() => {
       graceTimer = null;
       // The session that armed this timer may be gone already — stopped by
       // hand, or superseded by a new session started inside the grace window.
       if (currentSessionId !== armedFor) return;
-      console.log(`session ${armedFor}: publisher gone — auto-stopping`);
-      void teardown("publisher_done").catch((err) =>
+
+      // Audio is the other liveness proof, and the only one available when
+      // on_publish already fired before this process existed. Re-arm rather
+      // than cancel outright: when that broadcast does end there is no
+      // publish_done either, so a cancelled timer would strand the session
+      // exactly like the incident it is meant to fix.
+      // Compared against the arming instant rather than a duration: "did any
+      // audio arrive during THIS window" is the question, and the timestamp
+      // form has no boundary case to argue about.
+      //
+      // Applied to BOTH kinds. publisher_done needs it for the same reason:
+      // the "first writer wins" guard only holds while the slot is full, so
+      // after a node restart a rejected duplicate OBS can arm this timer for a
+      // broadcast that never stopped. The cost on the normal path is bounded —
+      // ffmpeg may flush a little buffered pcm right after the publisher
+      // leaves, which costs one extra window, and the next one finds silence.
+      const lastAudio = pipeline?.lastAudioAt() ?? null;
+      if (lastAudio !== null && lastAudio >= armedAt) {
+        scheduleAutoStop(kind);
+        return;
+      }
+
+      console.log(
+        kind === "no_publisher"
+          ? `session ${armedFor}: no publisher ever connected — auto-stopping`
+          : `session ${armedFor}: publisher gone — auto-stopping`
+      );
+      void teardown(kind).catch((err) =>
         console.error(`session ${armedFor}: auto-stop failed`, err)
       );
-    }, deps.graceMs());
+    }, graceMs);
     // Never hold the event loop open for a timer whose whole job is cleanup.
     timer.unref?.();
     graceTimer = timer;
@@ -165,6 +207,12 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
         throw new Error(`session ${sessionId} was torn down while starting`);
       }
       pipeline = handle;
+      // Nothing else will ever close this session if OBS does not show up:
+      // auto-stop arms on publisher_done, and [정지] is a P1 D4 no-op. Armed
+      // only when the slot is empty, so the normal order (OBS first) is
+      // untouched. Placed after `pipeline` is assigned — the timer reads
+      // lastAudioAt off it. (2026-08-24 incident)
+      if (!publisherClientId) scheduleAutoStop("no_publisher");
       // Publish the join cache only now — everything a joiner needs exists.
       currentWebSocketUrl = webSocketUrl;
       currentLanguages = languages;
@@ -261,7 +309,7 @@ export function createSessionLifecycle(deps: SessionLifecycleDeps) {
       // would then be discarded as a mismatch — a session nothing can close,
       // which is the failure P1 D4 left without a manual way out.
       publisherClientId = null;
-      scheduleAutoStop();
+      scheduleAutoStop("publisher_done");
     },
 
     currentSession(): string | null {
