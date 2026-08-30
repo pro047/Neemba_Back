@@ -42,6 +42,11 @@ export class StreamOrchestrator implements AudioConsumerPort {
   // rotating on each would recreate (and bill) streams forever. Reset to 0
   // whenever a transcript arrives (proof the client is still streaming).
   private consecutiveErrorRotations = 0;
+  // Wall-clock of the last pcm chunk. Read by SessionLifecycle's no-publisher
+  // timer: ffmpeg only emits here once it has actually pulled the RTMP url, so
+  // a chunk is proof a publisher exists even when on_publish never fired for
+  // this process (2026-08-24 incident).
+  private lastAudioAtMs: number | null = null;
 
   constructor(
     private readonly sttPort: SpeechToTextPort,
@@ -90,6 +95,10 @@ export class StreamOrchestrator implements AudioConsumerPort {
     }
   }
 
+  lastAudioAt(): number | null {
+    return this.lastAudioAtMs;
+  }
+
   private async _startWithSession(
     pcmReadable: Readable,
     sessionId: string
@@ -135,6 +144,7 @@ export class StreamOrchestrator implements AudioConsumerPort {
     (async () => {
       for await (const chunk of pcmReadable as unknown as AsyncIterable<Buffer>) {
         if (this.stopFlag) return;
+        this.lastAudioAtMs = Date.now();
         if (this.paused) {
           // Audio is flowing again — arriving chunks are the same liveness
           // proof as a transcript, so reset the counter and revive STT.

@@ -161,6 +161,15 @@ INFO_COUNTER_RULES = [
      'neemba_session_stopped_total{reason="publisher_done"}',
      'ℹ️ 방송 종료 — 세션 자동 종료 {delta:.0f}회 (정상 경로. '
      '예배 후 이 알림이 없으면 세션이 안 닫힌 것)'),
+    # 2026-08-24 인시던트. 위 규칙과 라벨만 다른 같은 메트릭인데 문구를 나눈
+    # 이유는, 이쪽은 방송이 아예 없던 세션이라 '방송 종료' 로 보고하면 위
+    # 규칙의 운영 휴리스틱(예배 후 알림 부재 = 세션 미종료)이 무너지기
+    # 때문이다. 이 알림이 없으면 운영자가 보는 유일한 신호는 stt_paused
+    # 시리즈 소멸로 인한 '✅ 복구' 뿐이고, 그건 정반대로 읽힌다.
+    ('session_stopped_no_publisher',
+     'neemba_session_stopped_total{reason="no_publisher"}',
+     'ℹ️ 방송 없음 — 발행자가 끝내 붙지 않아 세션을 정리했습니다 {delta:.0f}회 '
+     '([시작]만 눌리고 OBS 가 안 켜진 경우. 예배 중이면 발행 경로를 확인할 것)'),
 ]
 
 

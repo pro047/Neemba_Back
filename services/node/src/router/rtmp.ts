@@ -13,6 +13,16 @@ const PY_HOST = pythonHost;
 
 const DEFAULT_PUBLISH_DONE_GRACE_SEC = 120;
 
+// Thirty minutes, not two: this window is the human gap between opening the app
+// and starting OBS, not a network flap. Generous on purpose — the session it
+// closes may have real listeners attached, and teardown drops their sockets
+// with CLOSE_SESSION_ENDED (4410), which the client contract says not to retry
+// (handover §2-1). Someone opening the app before the service must not be
+// kicked. The 2026-08-24 incident alerted for 90 minutes, so 30 still cuts it
+// by two thirds. Arriving audio re-arms the timer, so a live broadcast never
+// expires no matter how long this is.
+const DEFAULT_NO_PUBLISHER_GRACE_SEC = 1800;
+
 // Read per call rather than at import: the grace window is an operational
 // knob (church network quality), and reading it live keeps it overridable in
 // tests — same reason RTMP_PUBLISH_KEY is read inside the handler.
@@ -20,6 +30,13 @@ function publishDoneGraceMs(): number {
   const raw = Number(process.env.RTMP_PUBLISH_DONE_GRACE_SEC);
   const seconds =
     Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PUBLISH_DONE_GRACE_SEC;
+  return seconds * 1000;
+}
+
+function noPublisherGraceMs(): number {
+  const raw = Number(process.env.RTMP_NO_PUBLISHER_GRACE_SEC);
+  const seconds =
+    Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_NO_PUBLISHER_GRACE_SEC;
   return seconds * 1000;
 }
 
@@ -235,6 +252,7 @@ const defaultLifecycle = createSessionLifecycle({
   },
   recordStop: incSessionStopped,
   graceMs: publishDoneGraceMs,
+  noPublisherGraceMs,
 });
 
 export default createRtmpRouter(defaultLifecycle);

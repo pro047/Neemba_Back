@@ -298,6 +298,38 @@ def test_auto_stop_alerts_even_after_session_went_inactive():
     assert any('자동 종료' in a for a in alerts)
 
 
+NO_PUBLISHER_STOP = 'neemba_session_stopped_total{reason="no_publisher"}'
+
+
+def test_no_publisher_stop_is_reported_separately():
+    # 2026-08-24 인시던트: 방송 없이 열린 세션이 스스로 닫힌다. 이걸 알리지
+    # 않으면 운영자가 받는 유일한 신호가 stt_paused 시리즈 소멸로 인한
+    # '✅ 복구' 뿐인데, 그건 "오디오가 돌아왔다"로 읽힌다.
+    state, alerts = evaluate({}, samples(**{NO_PUBLISHER_STOP: 0.0}), now=T0)
+    assert alerts == []
+
+    stopped = samples(neemba_hub_active_session=0.0, **{NO_PUBLISHER_STOP: 1.0})
+    state, alerts = evaluate(state, stopped, now=T0 + 60)
+
+    alert = next((a for a in alerts if '방송 없음' in a), None)
+    assert alert is not None
+    # 정상 종료 문구와 섞이면 안 된다 — '방송 종료'는 실제 방송이 끝났다는 뜻이다.
+    assert '방송 종료' not in alert
+
+
+def test_no_publisher_stop_does_not_fire_the_normal_stop_rule():
+    # 두 규칙이 같은 메트릭 이름을 라벨만 달리 쓴다. 라벨을 흘리면 방송 없이
+    # 닫힌 세션이 '방송 종료' 로 보고돼 §운영 휴리스틱이 무너진다.
+    state, alerts = evaluate(
+        {}, samples(**{AUTO_STOP: 0.0, NO_PUBLISHER_STOP: 0.0}), now=T0)
+    assert alerts == []
+
+    stopped = samples(neemba_hub_active_session=0.0,
+                      **{AUTO_STOP: 0.0, NO_PUBLISHER_STOP: 1.0})
+    state, alerts = evaluate(state, stopped, now=T0 + 60)
+    assert not any('방송 종료' in a for a in alerts)
+
+
 def test_auto_stop_does_not_repeat_without_a_new_increase():
     state, _ = evaluate({}, samples(**{AUTO_STOP: 0.0}), now=T0)
     state, alerts = evaluate(state, samples(**{AUTO_STOP: 1.0}), now=T0 + 60)
