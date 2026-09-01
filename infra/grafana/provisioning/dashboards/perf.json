@@ -1,0 +1,786 @@
+{
+  "id": null,
+  "uid": "neemba-perf",
+  "title": "Neemba Perf",
+  "tags": [
+    "neemba",
+    "perf"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-2h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "DS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "① 이벤트 루프 — 블로킹 가설 (계획 §3·§5②)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "python loop lag vs CPU",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "python cpu (cores)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(neemba_event_loop_lag_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "lag p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "histogram_quantile(0.90, sum(rate(neemba_event_loop_lag_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "lag p90"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(neemba_event_loop_lag_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "lag p99"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "rate(process_cpu_seconds_total{job=\"python\"}[$__rate_interval])",
+          "legendFormat": "python cpu (cores)"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "node event loop lag",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "nodejs_eventloop_lag_p50_seconds",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "nodejs_eventloop_lag_p99_seconds",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "nodejs_eventloop_lag_mean_seconds",
+          "legendFormat": "mean"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "DeepL translate 왕복",
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "translations/min"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(neemba_translate_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "histogram_quantile(0.95, sum(rate(neemba_translate_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(neemba_translate_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "rate(neemba_translate_duration_seconds_count[$__rate_interval]) * 60",
+          "legendFormat": "translations/min"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "② 유입 vs 처리 (계획 §5④⑤ · P1 큐 깊이)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "큐 깊이 — 1차 포화 신호",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "neemba_sentence_queue_depth",
+          "legendFormat": "python sentence queue"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "sum(neemba_publish_buffer_size)",
+          "legendFormat": "node publish buffer (all sessions)"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "유실·실패·주입 오류 (5m 증분)",
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_publish_buffer_dropped_total[5m])",
+          "legendFormat": "publish buffer dropped"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_hub_send_failed_total[5m])",
+          "legendFormat": "hub send failed"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_consumer_unparseable_total[5m])",
+          "legendFormat": "consumer unparseable"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_ensure_session_failed_total[5m])",
+          "legendFormat": "ensure session failed"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_separator_duplicate_dropped_total[5m])",
+          "legendFormat": "separator duplicate dropped",
+          "refId": "E"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "③ 팬아웃·연결 (계획 §5⑥⑦ · ①fds)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "청취자·세션",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "neemba_hub_listeners",
+          "legendFormat": "hub listeners"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "neemba_hub_active_session",
+          "legendFormat": "active session"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "node fd 사용 / 상한",
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "process_open_fds{job=\"node\"}",
+          "legendFormat": "open fds"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "process_max_fds{job=\"node\"}",
+          "legendFormat": "max fds"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "④ 자원 (계획 §5① · §8 t3 기준선)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "CPU (cores) by job",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.4
+              },
+              {
+                "color": "red",
+                "value": 2.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "rate(process_cpu_seconds_total[$__rate_interval])",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "RSS by job",
+      "gridPos": {
+        "x": 8,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "process_resident_memory_bytes",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "python GC collections/s",
+      "gridPos": {
+        "x": 16,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "rate(python_gc_collections_total[$__rate_interval])",
+          "legendFormat": "gen {{generation}}"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "⑤ 생존·오디오 입력 (계획 §5③⑤⑥)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "타겟 up",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "up",
+          "legendFormat": "{{job}}"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "NATS 연결",
+      "gridPos": {
+        "x": 6,
+        "y": 45,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "neemba_nats_connected"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "무자막 구간(초) — 침묵이지 지연이 아니다",
+      "gridPos": {
+        "x": 12,
+        "y": 45,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "time() - (neemba_hub_last_broadcast_timestamp_seconds > 0)"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "오디오 입력 이상 (5m 증분)",
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_ffmpeg_stale_total[5m])",
+          "legendFormat": "ffmpeg stale"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "sum(neemba_stt_paused)",
+          "legendFormat": "stt paused sessions"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "increase(neemba_session_stopped_total[5m])",
+          "legendFormat": "stopped: {{reason}}"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      }
+    }
+  ]
+}
