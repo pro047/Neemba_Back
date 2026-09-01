@@ -2,6 +2,30 @@
 
 큐 14번. 조사 근거는 `observation-2026-08-31.md` §6.
 
+> ## ⚠️ 배포 전 반드시 먼저 할 것 — 순서를 어기면 배포가 통째로 죽는다
+>
+> `docker-compose.prod.yml` 의 Grafana 는 `${GF_SECURITY_ADMIN_USER:?}` ·
+> `${GF_SECURITY_ADMIN_PASSWORD:?}` 를 요구한다. **compose 의 interpolation 실패는
+> 해당 서비스만이 아니라 파일 전체 파싱을 중단시킨다**(실측) — `deploy.yml:149` 가
+> `set -euo pipefail` 아래에서 `up -d --build --force-recreate` 를 돌리므로,
+> 시크릿에 이 두 줄이 없으면 **Grafana 와 무관한 앱 변경까지 포함해 배포 전체가 실패**한다.
+>
+> **머지 전에 이 순서로:**
+>
+> 1. 로컬 `.env.prod` 의 `GF_SECURITY_ADMIN_USER` / `GF_SECURITY_ADMIN_PASSWORD` 를
+>    **`admin/admin` 이 아닌 값**으로 교체한다 (2026-08-31 기준 둘 다 `admin` 이었다)
+> 2. `gh secret set ENV_PROD -R pro047/Neemba_Back < .env.prod`
+> 3. 그다음에 release PR 을 머지한다
+>
+> 서버의 `.env.prod` 를 손으로 고치는 것은 무의미하다 — 매 배포마다 시크릿이 덮어쓴다
+> (2026-07-12 확인). **`:?` 대신 `:-admin` 기본값을 쓰면 배포는 안 막히지만 prod 에
+> `admin/admin` 이 조용히 남는다** — 그래서 시끄럽게 실패하는 쪽을 골랐다(사용자 결정 2026-08-31).
+>
+> **왜 자격증명이 문제인가**: Grafana admin 은 데이터소스를 임의 URL 로 만들 수 있고,
+> 이 EC2 는 IMDS hop limit 2 라 컨테이너에서 `169.254.169.254` 에 닿는다(2026-07-15 실증).
+> 익명 Viewer 는 데이터소스를 못 만들어 막혀 있지만 admin 로그인은 그 제약을 우회한다.
+> nginx `auth_basic` 이 앞을 막으므로 즉시 위험은 아니나, 기본 자격증명을 prod 에 둘 이유가 없다.
+
 **이 작업의 성격**: 새로 만드는 것이 아니라 **dev 에만 있는 것을 prod 로 올리는 것**이다.
 `infra/prometheus/` · `infra/grafana/provisioning/` 은 이미 develop 에 있고
 `docker-compose.dev.yml` 에 3개 서비스가 정의돼 있다. **prod compose 에만 없다.**
@@ -144,3 +168,89 @@ GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
 ```
 
 **⑥은 ⑤ 이후로 미룬다** — Grafana 가 prod 에서 뜨기 전에는 임베드 URL 이 확정되지 않는다.
+
+## 9. 구현 결과 (2026-08-31)
+
+§8 의 ①~③ 완료. 배포는 아직이다.
+
+| 파일 | 변경 |
+|---|---|
+| `infra/grafana/provisioning/dashboards/perf.json` | 5곳 수정 → `test_perf_dashboard.py` **13/13** |
+| `infra/prometheus/prometheus.yml` | nginx 잡 제거(§7-1) |
+| `docker-compose.prod.yml` | prometheus·grafana 2서비스 + 볼륨 2개 |
+| `infra/nginx/nginx.conf` | `/grafana/` location + CSP `frame-ancestors 'self'` |
+| `.gitignore` | `!infra/grafana/provisioning/dashboards/*.json` 예외 |
+
+**검증**: nginx `-t` 통과(스텁 호스트·자체서명 인증서로 컨테이너에서 실행) ·
+compose `config` 통과 · python 217 passed/5 skipped · node 147 passed.
+
+### 구현 중 내린 결정 3가지
+
+1. **`proxy_pass` 에 후행 URI를 붙이지 않았다.** `proxy_pass http://grafana:3000/;`(후행 슬래시)를
+   쓰면 `/grafana/` 접두사가 잘리는데, `GF_SERVER_SERVE_FROM_SUB_PATH=true` 는 접두사를 포함해
+   받겠다는 선언이다. 자르면 첫 화면은 뜨지만 **Grafana 가 내보내는 자산 URL 이 전부 404** 가 된다
+2. **upstream 을 `set $grafana_upstream` 으로 우회했다.** 리포 관용구(`nginx.conf:10` 의
+   `resolver 127.0.0.11`)를 따랐다. 직접 지정하면 nginx 가 **기동 시점에 DNS 를 해석**하므로
+   grafana 컨테이너가 없거나 죽으면 **nginx 자체가 크래시 루프**에 빠진다 — 자막 송출 경로가
+   관측 스택 때문에 죽는 구조가 된다
+3. **이미지 태그를 `latest` 에서 고정으로 바꿨다** (`prom/prometheus:v3.1.0`,
+   `grafana/grafana:11.5.1`). dev 는 `latest` 지만 prod 는 `nginx:1.27-alpine`·`postgres:16-alpine`·
+   `nats:2.10.17-alpine` 로 전부 고정하는 관례다
+
+### 정정 — `datasource` 누락은 런타임 고장이 아니었다
+
+§1-5 를 쓸 때 "누락 시 조용히 빈 그래프" 라고 했으나, `provisioning/datasources/prometheus.yml` 에
+**`isDefault: true`** 가 있어 런타임에는 기본 데이터소스로 붙는다. 실제 성격은 **프로비저닝
+이식성 계약 위반**이지 즉시 고장이 아니다. 고치는 판단 자체는 유효하다.
+
+### `stt_overview.json` 삭제 (2026-08-31, 사용자 승인)
+
+`.gitignore` 의 `*.json` 에 가려 **1년간 보이지 않던 대시보드**가 예외 줄을 추가하면서 드러났다.
+`dashboards.yml` 이 디렉터리 통째를 프로비저닝하므로 prod 에 함께 올라갔을 것이다.
+
+**6패널 중 5개가 존재하지 않는 메트릭을 참조**한다 — 2025-08-14 에 만들다 만 스캐폴드다.
+**한 번도 커밋된 적이 없어** 삭제하면 복구가 불가능하므로 쿼리를 여기 남긴다:
+
+| 패널 | 쿼리 | 실재 |
+|---|---|---|
+| Targets UP | `sum(up)` | ✅ |
+| Node API Requests (rate) | `rate(demo_requests_total[1m])` | ❌ Grafana 예제 이름. 우리 것은 `neemba_requests_total` |
+| Python WS Messages (rate) | `rate(python_ws_messages_total[1m])` | ❌ |
+| Nginx Active Connections | `nginx_connections_active` | ❌ exporter 없음 |
+| Nginx HTTP Requests (rate) | `rate(nginx_http_requests_total[1m])` | ❌ |
+| Nginx Accepted Connections (rate) | `rate(nginx_connections_accepted[1m])` | ❌ |
+
+`sum(up)` 은 `perf.json` ⑤ 의 "타겟 up" stat 이 대체한다.
+
+> **교훈**: `.gitignore` 의 광범위한 `*.json` 이 산출물을 1년간 감췄다. 예외 줄을 넣기 전까지
+> **`git status` 에도 안 나오므로** 존재 자체를 알 수 없었다. 같은 패턴이 다른 디렉터리에도
+> 있을 수 있다.
+
+### 다음 (§8 의 ④~⑥)
+
+④ dev 스택에서 19패널 렌더 확인 → ⑤ 배포 + 검증(§6) → ⑥ 모니터 4번째 뷰
+
+### `/security-review` · `/code-review high` 반영 (2026-08-31)
+
+**보안 리뷰**: 신규 취약점 0건. `auth_basic` 상속·우회 경로 부재·`add_header` 상속 취소
+없음·변수 `proxy_pass` 의 업스트림이 정적 리터럴·Prometheus 관리 API 미개방을 각각 확인했다.
+다만 `.env.prod` 는 gitignore 라 리뷰 범위 밖이었고, **거기 `admin/admin` 이 있었다**(위 경고 절).
+부분 조치로 Grafana 에서 `env_file: .env.prod` 를 떼고 필요한 두 값만 `${}` 로 주입한다 —
+`DEEPL_API_KEY`·`POSTGRES_PASSWORD`·`NATS_PASSWORD`·`RTMP_PUBLISH_KEY` 를 서드파티
+이미지에 넣을 이유가 없다.
+
+**코드 리뷰 5건 중 4건 수정**(HIGH 1건은 위 경고 절로 처리):
+
+| 등급 | 발견 | 조치 |
+|---|---|---|
+| medium | `time() - neemba_hub_last_broadcast_timestamp_seconds` 가 게이지 미설정 시 `time() - 0` = **약 56.7년**을 표시한다. 매 배포 직후~그날 첫 번역까지가 그 구간이고 **예배 전에 이 패널을 여는 시점이 정확히 거기다** | `time() - (…_seconds > 0)` 로 감싸 값이 없으면 패널이 빈다 |
+| low | `location /grafana/` 는 끝 슬래시 있는 형태만 매칭 → `/grafana` 가 `location /` 의 SPA 로 떨어져 모니터 페이지가 200 을 준다. §5 가 링크로 쓰겠다고 한 그 형태다 | `location = /grafana { return 301 /grafana/; }` |
+| low | `test_perf_dashboard.py` 의 `NGINX_METRIC_NAMES` 허용목록이 남아, nginx 패널을 되살리면 **테스트는 통과하고 그래프만 빈다** | 항목 제거 |
+| low | `prometheus.yml` 은 **dev 도 같이 마운트**한다 — nginx 잡을 지우자 dev 의 `nginx-exporter` 와 `depends_on` 이 고아가 됐다 | dev compose 에서 제거. **단 `docker-compose.dev.yml` 은 gitignore(`​.gitignore:15`)라 이 수정은 커밋되지 않는다 — 다른 환경에서는 고아 exporter 가 그대로 뜬다** |
+
+리뷰어가 실측으로 기각한 가설 1건도 기록해 둔다: nginx 가 `Authorization: Basic` 을
+그대로 전달하면 Grafana 자체 basic auth 가 401 을 낼 것이라는 의심 — 실제로 컨테이너를
+같은 env 로 띄워 확인한 결과 **200 + 익명 Viewer 권한**이었다(11.5.1·12.4.1 동일).
+
+**최종 검증**: `test_perf_dashboard.py` 13/13 · python 217 passed/5 skipped ·
+node 147 passed · nginx `-t` 통과 · prod·dev compose `config` 통과.

@@ -9,6 +9,7 @@
 !package.json
 !package-lock.json
 !tsconfig.json
+!infra/grafana/provisioning/dashboards/*.json
 
 # Docker
 docker-compose.dev.yml
