@@ -64,6 +64,24 @@ def get_deepl_config() -> dict[str, str]:
     }
 
 
+def get_deepl_context_sentences() -> int:
+    """DeepL context window: how many previous sentences to send. 0 = off."""
+    raw = os.getenv('DEEPL_CONTEXT_SENTENCES')
+    if raw is None or raw == '':
+        value = 8
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            raise RuntimeError(
+                f'env DEEPL_CONTEXT_SENTENCES must be an integer, got: {raw!r}')
+        if value < 0:
+            raise RuntimeError(
+                f'env DEEPL_CONTEXT_SENTENCES must be >= 0, got: {value}')
+    print(f'env DEEPL_CONTEXT_SENTENCES = {value}')
+    return value
+
+
 def get_postgres_config() -> dict[str, str]:
     return {
         "postgres_host": require_env("POSTGRES_HOST"),

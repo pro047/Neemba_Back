@@ -254,3 +254,44 @@ compose `config` 통과 · python 217 passed/5 skipped · node 147 passed.
 
 **최종 검증**: `test_perf_dashboard.py` 13/13 · python 217 passed/5 skipped ·
 node 147 passed · nginx `-t` 통과 · prod·dev compose `config` 통과.
+
+## 10. 배포 완료 (2026-09-01, release #114)
+
+워크플로 `33498615350` **completed success**. prod 커밋은 PR #114 머지본.
+
+**외부 검증 5/5** (SSH 없이 확인 가능한 범위):
+
+| 확인 | 기대 | 실제 |
+|---|---|---|
+| `neemba.app/health` | 200 | **200** — 기존 서비스 무사 |
+| `monitor.neemba.app/` | 401 | **401** — Basic Auth 유지 |
+| `/grafana` (끝 슬래시 없음) | 301 | **301 → `/grafana/`** — §9 의 코드리뷰 수정이 실제로 작동 |
+| `/grafana/` (인증 없이) | 401 | **401** — `auth_basic` 상속 확인 |
+| CSP 헤더 | `frame-ancestors 'self'` | **응답에 존재** |
+
+`X-Frame-Options` 가 응답에 **없는 것도 의도대로**다 — `ALLOW_EMBEDDING=true` 가 그것을 없애고
+CSP 가 유일한 경계가 되는 구조다.
+
+### ⚠️ 함정 — 웹뷰에서는 401 페이지가 그대로 뜬다 (2026-09-01 실측)
+
+배포 직후 `https://monitor.neemba.app/grafana/` 가 401 로 보였는데 **설정 문제가 아니었다.**
+앱 내장 브라우저(웹뷰)는 Basic Auth 다이얼로그를 띄우지 못해 401 페이지를 그대로 렌더한다.
+**Chrome/Safari 에서는 정상**이었다. `watch-service` 스킬이 모니터 UI 에 대해 기록해 둔 것과
+같은 함정이며, `/grafana/` 도 같은 오리진·같은 realm(`Basic realm="Neemba Monitor"`)이라
+동일하게 적용된다.
+
+**구분법**: 같은 브라우저에서 `monitor.neemba.app/` 도 401 이면 웹뷰 문제다.
+모니터 페이지는 열리는데 `/grafana/` 만 401 이면 그건 다른 문제다(자격증명·컨테이너 상태).
+
+### 남은 확인 2건
+
+- **`⑤ 생존·오디오 입력` 의 `타겟 up` 이 전부 초록인지** — `nginx` job 이 빨갛게 남아 있으면
+  Prometheus 가 옛 설정을 들고 있다는 뜻이다(= 컨테이너 재생성이 덜 됨)
+- **배포 후 3일간 CPU 크레딧 잔고** — t3.medium 에 상시 스크레이프는 새 부하다.
+  `cpu-credit-watch.yml` 워크플로가 이미 있다. **현재 예측치 없음(미측정)**
+
+### 다음: §8 의 ⑥ — 모니터 페이지 iframe 뷰
+
+Grafana 가 prod 에 떴으므로 임베드 URL 이 확정됐다: `https://monitor.neemba.app/grafana/d-solo/neemba-perf?panelId=<N>`.
+기존 3뷰(`view-sessions`·`view-search`·`view-blips`) 옆에 4번째를 붙인다.
+패널 2~3개만 고르고, 뷰 전환 시 iframe `src` 를 비운다(§5).

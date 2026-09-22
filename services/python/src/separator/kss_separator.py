@@ -32,6 +32,20 @@ DEDUP_SIM_THRESHOLD = 0.90
 DEDUP_LOOKBACK_SEC = 300.0
 DEDUP_HISTORY_MAX = 200
 
+# --- DeepL context window (observation-2026-09-20 §4) ------------------------
+# Sentences reach DeepL one at a time, and spoken Korean drops the subject when
+# an earlier sentence carried it ("조상이요" / "나를 도와줄 수가 없어요" came out as
+# "You can't help me."). The session's previous source sentences go along as
+# DeepL `context`, which is read but not translated or billed. N=8 was picked
+# offline (~/neemba-logs/ab-context): wrong subjects 17 -> 1 on the tuning set,
+# 11~12 -> 1 on a hold-out sermon. The window size is DEEPL_CONTEXT_SENTENCES.
+CONTEXT_SENTENCES_DEFAULT = 8
+# Past this much silence (a hymn, a break) the earlier speech is no longer this
+# sentence's context. Also bounds sessions that die without a stop call.
+# Same value as the dedup lookback; whether bridging a long gap helps or hurts
+# was not measured — the offline windows were continuous speech.
+CONTEXT_IDLE_SEC = 300.0
+
 _NON_WORD = re.compile(r'[^0-9A-Za-z가-힣]')
 
 
@@ -65,6 +79,18 @@ class DedupState:
     # slot per sentence; anything else restarts the run.
     cursor: int | None = None
     # Monotonic clock of the last sentence judged for this session.
+    last_seen: float = 0.0
+
+
+@dataclass
+class ContextState:
+    """One session's recently translated source sentences, oldest first.
+
+    Kept apart from DedupState on purpose: dedup stores normalized text and
+    skips matched sentences, while context needs the raw text of everything
+    that was actually said.
+    """
+    sentences: deque[str]
     last_seen: float = 0.0
 
 
@@ -117,7 +143,8 @@ class Pusher(Protocol):
 
 class Translator(Protocol):
     def translate(self, source_text: str,
-                  target_language: str) -> TextResult | list[TextResult]: ...
+                  target_language: str,
+                  context: str | None = None) -> TextResult | list[TextResult]: ...
 
 
 def _is_sentence_closed(text: str) -> bool:
@@ -171,6 +198,7 @@ class SentenceSeparator:
                  translator: Translator,
                  pusher: Pusher,
                  flush_timeout_seconds: float = 2.0,
+                 context_sentences: int = CONTEXT_SENTENCES_DEFAULT,
                  ) -> None:
         # After this much input silence, an unfinished buffered sentence is
         # shipped as-is instead of waiting (possibly forever) for a closing
@@ -185,6 +213,8 @@ class SentenceSeparator:
         self.state_queue: asyncio.Queue[SegmentState] = asyncio.Queue()
         self.state_by_key: dict[tuple[str, int], SegmentState] = {}
         self.dedup_history: dict[str, DedupState] = {}
+        self._context_sentences = context_sentences
+        self.context_history: dict[str, ContextState] = {}
 
         self._start = False
         self._stop = False
@@ -315,6 +345,29 @@ class SentenceSeparator:
         state.cursor = match
         return replayed
 
+    def _context_for(self, session_id: str) -> str | None:
+        """The session's previous sentences as one string, or None."""
+        if self._context_sentences <= 0:
+            return None
+        now = time.monotonic()
+        for tracked_id, tracked in list(self.context_history.items()):
+            if now - tracked.last_seen > CONTEXT_IDLE_SEC:
+                del self.context_history[tracked_id]
+        state = self.context_history.get(session_id)
+        if state is None or not state.sentences:
+            return None
+        return ' '.join(state.sentences)
+
+    def _remember(self, session_id: str, source_text: str) -> None:
+        if self._context_sentences <= 0:
+            return
+        state = self.context_history.get(session_id)
+        if state is None:
+            state = ContextState(deque(maxlen=self._context_sentences))
+            self.context_history[session_id] = state
+        state.sentences.append(source_text.strip())
+        state.last_seen = time.monotonic()
+
     async def _push_loop(self) -> None:
         while not self._stop:
             item = await self.sentence_queue.get()
@@ -336,11 +389,16 @@ class SentenceSeparator:
                 # Translate to the segment's requested target language
                 # (falls back to en-US); recorded as the pair's target_lang.
                 target_language = item.target_lang or 'en-US'
+                context = self._context_for(item.session_id)
                 started = time.perf_counter()
                 try:
                     translated = self.translator.translate(
-                        item.source_text, target_language=target_language)
+                        item.source_text, target_language=target_language,
+                        context=context)
                 finally:
+                    # Remembered even when DeepL failed: the sentence was still
+                    # spoken, and the next one may lean on it.
+                    self._remember(item.session_id, item.source_text)
                     # Timed in a finally so a failed round trip still lands in
                     # the histogram: translate() is synchronous, so a DeepL
                     # timeout is the longest the event loop ever stalls — the
@@ -467,3 +525,5 @@ class SentenceSeparator:
         # it — the history is per session, and the replay that motivated all
         # this crossed a rotation boundary.
         self.dedup_history.pop(session_id, None)
+        # Same tail race as above; the idle sweep in _context_for bounds it.
+        self.context_history.pop(session_id, None)
