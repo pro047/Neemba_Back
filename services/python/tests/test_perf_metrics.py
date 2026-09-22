@@ -51,14 +51,14 @@ class SlowTranslator:
     def __init__(self, seconds: float = 0.0) -> None:
         self.seconds = seconds
 
-    def translate(self, source_text, target_language):
+    def translate(self, source_text, target_language, context=None):
         if self.seconds:
             time.sleep(self.seconds)
         return f'EN::{source_text}'
 
 
 class FailingTranslator:
-    def translate(self, source_text, target_language):
+    def translate(self, source_text, target_language, context=None):
         raise RuntimeError('deepl boom')
 
 
@@ -72,7 +72,7 @@ class DepthProbingTranslator:
     def __init__(self) -> None:
         self.observed: list[float | None] = []
 
-    def translate(self, source_text, target_language):
+    def translate(self, source_text, target_language, context=None):
         self.observed.append(sample('neemba_sentence_queue_depth'))
         return f'EN::{source_text}'
 
