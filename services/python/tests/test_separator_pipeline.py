@@ -44,7 +44,7 @@ class FakePusher:
 
 
 class FakeTranslator:
-    def translate(self, source_text, target_language):
+    def translate(self, source_text, target_language, context=None):
         return f'EN::{source_text}'
 
 
@@ -54,7 +54,7 @@ class FlakyTranslator:
     def __init__(self) -> None:
         self.calls = 0
 
-    def translate(self, source_text, target_language):
+    def translate(self, source_text, target_language, context=None):
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError('deepl boom')

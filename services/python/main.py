@@ -21,7 +21,12 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.compose import build
-from src.config import get_nats_config, get_deepl_config, get_ws_url
+from src.config import (
+    get_deepl_config,
+    get_deepl_context_sentences,
+    get_nats_config,
+    get_ws_url,
+)
 from src.database.pool import Db
 from src.deepL.deepL import DeeplTranslationService
 from src.monitor.node_metrics import fetch_node_gauges, gauge_bool, gauge_int
@@ -88,7 +93,8 @@ async def lifespan(app: FastAPI):
 
         separator = SentenceSeparator(
             translator=translator,
-            pusher=pusher
+            pusher=pusher,
+            context_sentences=get_deepl_context_sentences(),
         )
 
         app.state.hub = hub
