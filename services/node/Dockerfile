@@ -1,4 +1,7 @@
-FROM node:22-bullseye
+# bookworm: bullseye-security 의 .deb 가 pool 에서 사라져(index 는 남은 채 404)
+# apt-get install 이 exit 100 으로 죽었다 — release #116 배포 실패(2026-09-22).
+# ffmpeg 4.3 -> 5.1. FfmpegTranscoder 가 기대는 -progress 의 out_time_ms 는 5.1 도 낸다.
+FROM node:22-bookworm
 
 # yt-dlp / streamlink 는 초기 유튜브 수집 시절의 잔재라 제거했다. 둘 다 이미
 # 죽어 있었다 — bullseye 의 시스템 파이썬이 3.9 라 yt-dlp 는 실행 즉시
