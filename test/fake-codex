@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# 가짜 codex — API 를 태우지 않고 orchestrate.sh 의 codex 엔진 경로를 검증한다.
+#
+# fake-claude 와 같은 방식: PATH 앞의 test/ 에 'codex' 라는 이름으로 놓는다.
+# 흉내내는 것은 실측(2026-09-30, codex-cli 0.159.2)한 인터페이스다:
+#   - `codex login status` : 로그인 상태면 exit 0, 아니면 "Not logged in" + exit 1
+#   - `codex exec ... --json -o <파일> -` : stdin 프롬프트, stdout 에 JSONL 이벤트
+#     (thread.started / turn.started / item.completed / turn.completed | turn.failed),
+#     최종 응답을 -o 파일에 쓴다. 이벤트에 model 필드는 없다.
+#
+#   FAKE_CODEX_LOGGED_OUT=1          login status 가 실패한다
+#   FAKE_CODEX_RATELIMIT_MODELS="…"  이 목록의 모델로 불리면 사용 한도 오류로 죽는다
+#   FAKE_CODEX_SCENARIO:
+#     ok          최종 응답 = STATUS: DONE + 카운트 0 (기본)
+#     flagged     최종 응답에 반박 1 · 미확인 2
+#     nocount     카운트 라인 없는 최종 응답
+#     fenced      최종 응답을 ``` 코드 블록으로 감쌈 — 셸이 울타리를 벗겨야 정상
+#     no_message  최종 응답 없이 끝남 (-o 파일이 안 생김)
+#     crash       리밋이 아닌 오류로 죽음
+#
+# 받은 인자는 <산출물 폴더>/JUDGE.args 에 남긴다 (fake-claude 와 같은 파일 — 테스트가 본다).
+
+set -uo pipefail
+
+case "${1:-}" in
+  --version) echo "codex-cli 0.0.0-fake"; exit 0 ;;
+  login)
+    if [ "${FAKE_CODEX_LOGGED_OUT:-0}" = "1" ]; then echo "Not logged in"; exit 1; fi
+    echo "Logged in using ChatGPT"; exit 0 ;;
+  exec) shift ;;
+  *) echo "fake-codex: 모르는 명령 $*" >&2; exit 99 ;;
+esac
+
+MODEL="unknown"; SANDBOX="?"; LAST=""; CD=""; CONFIGS=""; FLAGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--model)   MODEL="$2"; shift 2 ;;
+    -s|--sandbox) SANDBOX="$2"; shift 2 ;;
+    -o|--output-last-message) LAST="$2"; shift 2 ;;
+    -C|--cd)      CD="$2"; shift 2 ;;
+    -c|--config)  CONFIGS="$CONFIGS${CONFIGS:+ }$2"; shift 2 ;;
+    --*)          FLAGS="$FLAGS${FLAGS:+ }$1"; shift ;;
+    *)            shift ;;
+  esac
+done
+
+PROMPT="$(cat)"
+ARTIFACT="$(awk '/^## 출력/{f=1;next} f&&/\.pipeline\//{print;exit}' <<<"$PROMPT" \
+            | grep -o '[^ `]*\.pipeline/[^ `]*/[A-Z]*\.md' | head -1)"
+DIR="$(dirname "${ARTIFACT:-./x/JUDGE.md}")"
+mkdir -p "$DIR"
+printf 'engine=codex model=%s sandbox=%s\nconfigs=%s\nflags=%s\ncd=%s\n' \
+  "$MODEL" "$SANDBOX" "$CONFIGS" "$FLAGS" "$CD" > "$DIR/JUDGE.args"
+printf '%s\n' "$PROMPT" > "$DIR/JUDGE.prompt.txt"
+
+echo '{"type":"thread.started","thread_id":"fake"}'
+echo '{"type":"turn.started"}'
+
+for rl in ${FAKE_CODEX_RATELIMIT_MODELS:-}; do
+  if [ "$rl" = "$MODEL" ]; then
+    echo "{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit ($MODEL). Try again later.\"}}"
+    echo "ERROR codex_core: usage limit reached" >&2
+    exit 1
+  fi
+done
+
+answer() {  # answer <본문> — 최종 응답을 -o 파일에 쓰고 이벤트를 흘린다
+  echo '{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"Get-Content DESIGN.md","exit_code":0,"status":"completed"}}'
+  [ -n "$LAST" ] && printf '%s' "$1" > "$LAST"
+  jq -cn --arg t "$1" '{type:"item.completed", item:{id:"item_1", type:"agent_message", text:$t}}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+}
+
+case "${FAKE_CODEX_SCENARIO:-ok}" in
+  ok)         answer $'STATUS: DONE\nUNVERIFIED: 0 REFUTED: 0\n\n(fake codex 판정)' ;;
+  flagged)    answer $'STATUS: DONE\nUNVERIFIED: 2 REFUTED: 1\n\n(fake codex 판정)' ;;
+  nocount)    answer $'STATUS: DONE\n\n(카운트 라인 없음)' ;;
+  fenced)     answer $'```markdown\nSTATUS: DONE\nUNVERIFIED: 0 REFUTED: 0\n```' ;;
+  no_message)
+    echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":0}}' ;;
+  crash)
+    echo '{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}'
+    exit 1 ;;
+  *) echo "fake-codex: 모르는 시나리오" >&2; exit 99 ;;
+esac
+exit 0

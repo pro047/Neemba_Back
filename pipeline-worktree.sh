@@ -139,9 +139,6 @@ cat >&2 <<EOF
     cd "$WT" && ./orchestrate.sh $FEATURE
     cd "$WT" && AUTO=1 ./orchestrate.sh $FEATURE          # 사람 게이트 없이
 
-  상담역 (다른 터미널):
-    cd "$WT" && ./advisor.sh $FEATURE
-
   결과 확인 / 가져오기:
     git -C "$MAIN" diff $BRANCH
     git -C "$MAIN" merge $BRANCH
