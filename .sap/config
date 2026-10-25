@@ -13,3 +13,4 @@ PROTECTED_FILES=services/node/package.json services/node/package-lock.json servi
 
 # 엔진 기본 git 읽기 4개 + 이 저장소의 검증 명령 3개 (에이전트가 치는 형태 그대로). 한 줄로 둔다 — --allowedTools 로 그대로 넘어간다.
 AGENT_TOOLS=Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git ls-files:*),Bash(cd services/python && .venv/bin/python -m pytest:*),Bash(cd services/node && npm test:*),Bash(cd services/node && npx tsc --noEmit:*)
+SETUP_CMD=(cd services/python && uv sync --frozen --extra dev) && (cd services/node && npm ci)
