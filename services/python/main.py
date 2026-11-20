@@ -32,6 +32,8 @@ from src.deepL.deepL import DeeplTranslationService
 from src.monitor.node_metrics import fetch_node_gauges, gauge_bool, gauge_int
 from src.monitoring import metrics
 from src.pushClient.pusher import Pusher
+from src.diagnostics import client_logs as cl
+from src.repository.implementation import client_diagnostics_repository as cdr
 from src.repository.implementation import monitor_query_repository as mq
 from src.repository.implementation.translation_repository import (
     close_stale_sessions,
@@ -329,6 +331,56 @@ def get_db_pool(request: Request):
     Used by the Phase 4 capture path and the Phase 5 history API.
     """
     return request.app.state.db_pool
+
+
+# Client-diagnostics upload is unauthenticated, so it must not be able to starve
+# the shared pool (max_size=10, no command_timeout). Two slots leave eight
+# connections for capture and the monitor API. The deadline is shorter than
+# nginx proxy_read_timeout (30s) and includes the wait for a slot — a request
+# queued behind the semaphore would otherwise hang past the proxy timeout.
+# Read as a module global per request (tests patch it).
+CLIENT_LOGS_DB_TIMEOUT_SECONDS = 10.0
+_CLIENT_LOGS_DB_SLOTS = asyncio.Semaphore(2)
+
+
+@app.post("/api/diagnostics/client-logs", response_model=cl.ClientLogAck, response_model_by_alias=True)
+async def client_logs_upload(request: Request, pool=Depends(get_db_pool)):
+    """Store device log lines idempotently on ``(installId, seq)``.
+
+    Error bodies are fixed strings on purpose: this endpoint is public, so no
+    exception text, SQL or path may reach the caller. 503 means "stored or not
+    is unknown" — the app resends, and the unique key absorbs the repeat.
+    """
+    try:
+        raw = await cl.read_body_capped(
+            request.stream(), content_length=request.headers.get("content-length")
+        )
+        upload = cl.decode_upload(raw)
+    except cl.PayloadTooLarge:
+        raise HTTPException(status_code=413, detail="payload too large")
+    except cl.InvalidUpload:
+        raise HTTPException(status_code=422, detail="invalid upload")
+    except Exception:
+        logger.exception("client_logs_upload: reading request failed")
+        raise HTTPException(status_code=503, detail="temporarily unavailable")
+
+    parsed = cl.normalize_entries(upload.entries)
+    app_version = (
+        cl.sanitize_text(upload.app_version) if upload.app_version is not None else None
+    )
+    try:
+        async with asyncio.timeout(CLIENT_LOGS_DB_TIMEOUT_SECONDS):
+            async with _CLIENT_LOGS_DB_SLOTS:
+                inserted = await cdr.insert_entries(
+                    pool,
+                    install_id=str(upload.install_id),
+                    app_version=app_version,
+                    entries=parsed,
+                )
+    except Exception:
+        logger.exception("client_logs_upload: insert failed")
+        raise HTTPException(status_code=503, detail="temporarily unavailable")
+    return cl.build_ack(upload, parsed, inserted)
 
 
 @app.get("/ping")
