@@ -363,8 +363,9 @@ class WebSocketHub:
 
         detach 와 달리 **세션을 끝내지 않는다** — 나머지 청취자는 계속 듣는다.
         주인 검사로 늦게 도착한 통지(이미 정리된 소켓)는 무시한다.
-        close_code/reason 은 클라 close frame 값(1001=정상 종료, 1006=비정상
-        단절)으로 ws_blips 에 기록된다 (§4-7).
+        close_code/reason 은 클라 close frame 값으로 ws_blips 에 기록된다 (§4-7).
+        1001 은 정상 종료가 아니다 — mvp 앱(마일스톤 A~)은 ping 무응답 시 1001
+        로 닫고 재연결한다. 1005=코드 없는 close, 1006=close frame 없는 단절.
 
         ``detected_by`` 는 ws_blips 행에 그대로 실린다. /ws 의 일반 예외 경로도
         이 함수를 쓰므로(정상 close frame 이 아니다) 그쪽은 다른 값을 넘긴다.
