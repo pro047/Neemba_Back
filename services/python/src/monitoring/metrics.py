@@ -19,6 +19,24 @@ _listeners = Gauge(
     'neemba_hub_listeners',
     'Listener websockets currently attached to the hub',
 )
+# The global gauge above is a sum over all sessions: 2 listeners on session A
+# and 0 on session B still reads 2, so B's "nobody is listening" is invisible.
+# The monitor sidecar needs the per-session value, hence these labelled series.
+# Both are removed on session detach to avoid unbounded label cardinality.
+_session_listeners = Gauge(
+    'neemba_hub_session_listeners',
+    'Listener websockets attached to one live session',
+    ['sessionId'],
+)
+# Counts translations that were produced for a live session but found no
+# connected listener. It is per session because the DeepL histogram is
+# unlabelled: another session's translations would otherwise look like
+# "translations happened while this session had 0 listeners".
+_undelivered = Counter(
+    'neemba_hub_undelivered_total',
+    'Translations for a live session that found no connected listener',
+    ['sessionId'],
+)
 _last_broadcast = Gauge(
     'neemba_hub_last_broadcast_timestamp_seconds',
     'Wall-clock time of the last translation delivered to the client',
@@ -99,6 +117,33 @@ def set_active_session(active: bool) -> None:
 def set_listeners(count: int) -> None:
     _listeners.set(count)
     _snapshot['listeners'] = count
+
+
+def open_session_series(session_id: str, listeners: int) -> None:
+    # Seed both series at registration so "session alive, 0 listeners" is
+    # visible as an explicit 0 and the first undelivered translation is not
+    # absorbed into the monitor's baseline. labels() keeps an existing child's
+    # value, so re-registering a live session never resets the counter.
+    _session_listeners.labels(session_id).set(listeners)
+    _undelivered.labels(session_id)
+
+
+def set_session_listeners(session_id: str, count: int) -> None:
+    _session_listeners.labels(session_id).set(count)
+
+
+def record_undelivered(session_id: str) -> None:
+    _undelivered.labels(session_id).inc()
+
+
+def remove_session_series(session_id: str) -> None:
+    # prometheus_client's remove() raises KeyError for an unknown label set,
+    # and detach can run for a session whose series were never created.
+    for metric in (_session_listeners, _undelivered):
+        try:
+            metric.remove(session_id)
+        except KeyError:
+            pass
 
 
 def record_broadcast(timestamp: float) -> None:

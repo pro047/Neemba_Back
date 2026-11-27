@@ -164,6 +164,10 @@ class WebSocketHub:
         """지금 붙어 있는 청취자 소켓 수 (P1: 상태 개요·게이지용)."""
         return sum(1 for ws in list(self._conns) if self._is_connected(ws))
 
+    def _session_listener_count_locked(self, session_id: str) -> int:
+        """이 세션에 등재된 소켓 수 (세션별 게이지용). (_lock 보유 전제)"""
+        return sum(1 for c in self._conns.values() if c.session_id == session_id)
+
     # --- 세션 등록 ---------------------------------------------------------
 
     async def register_session(
@@ -183,6 +187,8 @@ class WebSocketHub:
                 # 안 옮기면 그 소켓들은 등재된 채로 영원히 자막을 못 받는다.
                 self._move_channel_locked(session_id, previous, lang)
             metrics.set_active_session(True)
+            metrics.open_session_series(
+                session_id, self._session_listener_count_locked(session_id))
         print('hub: session registered', session_id, lang)
 
     def _move_channel_locked(
@@ -253,6 +259,8 @@ class WebSocketHub:
                 self._conns[ws] = conn
                 self._channels.setdefault((session_id, lang), set()).add(ws)
                 metrics.set_listeners(len(self._conns))
+                metrics.set_session_listeners(
+                    session_id, self._session_listener_count_locked(session_id))
 
                 # §4-7: 이 재접속이 세션의 열린 blip 을 닫는다. 같은 락 안에서
                 # 판정해야 attach 경쟁과 직렬화된다.
@@ -293,6 +301,7 @@ class WebSocketHub:
             abandoned = self._release_blips_locked(session_id)
             metrics.set_active_session(bool(self._sessions))
             metrics.set_listeners(len(self._conns))
+            metrics.remove_session_series(session_id)
 
         # close 는 락 밖에서. 안에서 하면 게이트를 쥔 느린 소켓 하나가
         # 허브 전체(_lock)를 얼린다 — 소켓이 N개가 된 지금은 그게 전면 정지다.
@@ -343,6 +352,12 @@ class WebSocketHub:
             self._forget_conn_locked(conn)
             self._open_blip_locked(conn, close_code, close_reason, detected_by)
             metrics.set_listeners(len(self._conns))
+            # Only for a still-live session: a late drop after detach must not
+            # resurrect the series that detach just removed.
+            if conn.session_id in self._sessions:
+                metrics.set_session_listeners(
+                    conn.session_id,
+                    self._session_listener_count_locked(conn.session_id))
         self._cancel_keepalive(conn)
         # 기본 1000 그대로 — 여기서 CLOSE_SESSION_ENDED 를 쓰면 안 된다. 소켓
         # 하나가 keepalive 로 떨어졌을 뿐 세션은 살아 있고, 그 청취자는 재접속을
@@ -415,6 +430,7 @@ class WebSocketHub:
             if not targets:
                 # 아무도 못 받은 문장은 이 세션의 열린 순단들이 놓친 문장이다.
                 self._count_lost_locked(session_id)
+                metrics.record_undelivered(session_id)
 
         if not targets:
             print('hub: no connected listener', session_id, lang)

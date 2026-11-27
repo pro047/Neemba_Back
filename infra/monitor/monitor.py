@@ -14,6 +14,7 @@ docker.sock 없이(저장소 보안 결정) compose 네트워크에서 python/no
 """
 import json
 import os
+import re
 import time
 import urllib.request
 
@@ -26,6 +27,13 @@ DAILY_SECONDS = 86400
 ACTIVE = 'neemba_hub_active_session'
 LAST_BROADCAST = 'neemba_hub_last_broadcast_timestamp_seconds'
 STT_PAUSED = 'neemba_stt_paused'
+SESSION_LISTENERS = 'neemba_hub_session_listeners'
+UNDELIVERED = 'neemba_hub_undelivered_total'
+# Longer than the app's ~241s RTMP retry budget so a reconnecting app does not
+# page anyone (budget figure comes from the handoff; the app repo is not here).
+NO_LISTENER_SECONDS = int(os.environ.get('MONITOR_NO_LISTENER_THRESHOLD', '300'))
+
+_SESSION_ID_RE = re.compile(r'sessionId="([^"]*)"')
 
 
 def _is_active(samples: dict) -> bool:
@@ -63,6 +71,61 @@ def _all_stt_paused(samples: dict, now: float = 0.0) -> bool:
     return bool(values) and all(v == 1.0 for v in values)
 
 
+def _session_series(samples: dict, name: str) -> dict:
+    """{sessionId: value} for labelled series of `name`.
+
+    fetch_metrics keys samples by the whole exposition token, so a labelled
+    series is 'name{sessionId="..."}'. Matching on 'name{' keeps unlabelled
+    keys and look-alikes ('name_created{...}') out.
+    """
+    out = {}
+    prefix = name + '{'
+    for key, value in samples.items():
+        if not key.startswith(prefix):
+            continue
+        m = _SESSION_ID_RE.search(key)
+        if m:
+            out[m.group(1)] = value
+    return out
+
+
+def _broadcast_gap(samples: dict, now: float) -> float:
+    """Seconds since the later of the last broadcast and the observed session start.
+
+    Without the session-start clamp, the first tick of a new session measures
+    against yesterday's last broadcast (2026-11-22: "44977초째"). Both 0 means
+    "never" and yields `now`, as before.
+    """
+    return now - max(samples.get(LAST_BROADCAST, 0.0),
+                     samples.get('_active_since', 0.0))
+
+
+def _all_sessions_unattended(samples: dict) -> bool:
+    """Every live session has 0 listeners. No per-session series -> False (not
+    vacuously true), same all-of rule as _all_stt_paused."""
+    values = list(_session_series(samples, SESSION_LISTENERS).values())
+    return bool(values) and all(v == 0.0 for v in values)
+
+
+def _no_listener_offenders(zero: dict, undelivered: dict, now: float) -> list:
+    """(sid, zero_for, dropped) for sessions past the threshold that also lost
+    at least one translation during the zero interval."""
+    out = []
+    for sid in sorted(zero):
+        entry = zero[sid]
+        zero_for = now - entry['since']
+        base = entry.get('base')
+        current = undelivered.get(sid)
+        dropped = 0.0 if base is None or current is None else current - base
+        if zero_for >= NO_LISTENER_SECONDS and dropped > 0:
+            out.append((sid, zero_for, dropped))
+    return out
+
+
+def _no_listeners_stale(samples: dict, now: float) -> bool:
+    return _is_active(samples) and bool(samples.get('_no_listener_offenders'))
+
+
 def _heartbeat_stale(samples: dict, now: float) -> bool:
     if not _is_active(samples):
         return False
@@ -72,9 +135,13 @@ def _heartbeat_stale(samples: dict, now: float) -> bool:
     # 억제하지 않는다.)
     if _all_stt_paused(samples):
         return False
+    # 모든 세션에 청취자가 없으면 hub 가 번역을 못 보내 last_broadcast 가 멈추는
+    # 게 당연하다 — 그 상황은 no_listeners 규칙이 따로 알린다.
+    if _all_sessions_unattended(samples):
+        return False
     # last_broadcast==0(부팅 후 broadcast 없음)이면 gap 무한대로 간주 —
     # 세션이 열렸는데 첫 번역이 영영 안 오는 경우를 놓치지 않는다.
-    return now - samples.get(LAST_BROADCAST, 0.0) > GAP_SECONDS
+    return _broadcast_gap(samples, now) > GAP_SECONDS
 
 
 # condition 규칙: (이름, 판정, 게이트, 발생 문구)
@@ -83,6 +150,11 @@ CONDITION_RULES = [
      _heartbeat_stale,
      'always',
      '🚨 번역 심장박동 끊김 — 세션 활성 중 {gap:.0f}초째 번역 없음'),
+    ('no_listeners',
+     _no_listeners_stale,
+     'always',
+     '🚨 청취자 0명 — 세션 {sessions} 에 {zero_for:.0f}초째 붙은 청취자가 없고 그동안 번역 '
+     '{dropped:.0f}건이 버려짐 (성가대 찬양 오탐 아님 · 앱 재접속 확인)'),
     # 장애가 아니라 상태 전환 보고다 — 방송 종료면 정상, 방송 중이면 송출
     # 사고다. 어느 쪽인지는 사람이 시간대를 보고 판단하는 게 맞아 정보성으로
     # 낮췄다. 오디오가 돌아오면 아래 공통 경로가 ✅ 복구를 보낸다.
@@ -185,12 +257,56 @@ def evaluate(state: dict, samples: dict, now: float) -> tuple[dict, list[str]]:
 
     scrape_ok = samples.get('_scrape_ok', 1.0) == 1.0
     if scrape_ok:
-        state['_last_known_active'] = _is_active(samples)
+        active = _is_active(samples)
+        # Session start is not exported by the apps, so use the inactive->active
+        # transition we observed. Must be read before _last_known_active is
+        # overwritten. An unobserved transition (empty state, boot mid-session)
+        # stays 0.0, which keeps the plain last_broadcast judgement.
+        prev_active = state.get('_last_known_active')
+        if not active:
+            state['_active_since'] = 0.0
+        elif prev_active is False:
+            state['_active_since'] = now
+        else:
+            state.setdefault('_active_since', 0.0)
+
+        # Per-session zero-listener intervals. Failed scrapes leave this alone
+        # so a blip in /metrics does not restart the 300s clock.
+        listeners = _session_series(samples, SESSION_LISTENERS)
+        undelivered = _session_series(samples, UNDELIVERED)
+        zero = state.get('_listeners_zero', {})
+        if not active:
+            zero = {}
+        else:
+            for sid in list(zero):
+                if listeners.get(sid) != 0.0:
+                    del zero[sid]
+            for sid, value in listeners.items():
+                if value != 0.0:
+                    continue
+                current = undelivered.get(sid)
+                entry = zero.get(sid)
+                if entry is None:
+                    zero[sid] = {'since': now, 'base': current}
+                    continue
+                if entry['base'] is None:
+                    entry['base'] = current
+                elif current is not None and current < entry['base']:
+                    # Counter went backwards = python restarted; rebase so the
+                    # reset is not read as a negative (or huge) drop count.
+                    entry['base'] = current
+        state['_listeners_zero'] = zero
+
+        state['_last_known_active'] = active
         state['_scrape_fail_streak'] = 0
     else:
         state['_scrape_fail_streak'] = state.get('_scrape_fail_streak', 0) + 1
     samples = dict(samples)
     samples['_scrape_fail_streak'] = state['_scrape_fail_streak']
+    samples['_active_since'] = state.get('_active_since', 0.0)
+    samples['_no_listener_offenders'] = _no_listener_offenders(
+        state.get('_listeners_zero', {}), _session_series(samples, UNDELIVERED),
+        now)
 
     # scrape 실패 중엔 일일 틱을 소모하지 않는다 — 부팅 경합으로 첫 틱이
     # 실패하면 daily 규칙(auth 등)이 24h 밀리는 버그 방지.
@@ -212,11 +328,18 @@ def evaluate(state: dict, samples: dict, now: float) -> tuple[dict, list[str]]:
             continue
 
         firing = predicate(samples, now)
-        gap = now - samples.get(LAST_BROADCAST, 0.0)
+        gap = _broadcast_gap(samples, now)
+        offenders = samples['_no_listener_offenders']
+        fmt = dict(
+            gap=gap,
+            zero_for=max((o[1] for o in offenders), default=0.0),
+            dropped=sum(o[2] for o in offenders),
+            sessions=', '.join(o[0][:8] for o in offenders),
+        )
 
         if firing and not rule['active']:
             rule.update(active=True, since=now, last_alert=now)
-            alerts.append(message.format(gap=gap))
+            alerts.append(message.format(**fmt))
         elif firing and rule['active'] and gate != 'daily':
             if now - rule['last_alert'] >= REMINDER_SECONDS:
                 rule['last_alert'] = now
@@ -224,7 +347,7 @@ def evaluate(state: dict, samples: dict, now: float) -> tuple[dict, list[str]]:
                     f'⏰ {name} 장애 지속 중 ({_fmt_duration(now - rule["since"])})')
         elif firing and rule['active'] and gate == 'daily':
             rule['last_alert'] = now
-            alerts.append(message.format(gap=gap))
+            alerts.append(message.format(**fmt))
         elif not firing and rule['active']:
             rule['active'] = False
             alerts.append(

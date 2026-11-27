@@ -365,3 +365,173 @@ async def test_detach_closes_every_socket_of_the_session():
     assert ws1.sent == []
     assert ws2.sent == []
     await _teardown(hub)
+
+
+# --- heartbeat-alert: 세션별 청취자 게이지·미전달 카운터 ----------------------
+# monitor 사이드카가 '살아 있는 세션 B 에 청취자 0명' 을 보려면 전역 합계
+# (neemba_hub_listeners) 가 아니라 세션별 시리즈가 있어야 한다. 전역 레지스트리라
+# 테스트마다 고유 sessionId 를 쓴다.
+
+from prometheus_client import REGISTRY  # noqa: E402
+import uuid  # noqa: E402
+
+
+def _sl(session_id: str) -> float | None:
+    return REGISTRY.get_sample_value(
+        "neemba_hub_session_listeners", {"sessionId": session_id})
+
+
+def _und(session_id: str) -> float | None:
+    return REGISTRY.get_sample_value(
+        "neemba_hub_undelivered_total", {"sessionId": session_id})
+
+
+def _uniq(tag: str) -> str:
+    return f"{tag}-{uuid.uuid4().hex}"
+
+
+# AC-23
+async def test_register_session_seeds_both_series_at_zero():
+    # Arrange
+    hub = WebSocketHub()
+    s = _uniq("h-reg")
+
+    # Act
+    await hub.register_session(s)
+
+    # Assert
+    assert _sl(s) == 0.0
+    assert _und(s) == 0.0
+    await hub.detach(s)
+    await _teardown(hub)
+
+
+# AC-24
+async def test_session_listener_gauge_tracks_attach_and_disconnect_per_session():
+    # Arrange
+    hub = WebSocketHub()
+    s, t = _uniq("h-s"), _uniq("h-t")
+    ws1, ws2 = FakeWS(), FakeWS()
+    await hub.register_session(t)
+
+    # Act
+    await _attach(hub, ws1, s)
+    await _attach(hub, ws2, s)
+    await _drain()
+    after_two = _sl(s)
+    ws1.client_disconnect()
+    await hub.handle_client_disconnect(s, ws1)
+    await _drain()
+
+    # Assert
+    assert after_two == 2.0
+    assert _sl(s) == 1.0
+    assert _sl(t) == 0.0
+    await hub.detach(s)
+    await hub.detach(t)
+    await _teardown(hub)
+
+
+# AC-25
+async def test_detach_removes_series_and_late_broadcast_does_not_revive_them():
+    # Arrange
+    hub = WebSocketHub()
+    s = _uniq("h-detach")
+    ws = FakeWS()
+    await _attach(hub, ws, s)
+    await _drain()
+
+    # Act
+    await hub.detach(s)
+    await _drain()
+    removed = (_sl(s), _und(s))
+    await hub.broadcast_to_session(s, {"sentence": "late"})
+    await hub.handle_client_disconnect(s, ws)  # 늦은 끊김 통지
+    await _drain()
+
+    # Assert
+    assert removed == (None, None)
+    assert _sl(s) is None
+    assert _und(s) is None
+    await _teardown(hub)
+
+
+# AC-26
+async def test_broadcast_without_listener_counts_undelivered_for_that_session():
+    # Arrange
+    hub = WebSocketHub()
+    s, other = _uniq("h-und"), _uniq("h-other")
+    await hub.register_session(s)
+    await hub.register_session(other)
+    before = _und(s) or 0.0
+
+    # Act
+    await hub.broadcast_to_session(s, {"sentence": "nobody"})
+    await _drain()
+    after_drop = _und(s)
+    ws = FakeWS()
+    await hub.attach(ws, s)
+    await _drain()
+    await hub.broadcast_to_session(s, {"sentence": "heard"})
+    await _drain()
+
+    # Assert
+    assert after_drop == before + 1.0
+    assert _und(s) == before + 1.0
+    assert ws.sent[-1] == "heard"
+    assert _und(other) == 0.0, "다른 세션의 미전달 카운터가 섞이면 안 된다"
+    await hub.detach(s)
+    await hub.detach(other)
+    await _teardown(hub)
+
+
+# AC-27
+async def test_reregister_keeps_listener_gauge_and_undelivered_count():
+    # Arrange
+    hub = WebSocketHub()
+    s = _uniq("h-rereg")
+    await hub.register_session(s)
+    await hub.broadcast_to_session(s, {"sentence": "nobody"})
+    ws = FakeWS()
+    await hub.attach(ws, s)
+    await _drain()
+
+    # Act
+    await hub.register_session(s)
+
+    # Assert
+    assert _sl(s) == 1.0
+    assert _und(s) == 1.0
+    await hub.detach(s)
+    await _teardown(hub)
+
+
+async def test_rejected_attach_creates_no_session_series():
+    # Arrange
+    hub = WebSocketHub()
+    ghost = _uniq("h-ghost")
+
+    # Act
+    assert await hub.attach(FakeWS(), ghost) is None
+
+    # Assert
+    assert _sl(ghost) is None
+    assert _und(ghost) is None
+    await _teardown(hub)
+
+
+async def test_duplicate_attach_of_same_socket_counts_once():
+    # Arrange
+    hub = WebSocketHub()
+    s = _uniq("h-dup")
+    ws = FakeWS()
+    await _attach(hub, ws, s)
+
+    # Act
+    await hub.attach(ws, s)
+    await _drain()
+
+    # Assert
+    assert _sl(s) == 1.0
+    await hub.detach(s)
+    await _teardown(hub)
