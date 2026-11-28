@@ -37,6 +37,14 @@ from starlette.websockets import WebSocketState
 
 from src.monitoring import metrics
 from src.ws.blip_recorder import WsBlipRecorder
+from src.ws.listener_alert import (
+    ListenerAlertSink,
+    classify_drop,
+    format_attach,
+    format_drop,
+    format_reconnect,
+    format_session_end,
+)
 
 # node 의 rtmp 라우터 zod 기본값과 같은 값 (`router/rtmp.ts:42`).
 DEFAULT_TARGET_LANG = "en-US"
@@ -98,17 +106,27 @@ class _Conn:
 class _OpenBlip:
     """기록 중인 순단 1건. ``task`` 는 insert 를 돌리는 fire-and-forget 태스크."""
 
-    __slots__ = ("task", "client_id", "lost")
+    __slots__ = ("task", "client_id", "lost", "opened_at")
 
     def __init__(self, task: "asyncio.Task[int | None]", client_id: str) -> None:
         self.task = task
         self.client_id = client_id
         self.lost = 0
+        # Monotonic, for the reconnect alert's "끊긴 시간". The DB computes its
+        # own duration_ms in SQL and never returns it, so this can differ by ms.
+        self.opened_at = time.monotonic()
 
 
 class WebSocketHub:
-    def __init__(self, blip_recorder: WsBlipRecorder | None = None) -> None:
+    def __init__(
+        self,
+        blip_recorder: WsBlipRecorder | None = None,
+        alert_sink: ListenerAlertSink | None = None,
+    ) -> None:
         self._lock = asyncio.Lock()
+        # Listener event alerts (Discord). None = off. notify() is sync and only
+        # enqueues, so it is safe to call outside the lock without awaiting.
+        self._alert_sink = alert_sink
         # (session_id, lang) -> 그 언어 채널에 붙은 소켓 집합 (D2).
         self._channels: Dict[tuple[str, str], set[WebSocket]] = {}
         # ws -> _Conn. 소켓별 자원의 단일 소유자이자 '붙어 있는 소켓' 명부.
@@ -204,6 +222,15 @@ class WebSocketHub:
             if conn is not None:
                 conn.target_lang = new_lang
 
+    def _alert(self, text: str) -> None:
+        """Hand one alert line to the sink. A broken sink must never break the hub."""
+        if self._alert_sink is None:
+            return
+        try:
+            self._alert_sink.notify(text)
+        except Exception as e:
+            print('hub: alert sink failed (ignored):', repr(e))
+
     # --- attach / detach ---------------------------------------------------
 
     async def attach(
@@ -237,6 +264,7 @@ class WebSocketHub:
 
         conn: _Conn | None = None
         reopened: _OpenBlip | None = None
+        listeners = 0
 
         async with self._lock:
             existing = self._conns.get(ws)
@@ -259,8 +287,8 @@ class WebSocketHub:
                 self._conns[ws] = conn
                 self._channels.setdefault((session_id, lang), set()).add(ws)
                 metrics.set_listeners(len(self._conns))
-                metrics.set_session_listeners(
-                    session_id, self._session_listener_count_locked(session_id))
+                listeners = self._session_listener_count_locked(session_id)
+                metrics.set_session_listeners(session_id, listeners)
 
                 # §4-7: 이 재접속이 세션의 열린 blip 을 닫는다. 같은 락 안에서
                 # 판정해야 attach 경쟁과 직렬화된다.
@@ -277,6 +305,20 @@ class WebSocketHub:
 
         if reopened is not None:
             self._spawn(self._finish_blip(reopened))
+            # clientId is usually server-issued, so reopened may be another
+            # listener's blip (oldest-open match) — the text names the dropped
+            # socket so an operator can cross-check.
+            self._alert(format_reconnect(
+                session_id=session_id,
+                client_id=cid,
+                dropped_client_id=reopened.client_id,
+                duration_s=time.monotonic() - reopened.opened_at,
+                lost_count=reopened.lost,
+                listeners=listeners,
+            ))
+        else:
+            self._alert(format_attach(
+                session_id=session_id, client_id=cid, listeners=listeners))
 
         conn.keepalive_task = asyncio.create_task(self._keepalive_loop(conn))
         print('curr ws :', ws, 'session:', session_id,
@@ -302,6 +344,11 @@ class WebSocketHub:
             metrics.set_active_session(bool(self._sessions))
             metrics.set_listeners(len(self._conns))
             metrics.remove_session_series(session_id)
+
+        # One summary per real session end; per-socket drop alerts stay silent
+        # here because the 4410 closes never reach _drop_conn (owner check).
+        self._alert(format_session_end(
+            session_id=session_id, listeners=len(conns)))
 
         # close 는 락 밖에서. 안에서 하면 게이트를 쥔 느린 소켓 하나가
         # 허브 전체(_lock)를 얼린다 — 소켓이 N개가 된 지금은 그게 전면 정지다.
@@ -352,12 +399,20 @@ class WebSocketHub:
             self._forget_conn_locked(conn)
             self._open_blip_locked(conn, close_code, close_reason, detected_by)
             metrics.set_listeners(len(self._conns))
+            remaining = self._session_listener_count_locked(conn.session_id)
             # Only for a still-live session: a late drop after detach must not
             # resurrect the series that detach just removed.
             if conn.session_id in self._sessions:
-                metrics.set_session_listeners(
-                    conn.session_id,
-                    self._session_listener_count_locked(conn.session_id))
+                metrics.set_session_listeners(conn.session_id, remaining)
+        # After the owner check above, so a duplicate notice alerts once.
+        self._alert(format_drop(
+            classify_drop(close_code, detected_by),
+            session_id=conn.session_id,
+            client_id=conn.client_id,
+            close_code=close_code,
+            detected_by=detected_by,
+            listeners=remaining,
+        ))
         self._cancel_keepalive(conn)
         # 기본 1000 그대로 — 여기서 CLOSE_SESSION_ENDED 를 쓰면 안 된다. 소켓
         # 하나가 keepalive 로 떨어졌을 뿐 세션은 살아 있고, 그 청취자는 재접속을

@@ -43,6 +43,7 @@ from src.repository.implementation.translation_repository import (
 from src.repository.implementation import ws_blip_repository as wb
 from src.separator.kss_separator import SentenceSeparator
 from src.ws.blip_recorder import WsBlipRecorder
+from src.ws.listener_alert import DiscordListenerAlerter, webhook_url_from_env
 from src.ws.monitor import MonitorHub
 from src.ws.websocket import WebSocketHub
 
@@ -88,7 +89,13 @@ async def lifespan(app: FastAPI):
         deepl_api = app.state.deepl_config['deepl_api_key']
 
         # §4-7 순단 계측: /ws 끊김·재접속을 ws_blips 에 기록 (DB 실패는 recorder 가 격리)
-        hub = WebSocketHub(blip_recorder=WsBlipRecorder(app.state.db_pool))
+        # Listener event alerts: unset DISCORD_WEBHOOK_URL -> log-only (no POST).
+        alerter = DiscordListenerAlerter(webhook_url_from_env())
+        app.state.listener_alerter = alerter
+        hub = WebSocketHub(
+            blip_recorder=WsBlipRecorder(app.state.db_pool),
+            alert_sink=alerter,
+        )
         monitor_hub = MonitorHub()
         translator = DeeplTranslationService(deepl_api)
         pusher = Pusher(hub, monitor_hub=monitor_hub, db_pool=app.state.db_pool)
@@ -136,6 +143,9 @@ async def lifespan(app: FastAPI):
         )
         app.state.loop_lag_task.add_done_callback(_log_task_result)
 
+        app.state.listener_alert_task = asyncio.create_task(alerter.run())
+        app.state.listener_alert_task.add_done_callback(_log_task_result)
+
         logger.info(">>> lifespan : init done")
         print(f"--------ws : {app.state.get_ws_config} -------")
         print(">>> hub at lifespan:", id(app.state.hub))
@@ -152,7 +162,8 @@ async def lifespan(app: FastAPI):
 
         background_tasks = tuple(
             getattr(app.state, name, None)
-            for name in ("consumer_task", "separator_task", "loop_lag_task")
+            for name in ("consumer_task", "separator_task", "loop_lag_task",
+                         "listener_alert_task")
         )
 
         for task in background_tasks:
@@ -163,6 +174,11 @@ async def lifespan(app: FastAPI):
             if task:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+
+        # After the worker is cancelled: closes only a client run() built itself.
+        if getattr(app.state, "listener_alerter", None):
+            with contextlib.suppress(Exception):
+                await app.state.listener_alerter.aclose()
 
         if getattr(app.state, "db", None):
             with contextlib.suppress(Exception):
