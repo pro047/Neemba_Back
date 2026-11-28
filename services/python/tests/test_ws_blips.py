@@ -459,7 +459,8 @@ async def test_reconnect_closes_blip_with_lost_count():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await _attach(hub, ws, "s1")
+    # 복귀는 같은 기기 id 일치로만 짝지어진다 (listener-alert-exact-match)
+    await _attach(hub, ws, "s1", client_id="dev-x")
     await _drain()
 
     ws.client_disconnect()
@@ -471,7 +472,7 @@ async def test_reconnect_closes_blip_with_lost_count():
     await hub.broadcast_to_session("s1", {"sentence": "m2"})
 
     ws2 = FakeWS()
-    await _attach(hub, ws2, "s1")
+    await _attach(hub, ws2, "s1", client_id="dev-x")
     await _drain()
 
     assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 2}]
@@ -487,8 +488,8 @@ async def test_listener_still_attached_does_not_count_as_lost():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws1, ws2 = FakeWS(), FakeWS()
-    await _attach(hub, ws1, "s1")
-    await _attach(hub, ws2, "s1")
+    await _attach(hub, ws1, "s1", client_id="dev-x")
+    await _attach(hub, ws2, "s1", client_id="dev-y")
     await _drain()
 
     ws1.client_disconnect()
@@ -499,8 +500,9 @@ async def test_listener_still_attached_does_not_count_as_lost():
     await _drain()
     assert ws2.sent == ["m1"]
 
+    # ws1 과 같은 기기의 재접속 — 정확 일치로 ws1 의 blip 을 닫는다
     ws3 = FakeWS()
-    await _attach(hub, ws3, "s1")
+    await _attach(hub, ws3, "s1", client_id="dev-x")
     await _drain()
 
     assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 0}]
@@ -621,7 +623,8 @@ async def test_next_session_reconnect_does_not_close_previous_blip():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await _attach(hub, ws, "s1")
+    # 같은 기기가 세션을 넘어 계속 쓰인다 — id 가 같아도 세션이 다르면 남이다
+    await _attach(hub, ws, "s1", client_id="dev-x")
     await _drain()
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -630,13 +633,13 @@ async def test_next_session_reconnect_does_not_close_previous_blip():
     await _drain()
 
     ws2 = FakeWS()
-    await _attach(hub, ws2, "s2")  # 새 세션 첫 접속
+    await _attach(hub, ws2, "s2", client_id="dev-x")  # 새 세션 첫 접속
     await _drain()
     ws2.client_disconnect()  # s2 자신의 순단
     await hub.handle_client_disconnect("s2", ws2, close_code=1006)
     await _drain()
     ws3 = FakeWS()
-    await _attach(hub, ws3, "s2")  # s2 의 재접속
+    await _attach(hub, ws3, "s2", client_id="dev-x")  # s2 의 재접속
     await _drain()
 
     # s2 의 재접속은 자기 blip(2)만 닫는다 — s1 의 blip 1 은 미복귀로 남는다
@@ -649,9 +652,10 @@ async def test_multiple_blips_in_one_session_each_get_a_row():
     """한 세션에서 순단이 여러 번 나면 행도 그만큼 생겨야 한다."""
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
+    # 같은 기기가 끊김·재접속을 세 번 반복한다
     for _ in range(3):
         ws = FakeWS()
-        await _attach(hub, ws, "s1")
+        await _attach(hub, ws, "s1", client_id="dev-x")
         await _drain()
         ws.client_disconnect()
         await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -673,7 +677,7 @@ async def test_reconnect_closes_blip_after_keepalive_loop_is_gone():
     rec = FakeRecorder()
     hub = WebSocketHub(blip_recorder=rec)
     ws = FakeWS()
-    await _attach(hub, ws, "s1")
+    await _attach(hub, ws, "s1", client_id="dev-x")
     await _drain()
     ws.client_disconnect()
     await hub.handle_client_disconnect("s1", ws, close_code=1006)
@@ -684,7 +688,7 @@ async def test_reconnect_closes_blip_after_keepalive_loop_is_gone():
                for c in hub._conns.values())
 
     ws2 = FakeWS()
-    await _attach(hub, ws2, "s1")
+    await _attach(hub, ws2, "s1", client_id="dev-x")
     await _drain()
 
     assert rec.reconnects == [{"blip_id": 1, "flushed_count": 0, "lost_count": 0}]

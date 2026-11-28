@@ -62,6 +62,10 @@ CLOSE_SESSION_NOT_FOUND = 4404
 # 멈춰야 할지 판단할 수 없었다. 클라이언트 동작은 4404 와 같다(재시도 중단).
 CLOSE_SESSION_ENDED = 4410
 
+# ws_blips.detected_by for a socket the hub retired because the same
+# client_id attached again before the old socket's loss was detected.
+DETECTED_BY_REPLACED = "replaced"
+
 _PING_INTERVAL_SECONDS = 30
 _PONG_TIMEOUT_SECONDS = 60
 
@@ -252,10 +256,13 @@ class WebSocketHub:
         있으면 종료된 세션이 재접속만으로 되살아나고, 그러면 stale drop 규약
         (§7 에러B)과 ``neemba_hub_active_session`` 낙하가 함께 무너진다.
 
-        ``client_id`` 는 호출자가 줄 수 있고(앱이 보내기 시작하면 P2 에서 정확한
-        순단 매칭이 된다) 없으면 서버가 발급한다.
+        ``client_id`` 는 기기 id 다. 보내면(None·"" 은 안 보낸 것) 그 id 로만
+        복귀가 짝지어지고, 같은 세션에 같은 id 의 옛 소켓이 아직 명부에 있으면
+        그것을 교체한다. 없으면 서버가 접속마다 새 id 를 발급하므로 어떤 순단과도
+        짝지어지지 않는다.
         """
-        cid = client_id or uuid.uuid4().hex
+        supplied = bool(client_id)
+        cid = client_id if supplied and client_id else uuid.uuid4().hex
         # accept 를 등재보다 먼저: 등재된 소켓에 accept 전 send 가 나가면
         # application_state 가 CONNECTING 이라 그 자막만 조용히 버려진다.
         # 거절할 때도 accept 는 필요하다 — accept 전 close 는 핸드셰이크 실패
@@ -265,6 +272,7 @@ class WebSocketHub:
         conn: _Conn | None = None
         reopened: _OpenBlip | None = None
         listeners = 0
+        replaced: list[_Conn] = []
 
         async with self._lock:
             existing = self._conns.get(ws)
@@ -286,6 +294,13 @@ class WebSocketHub:
                 conn = _Conn(ws, session_id, lang, cid)
                 self._conns[ws] = conn
                 self._channels.setdefault((session_id, lang), set()).add(ws)
+                # Retire the same device's stale socket first: it opens a
+                # "replaced" blip that the exact match below closes at once.
+                if supplied:
+                    replaced = self._take_replaced_conns_locked(
+                        session_id, cid, ws)
+                # Count after the replacement, or the reconnect alert says
+                # "현재 2명" while the retired socket is still listed.
                 metrics.set_listeners(len(self._conns))
                 listeners = self._session_listener_count_locked(session_id)
                 metrics.set_session_listeners(session_id, listeners)
@@ -303,11 +318,15 @@ class WebSocketHub:
                 print('hub: reject close failed (ignored):', repr(e))
             return None
 
+        for old in replaced:
+            self._cancel_keepalive(old)
+            # Fire-and-forget: a dead socket's close must not hold up the new
+            # listener's attach.
+            self._spawn(self._safe_close(old))
+            print('hub: replaced stale socket', cid, 'session:', session_id)
+
         if reopened is not None:
             self._spawn(self._finish_blip(reopened))
-            # clientId is usually server-issued, so reopened may be another
-            # listener's blip (oldest-open match) — the text names the dropped
-            # socket so an operator can cross-check.
             self._alert(format_reconnect(
                 session_id=session_id,
                 client_id=cid,
@@ -590,19 +609,34 @@ class WebSocketHub:
             _OpenBlip(task, conn.client_id)
         )
 
+    def _take_replaced_conns_locked(
+        self, session_id: str, client_id: str, ws: WebSocket
+    ) -> list[_Conn]:
+        """Retire listed sockets of the same device that the hub still thinks are alive.
+
+        Same session only. No drop alert: the reconnect alert that follows is
+        the single notice. The caller cancels keepalive and closes outside the
+        lock. (_lock 보유 전제)
+        """
+        stale = [
+            c for c in self._conns.values()
+            if c.session_id == session_id
+            and c.client_id == client_id
+            and c.ws is not ws
+        ]
+        for conn in stale:
+            self._forget_conn_locked(conn)
+            self._open_blip_locked(conn, None, None, DETECTED_BY_REPLACED)
+        return stale
+
     def _match_open_blip_locked(
         self, session_id: str, client_id: str
     ) -> _OpenBlip | None:
         """재접속한 소켓이 닫을 순단을 고른다. (_lock 보유 전제)
 
-        client_id 가 일치하면 그것 — 앱이 ``/ws?clientId=`` 를 보내기 시작하면
-        (P2) 코드 변경 없이 정확 매칭이 된다.
-
-        P1 에서는 앱이 안 보내 서버가 접속마다 새 id 를 발급하므로 정확 매칭이
-        성립하지 않는다. 그래서 같은 세션의 **가장 오래된** 열린 순단을 복귀로
-        본다 (사용자 결정 2026-08-08). 청취자가 여럿이면 A 의 순단이 B 의
-        접속으로 닫히는 오귀속이 가능하다 — 정확도보다 '순단 이력이 전부
-        미복귀로 남지 않는 것'을 택한 결과다.
+        client_id 가 같은 **가장 오래된** 1건만 짝짓는다. 일치가 없으면 None 이고
+        큐는 그대로다 — 예전의 "가장 오래된 순단을 가져가는" 대체 매칭은 A 의
+        순단을 B 의 접속으로 닫는 오귀속을 만들어 없앴다.
         """
         queue = self._open_blips.get(session_id)
         if not queue:
@@ -613,8 +647,6 @@ class WebSocketHub:
                 del queue[i]
                 matched = blip
                 break
-        if matched is None:
-            matched = queue.popleft()
         if not queue:
             del self._open_blips[session_id]
         return matched

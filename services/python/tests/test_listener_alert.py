@@ -374,7 +374,9 @@ async def test_ac10_drop_then_reattach_sends_blip_then_reconnect_with_lost():
     sink = RecordingSink()
     hub = WebSocketHub(blip_recorder=FakeRecorder(), alert_sink=sink)
     ws = FakeWS()
-    first_cid = await _attach(hub, ws, "s1")
+    # Same device on both sockets: reconnect pairing is exact client_id match
+    # only (docs/prd/listener-alert-exact-match.md decision 1·2).
+    first_cid = await _attach(hub, ws, "s1", client_id="device-a-0001")
     await _drain()
     # Act
     ws.client_disconnect()
@@ -383,7 +385,7 @@ async def test_ac10_drop_then_reattach_sends_blip_then_reconnect_with_lost():
     await hub.broadcast_to_session("s1", {"sentence": "m1"})
     await hub.broadcast_to_session("s1", {"sentence": "m2"})
     ws2 = FakeWS()
-    await _attach(hub, ws2, "s1")
+    await _attach(hub, ws2, "s1", client_id="device-a-0001")
     await _drain()
     # Assert
     assert len(sink.texts) == 3
